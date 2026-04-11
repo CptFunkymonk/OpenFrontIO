@@ -17,7 +17,7 @@
   //  CONSTANTS & ENUMS (mirrored from src/core/game/Game.ts)
   // ═══════════════════════════════════════════════════════════════════════
 
-  const BOT_VERSION = "1.0.0";
+  const BOT_VERSION = "1.1.0";
 
   const UnitType = Object.freeze({
     TransportShip: "Transport",
@@ -88,6 +88,7 @@
 
     // Cooldown tracking (in ticks)
     lastAttackTick: -999,
+    lastExpandTick: -999,
     lastBoatTick: -999,
     lastBuildTick: -999,
     lastNukeTick: -999,
@@ -95,25 +96,40 @@
     lastUpgradeTick: -999,
 
     // Adaptive parameters
-    attackRate: 35,
-    reserveRatio: 0.35,
-    expandRatio: 0.15,
+    attackRate: 15,
+    expandRate: 8,
+    reserveRatio: 0.30,
+    expandRatio: 0.10,
+
+    // Intent tracking
+    intentsSent: 0,
+    intentsConfirmed: 0,
+    lastSentIntentTypes: [],
 
     log: [],
+    decisionLog: [],
     currentAction: "Initializing...",
     strategy: "Waiting for game",
     statsSnapshot: null,
   };
 
   // ═══════════════════════════════════════════════════════════════════════
-  //  LOGGING
+  //  LOGGING — two channels: action log (what happened) and decision log
+  //  (why the bot chose what it did, including skipped branches)
   // ═══════════════════════════════════════════════════════════════════════
 
   function botLog(msg) {
     const ts = new Date().toLocaleTimeString();
     bot.log.push("[" + ts + "] " + msg);
-    if (bot.log.length > 300) bot.log.shift();
+    if (bot.log.length > 400) bot.log.shift();
     console.log("[OFBot] " + msg);
+  }
+
+  function decisionLog(msg) {
+    const entry = "T" + bot.tick + " " + msg;
+    bot.decisionLog.push(entry);
+    if (bot.decisionLog.length > 200) bot.decisionLog.shift();
+    console.log("[OFBot:decision] " + entry);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -259,23 +275,44 @@
 
   // ═══════════════════════════════════════════════════════════════════════
   //  INTENT HELPERS — send JSON messages over the game WebSocket
+  //  Every send is logged so we can see exactly what the bot is doing.
   // ═══════════════════════════════════════════════════════════════════════
 
   function sendRaw(obj) {
-    if (!bot.socket || bot.socket.readyState !== NativeWebSocket.OPEN) return false;
+    if (!bot.socket) {
+      decisionLog("SEND FAIL: no socket reference");
+      return false;
+    }
+    if (bot.socket.readyState !== NativeWebSocket.OPEN) {
+      decisionLog("SEND FAIL: socket not OPEN (state=" + bot.socket.readyState + ")");
+      return false;
+    }
     bot.socket.send(JSON.stringify(obj));
     return true;
   }
 
   function sendIntent(intent) {
-    if (!bot.enabled) return false;
-    return sendRaw({ type: "intent", intent });
+    if (!bot.enabled) {
+      decisionLog("SEND SKIP: bot disabled");
+      return false;
+    }
+    const ok = sendRaw({ type: "intent", intent });
+    if (ok) {
+      bot.intentsSent++;
+      bot.lastSentIntentTypes.push(intent.type);
+      if (bot.lastSentIntentTypes.length > 30) bot.lastSentIntentTypes.shift();
+      decisionLog("SENT intent: " + intent.type + " " + JSON.stringify(intent).substring(0, 120));
+    }
+    return ok;
   }
 
   // Typed intent senders
   function doAttack(targetID, troops) {
-    if (sendIntent({ type: "attack", targetID, troops: Math.max(1, Math.floor(troops)) })) {
+    const t = Math.max(1, Math.floor(troops));
+    decisionLog("doAttack → target=" + (targetID || "TerraNullius") + " troops=" + fmt(t));
+    if (sendIntent({ type: "attack", targetID, troops: t })) {
       bot.lastAttackTick = bot.tick;
+      if (targetID === null) bot.lastExpandTick = bot.tick;
       return true;
     }
     return false;
@@ -356,21 +393,28 @@
       bot.spawned = false;
       bot.tick = 0;
       bot.myClientID = data.myClientID || bot.myClientID;
-      botLog("Game started!");
+      botLog("Game started! myClientID=" + bot.myClientID);
     } else if (data.type === "turn") {
       bot.tick = data.turn.turnNumber;
-      // Check if we spawned via our own intent
-      if (!bot.spawned && data.turn.intents) {
+      // Track our own intents appearing in turns (confirms server received them)
+      if (data.turn.intents) {
         for (const intent of data.turn.intents) {
-          if (intent.clientID === bot.myClientID && intent.type === "spawn") {
-            bot.spawned = true;
-            botLog("Spawned successfully!");
+          if (intent.clientID === bot.myClientID) {
+            bot.intentsConfirmed++;
+            decisionLog("CONFIRMED intent in turn: " + intent.type);
+            if (intent.type === "spawn") {
+              bot.spawned = true;
+              botLog("Spawned successfully!");
+            }
           }
         }
       }
       // Run the AI brain on every turn
       if (bot.enabled && bot.gameStarted) {
-        try { runAI(); } catch (e) { console.error("[OFBot] AI error:", e); }
+        try { runAI(); } catch (e) {
+          console.error("[OFBot] AI error:", e);
+          decisionLog("AI ERROR: " + e.message);
+        }
       }
     }
   }
@@ -504,195 +548,266 @@
 
   // ═══════════════════════════════════════════════════════════════════════
   //  AI BRAIN — runs every turn (100ms)
-  //  Modeled after NationExecution + AiAttackBehavior but tuned for
-  //  maximum aggression ("Impossible" difficulty style).
+  //  Expansion and combat are checked EVERY tick (separate cooldowns).
+  //  Economy/diplomacy/nukes/naval rotate on remaining ticks.
   // ═══════════════════════════════════════════════════════════════════════
 
   function runAI() {
     const g = gv();
     if (!g) {
-      // Keep trying to find GameView
       bot.gameView = findGameView();
-      bot.currentAction = "Searching for game state...";
+      if (!bot.gameView) {
+        bot.currentAction = "Searching for GameView...";
+        decisionLog("GameView not found yet");
+      }
       return;
     }
 
     const myP = me();
     if (!myP) {
-      bot.currentAction = "Waiting for player...";
+      bot.currentAction = "Waiting for player (GameView found but myPlayer is null)";
       bot.strategy = "Pre-game";
+      decisionLog("myPlayer() returned null — not spawned or dead");
       return;
     }
 
-    bot.spawned = true; // If we can see ourselves, we've spawned
+    bot.spawned = true;
 
     // Snapshot stats for UI
+    const troops = myTroops();
+    const gold = myGold();
+    const tiles = myTiles();
+    const maxT = maxTroopsEstimate();
+    const ratio = maxT > 0 ? troops / maxT : 0;
+    const enems = enemies();
+    const alls = allies();
+    const structs = myStructures();
+    const outAtk = myP.outgoingAttacks();
+    const inAtk = myP.incomingAttacks();
+
     bot.statsSnapshot = {
-      troops: myTroops(),
-      gold: myGold(),
-      tiles: myTiles(),
-      maxTroops: maxTroopsEstimate(),
-      structures: myStructures().length,
-      allies: allies().length,
-      enemies: enemies().length,
+      troops, gold, tiles, maxTroops: maxT,
+      structures: structs.length,
+      allies: alls.length,
+      enemies: enems.length,
+      outgoingAttacks: outAtk.length,
+      incomingAttacks: inAtk.length,
+      troopRatio: ratio,
+      intentsSent: bot.intentsSent,
+      intentsConfirmed: bot.intentsConfirmed,
     };
 
-    // ── Distribute AI work across ticks to avoid lag ──
-    const phase = bot.tick % 5;
-    switch (phase) {
-      case 0: aiCombat(); break;
-      case 1: aiEconomy(); break;
-      case 2: aiDiplomacy(); break;
-      case 3: aiNukes(); break;
-      case 4: aiNaval(); break;
+    // Log a diagnostic snapshot every 50 ticks
+    if (bot.tick % 50 === 0) {
+      decisionLog(
+        "SNAPSHOT: troops=" + fmt(troops) + " max=" + fmt(maxT) +
+        " ratio=" + (ratio * 100).toFixed(0) + "%" +
+        " gold=" + fmt(gold) + " tiles=" + fmt(tiles) +
+        " structs=" + structs.length +
+        " enemies=" + enems.length + " allies=" + alls.length +
+        " outAtk=" + outAtk.length + " inAtk=" + inAtk.length +
+        " sent=" + bot.intentsSent + " confirmed=" + bot.intentsConfirmed
+      );
     }
 
-    // Always check for emergency responses
-    aiEmergency();
+    // ── EXPANSION: checked every tick on its own cooldown ──
+    aiExpand(troops, maxT, ratio);
+
+    // ── COMBAT: checked every tick on its own cooldown ──
+    aiCombat(troops, maxT, ratio, enems, inAtk);
+
+    // ── SECONDARY SYSTEMS: rotate through remaining phases ──
+    const phase = bot.tick % 4;
+    switch (phase) {
+      case 0: aiEconomy(); break;
+      case 1: aiDiplomacy(); break;
+      case 2: aiNukes(); break;
+      case 3: aiNaval(); break;
+    }
+
+    // Adaptive parameters every tick
+    aiAdaptParameters(ratio);
   }
 
   // ──────────────────────────────────────────────────────────────────────
-  //  COMBAT — land attacks
-  //  Priority order mirrors Impossible difficulty from AiAttackBehavior:
-  //   retaliate > expand > veryWeak > assist > bots > victim >
-  //   hated > traitor > afk > weakest > betray
+  //  EXPANSION — conquer unowned (TerraNullius) land
+  //  This is the #1 priority — always grow. Checked every tick.
+  //  Sends attack with targetID=null which the server maps to TerraNullius.
   // ──────────────────────────────────────────────────────────────────────
 
-  function aiCombat() {
-    bot.strategy = "Combat";
-    if (bot.tick - bot.lastAttackTick < bot.attackRate) return;
+  function aiExpand(troops, maxT, ratio) {
+    const expandCd = bot.tick - bot.lastExpandTick;
+    if (expandCd < bot.expandRate) return;
 
-    const troops = myTroops();
-    const maxT = maxTroopsEstimate();
-    const ratio = troops / Math.max(1, maxT);
-    const enems = enemies();
-
-    // Always try to expand into empty land first
-    if (ratio > bot.expandRatio) {
-      // Check if any border is TerraNullius (unowned)
-      // We attack null (server maps null targetID → terraNullius)
-      const expandTroops = Math.floor(troops * 0.25);
-      if (expandTroops > 100) {
-        doAttack(null, expandTroops);
-        bot.currentAction = "Expanding territory";
-        botLog("Expanding into unclaimed land (" + fmt(expandTroops) + " troops)");
-        return;
-      }
-    }
-
-    if (ratio < bot.reserveRatio) {
-      bot.currentAction = "Building troop reserves (" + Math.round(ratio * 100) + "%)";
+    if (ratio < bot.expandRatio) {
+      decisionLog("EXPAND SKIP: ratio too low (" + (ratio * 100).toFixed(0) + "% < " + (bot.expandRatio * 100).toFixed(0) + "% threshold)");
       return;
     }
 
-    // Strategy 1: Retaliate against incoming attacks
-    const myIncoming = me().incomingAttacks();
-    if (myIncoming && myIncoming.length > 0) {
-      const biggest = myIncoming.reduce((a, b) => ((b.troops || 0) > (a.troops || 0) ? b : a), myIncoming[0]);
+    // Send 20% of troops to conquer empty land, minimum 500
+    const expandTroops = Math.max(500, Math.floor(troops * 0.20));
+    if (troops < 1000) {
+      decisionLog("EXPAND SKIP: total troops too low (" + fmt(troops) + ")");
+      return;
+    }
+
+    bot.strategy = "Expansion";
+    bot.currentAction = "Expanding into unclaimed territory (" + fmt(expandTroops) + " troops)";
+    if (doAttack(null, expandTroops)) {
+      botLog("Expanding → " + fmt(expandTroops) + " troops into TerraNullius");
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  //  COMBAT — land attacks against other players
+  //  Runs every tick on its own cooldown (separate from expansion).
+  //  Priority: retaliate > veryWeak > traitor > AFK > victim > weakest
+  // ──────────────────────────────────────────────────────────────────────
+
+  function aiCombat(troops, maxT, ratio, enems, incomingAttacks) {
+    const combatCd = bot.tick - bot.lastAttackTick;
+    if (combatCd < bot.attackRate) return;
+
+    if (enems.length === 0) {
+      decisionLog("COMBAT: no enemies alive");
+      bot.currentAction = "No enemies — expanding only";
+      return;
+    }
+
+    // Need enough troops to both reserve and attack
+    const reserveTroops = maxT * bot.reserveRatio;
+    const available = troops - reserveTroops;
+
+    decisionLog(
+      "COMBAT EVAL: troops=" + fmt(troops) + " reserve=" + fmt(reserveTroops) +
+      " available=" + fmt(available) + " enemies=" + enems.length +
+      " incoming=" + incomingAttacks.length
+    );
+
+    if (available <= 0) {
+      decisionLog("COMBAT SKIP: no troops above reserve (" + (ratio * 100).toFixed(0) + "%)");
+      bot.currentAction = "Building reserves (" + (ratio * 100).toFixed(0) + "% of max)";
+      return;
+    }
+
+    // Sort enemies weakest first
+    const sorted = [...enems].sort((a, b) => a.troops() - b.troops());
+    const enemyInfo = sorted.slice(0, 5).map(e =>
+      safePlayerName(e) + ":" + fmt(e.troops()) + "/" + fmt(e.numTilesOwned()) + "t"
+    ).join(", ");
+    decisionLog("COMBAT enemies (weakest first): " + enemyInfo);
+
+    // ── Strategy 1: Retaliate against incoming attacks ──
+    if (incomingAttacks.length > 0) {
+      const biggest = incomingAttacks.reduce(
+        (a, b) => ((b.troops || 0) > (a.troops || 0) ? b : a),
+        incomingAttacks[0]
+      );
       if (biggest && biggest.attackerID) {
-        const g = gv();
         try {
-          const attacker = g.playerBySmallID(biggest.attackerID);
+          const attacker = gv().playerBySmallID(biggest.attackerID);
           if (attacker && attacker.isPlayer && attacker.isPlayer()) {
             const sendTroops = Math.floor(troops * 0.6);
             doAttack(attacker.id(), sendTroops);
-            bot.currentAction = "Retaliating against " + safePlayerName(attacker);
+            bot.currentAction = "RETALIATING vs " + safePlayerName(attacker);
             bot.strategy = "Retaliation";
-            botLog("Retaliating against " + safePlayerName(attacker) + " (" + fmt(sendTroops) + ")");
+            botLog("Retaliate → " + safePlayerName(attacker) + " (" + fmt(sendTroops) + " troops)");
             return;
           }
-        } catch (_) {}
+        } catch (e) { decisionLog("RETALIATE error: " + e.message); }
       }
+      decisionLog("RETALIATE: incoming attack but could not resolve attacker");
     }
 
-    if (enems.length === 0) {
-      bot.currentAction = "No enemies in range";
-      return;
-    }
-
-    // Sort enemies by various criteria
-    const sorted = [...enems].sort((a, b) => a.troops() - b.troops());
-
-    // Strategy 2: Attack very weak enemies (post-nuke or collapsing)
+    // ── Strategy 2: Finish very weak enemies ──
     for (const e of sorted) {
-      if (e.troops() < maxT * 0.15 && e.troops() < troops * 1.2) {
-        const sendTroops = Math.floor(troops - maxT * bot.reserveRatio);
-        if (sendTroops > 0) {
-          doAttack(e.id(), sendTroops);
-          bot.currentAction = "Finishing off " + safePlayerName(e);
-          bot.strategy = "Elimination";
-          botLog("Attacking weak target: " + safePlayerName(e));
-          return;
-        }
-      }
-    }
-
-    // Strategy 3: Attack traitors
-    for (const e of sorted) {
-      try {
-        if (e.isTraitor() && e.troops() < troops * 1.2) {
-          const sendTroops = Math.floor(troops - maxT * bot.reserveRatio);
-          if (sendTroops > 0) {
-            doAttack(e.id(), sendTroops);
-            bot.currentAction = "Punishing traitor " + safePlayerName(e);
-            bot.strategy = "Traitor Punishment";
-            botLog("Attacking traitor: " + safePlayerName(e));
-            return;
-          }
-        }
-      } catch (_) {}
-    }
-
-    // Strategy 4: Attack disconnected (AFK) players
-    for (const e of sorted) {
-      try {
-        if (e.isDisconnected() && e.troops() < troops * 3) {
-          const sendTroops = Math.floor(troops - maxT * bot.reserveRatio);
-          if (sendTroops > 0) {
-            doAttack(e.id(), sendTroops);
-            bot.currentAction = "Absorbing AFK " + safePlayerName(e);
-            bot.strategy = "AFK Cleanup";
-            botLog("Attacking AFK: " + safePlayerName(e));
-            return;
-          }
-        }
-      } catch (_) {}
-    }
-
-    // Strategy 5: Attack victim (enemy under heavy attack by others)
-    for (const e of sorted) {
-      try {
-        const eIncoming = e.incomingAttacks();
-        if (eIncoming && eIncoming.length > 0) {
-          const totalIncoming = eIncoming.reduce((s, a) => s + (a.troops || 0), 0);
-          if (totalIncoming > e.troops() * 0.5 && e.troops() < troops * 1.2) {
-            const sendTroops = Math.floor(troops - maxT * bot.reserveRatio);
-            if (sendTroops > 0) {
-              doAttack(e.id(), sendTroops);
-              bot.currentAction = "Piling on " + safePlayerName(e);
-              bot.strategy = "Opportunistic Attack";
-              botLog("Attacking distressed target: " + safePlayerName(e));
-              return;
-            }
-          }
-        }
-      } catch (_) {}
-    }
-
-    // Strategy 6: Attack weakest enemy if we're stronger
-    const weakest = sorted[0];
-    if (weakest && weakest.troops() < troops) {
-      const sendTroops = Math.floor(troops - maxT * bot.reserveRatio);
-      if (sendTroops > 0) {
-        doAttack(weakest.id(), sendTroops);
-        bot.currentAction = "Attacking " + safePlayerName(weakest);
-        bot.strategy = "Weakest Target";
-        botLog("Attacking weakest: " + safePlayerName(weakest) + " (" + fmt(weakest.troops()) + " troops)");
+      const eTroops = e.troops();
+      if (eTroops < maxT * 0.15 && eTroops < troops * 1.2) {
+        const sendTroops = Math.floor(available);
+        decisionLog("WEAK TARGET: " + safePlayerName(e) + " troops=" + fmt(eTroops) + " → sending " + fmt(sendTroops));
+        doAttack(e.id(), sendTroops);
+        bot.currentAction = "Finishing off " + safePlayerName(e);
+        bot.strategy = "Elimination";
+        botLog("Eliminate → " + safePlayerName(e) + " (" + fmt(sendTroops) + ")");
         return;
       }
     }
 
-    bot.currentAction = "Holding position, building strength";
+    // ── Strategy 3: Attack traitors ──
+    for (const e of sorted) {
+      try {
+        if (e.isTraitor() && e.troops() < troops * 1.2) {
+          const sendTroops = Math.floor(available);
+          decisionLog("TRAITOR: " + safePlayerName(e) + " → sending " + fmt(sendTroops));
+          doAttack(e.id(), sendTroops);
+          bot.currentAction = "Punishing traitor " + safePlayerName(e);
+          bot.strategy = "Traitor";
+          botLog("Punish traitor → " + safePlayerName(e));
+          return;
+        }
+      } catch (_) {}
+    }
+
+    // ── Strategy 4: Attack AFK (disconnected) players ──
+    for (const e of sorted) {
+      try {
+        if (e.isDisconnected() && e.troops() < troops * 3) {
+          const sendTroops = Math.floor(available);
+          decisionLog("AFK TARGET: " + safePlayerName(e) + " → sending " + fmt(sendTroops));
+          doAttack(e.id(), sendTroops);
+          bot.currentAction = "Absorbing AFK " + safePlayerName(e);
+          bot.strategy = "AFK Cleanup";
+          botLog("AFK cleanup → " + safePlayerName(e));
+          return;
+        }
+      } catch (_) {}
+    }
+
+    // ── Strategy 5: Pile on enemies under heavy attack ──
+    for (const e of sorted) {
+      try {
+        const eIn = e.incomingAttacks();
+        if (eIn && eIn.length > 0) {
+          const totalIncoming = eIn.reduce((s, a) => s + (a.troops || 0), 0);
+          if (totalIncoming > e.troops() * 0.5 && e.troops() < troops * 1.2) {
+            const sendTroops = Math.floor(available);
+            decisionLog("PILE ON: " + safePlayerName(e) + " (under " + fmt(totalIncoming) + " attack) → " + fmt(sendTroops));
+            doAttack(e.id(), sendTroops);
+            bot.currentAction = "Piling on " + safePlayerName(e);
+            bot.strategy = "Opportunistic";
+            botLog("Pile on → " + safePlayerName(e));
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+
+    // ── Strategy 6: Attack weakest enemy we're stronger than ──
+    const weakest = sorted[0];
+    if (weakest && weakest.troops() < troops) {
+      const sendTroops = Math.floor(available);
+      decisionLog("WEAKEST: " + safePlayerName(weakest) + " troops=" + fmt(weakest.troops()) + " → sending " + fmt(sendTroops));
+      doAttack(weakest.id(), sendTroops);
+      bot.currentAction = "Attacking " + safePlayerName(weakest);
+      bot.strategy = "Weakest Target";
+      botLog("Attack weakest → " + safePlayerName(weakest) + " (" + fmt(weakest.troops()) + ")");
+      return;
+    }
+
+    // ── Strategy 7: Even if everyone is stronger, attack with partial force ──
+    if (sorted.length > 0 && available > 5000) {
+      const target = sorted[0];
+      const sendTroops = Math.floor(available * 0.5);
+      decisionLog("AGGRESSIVE: all enemies stronger, partial attack → " + safePlayerName(target) + " with " + fmt(sendTroops));
+      doAttack(target.id(), sendTroops);
+      bot.currentAction = "Aggressive push vs " + safePlayerName(target);
+      bot.strategy = "Aggressive";
+      botLog("Aggressive → " + safePlayerName(target) + " (" + fmt(sendTroops) + ")");
+      return;
+    }
+
+    decisionLog("COMBAT: no viable target found, holding");
+    bot.currentAction = "Holding — building strength";
   }
 
   // ──────────────────────────────────────────────────────────────────────
@@ -703,10 +818,14 @@
 
   function aiEconomy() {
     bot.strategy = "Economy";
-    if (bot.tick - bot.lastBuildTick < 30) return;
+    if (bot.tick - bot.lastBuildTick < 30) {
+      decisionLog("ECON SKIP: build cooldown (" + (bot.tick - bot.lastBuildTick) + "/30)");
+      return;
+    }
 
     const gold = myGold();
     const structures = myStructures();
+    decisionLog("ECON EVAL: gold=" + fmt(gold) + " structures=" + structures.length);
 
     const cities = structures.filter(s => s.type() === UnitType.City && !s.isUnderConstruction());
     const factories = structures.filter(s => s.type() === UnitType.Factory && !s.isUnderConstruction());
@@ -733,15 +852,22 @@
     ];
 
     for (const b of builds) {
-      if (b.condition && gold >= b.cost) {
-        const tile = findBuildTile(STRUCTURE_MIN_DIST);
-        if (tile !== null) {
-          doBuild(b.type, tile);
-          bot.currentAction = "Building " + b.type;
-          botLog("Building " + b.type + " (cost: " + fmt(b.cost) + ")");
-          return;
-        }
+      if (!b.condition) {
+        decisionLog("ECON: " + b.type + " condition not met");
+        continue;
       }
+      if (gold < b.cost) {
+        decisionLog("ECON: " + b.type + " too expensive (need " + fmt(b.cost) + ", have " + fmt(gold) + ")");
+        continue;
+      }
+      const tile = findBuildTile(STRUCTURE_MIN_DIST);
+      if (tile !== null) {
+        doBuild(b.type, tile);
+        bot.currentAction = "Building " + b.type;
+        botLog("Building " + b.type + " (cost: " + fmt(b.cost) + ")");
+        return;
+      }
+      decisionLog("ECON: " + b.type + " — could not find valid build tile");
     }
 
     // Upgrade existing structures (cheapest first for rapid value)
@@ -778,12 +904,16 @@
 
   function aiDiplomacy() {
     bot.strategy = "Diplomacy";
-    if (bot.tick - bot.lastAllianceTick < 100) return;
+    if (bot.tick - bot.lastAllianceTick < 100) {
+      decisionLog("DIPLO SKIP: cooldown (" + (bot.tick - bot.lastAllianceTick) + "/100)");
+      return;
+    }
 
     const myP = me();
     if (!myP) return;
     const enems = enemies();
     const alls = allies();
+    decisionLog("DIPLO EVAL: enemies=" + enems.length + " allies=" + alls.length);
 
     // If we have many enemies, try to ally with the strongest one
     if (enems.length >= 3 && alls.length < 2) {
@@ -840,14 +970,24 @@
 
   function aiNukes() {
     bot.strategy = "Nuclear";
-    if (bot.tick - bot.lastNukeTick < 80) return;
+    if (bot.tick - bot.lastNukeTick < 80) {
+      decisionLog("NUKE SKIP: cooldown (" + (bot.tick - bot.lastNukeTick) + "/80)");
+      return;
+    }
 
     const gold = myGold();
     const silos = myUnits(UnitType.MissileSilo).filter(s => !s.isUnderConstruction());
-    if (silos.length === 0) return;
+    if (silos.length === 0) {
+      decisionLog("NUKE SKIP: no silos built");
+      return;
+    }
 
     const enems = enemies();
-    if (enems.length === 0) return;
+    if (enems.length === 0) {
+      decisionLog("NUKE SKIP: no enemies");
+      return;
+    }
+    decisionLog("NUKE EVAL: silos=" + silos.length + " gold=" + fmt(gold));
 
     // Find the best nuke target — strongest or most threatening enemy
     const target = [...enems].sort((a, b) => b.numTilesOwned() - a.numTilesOwned())[0];
@@ -884,6 +1024,7 @@
     const gold = myGold();
     const ports = myUnits(UnitType.Port).filter(u => !u.isUnderConstruction());
     const warships = myUnits(UnitType.Warship);
+    decisionLog("NAVAL EVAL: ports=" + ports.length + " warships=" + warships.length + " gold=" + fmt(gold));
 
     // Build warship if we have a port and no warships
     if (ports.length > 0 && warships.length < 2 && gold >= warshipCost(warships.length)) {
@@ -932,28 +1073,32 @@
   }
 
   // ──────────────────────────────────────────────────────────────────────
-  //  EMERGENCY — always-active responses to urgent threats
+  //  ADAPTIVE PARAMETERS — tune aggression based on troop reserves
   // ──────────────────────────────────────────────────────────────────────
 
-  function aiEmergency() {
-    const myP = me();
-    if (!myP) return;
+  function aiAdaptParameters(ratio) {
+    const prev = { attackRate: bot.attackRate, expandRate: bot.expandRate, reserveRatio: bot.reserveRatio };
 
-    // Accept incoming alliance requests (if from strong players)
-    // The game doesn't expose pending requests via GameView directly,
-    // so we rely on our diplomatic strategy instead.
-
-    // Adjust attack rate based on troop ratio
-    const ratio = troopRatio();
     if (ratio > 0.8) {
-      bot.attackRate = 20; // Very aggressive when full
-      bot.reserveRatio = 0.25;
+      bot.attackRate = 8;
+      bot.expandRate = 4;
+      bot.reserveRatio = 0.20;
     } else if (ratio > 0.5) {
-      bot.attackRate = 35;
-      bot.reserveRatio = 0.35;
+      bot.attackRate = 15;
+      bot.expandRate = 6;
+      bot.reserveRatio = 0.30;
+    } else if (ratio > 0.25) {
+      bot.attackRate = 25;
+      bot.expandRate = 8;
+      bot.reserveRatio = 0.40;
     } else {
-      bot.attackRate = 60; // Conservative when low
-      bot.reserveRatio = 0.5;
+      bot.attackRate = 40;
+      bot.expandRate = 10;
+      bot.reserveRatio = 0.50;
+    }
+
+    if (bot.tick % 100 === 0) {
+      decisionLog("ADAPT: ratio=" + (ratio * 100).toFixed(0) + "% → atkRate=" + bot.attackRate + " expRate=" + bot.expandRate + " reserve=" + (bot.reserveRatio * 100).toFixed(0) + "%");
     }
   }
 
@@ -1102,17 +1247,22 @@
           <div class="ofbot-sec-title">Status</div>
           <div class="ofbot-row"><span class="ofbot-lbl">Tick</span><span class="ofbot-val" id="ofbot-tick">0</span></div>
           <div class="ofbot-row"><span class="ofbot-lbl">Game</span><span class="ofbot-val" id="ofbot-game">—</span></div>
-          <div class="ofbot-row"><span class="ofbot-lbl">Attack Rate</span><span class="ofbot-val" id="ofbot-arate">—</span></div>
+          <div class="ofbot-row"><span class="ofbot-lbl">Atk / Exp Rate</span><span class="ofbot-val" id="ofbot-arate">—</span></div>
+          <div class="ofbot-row"><span class="ofbot-lbl">Intents Sent</span><span class="ofbot-val" id="ofbot-isent">0</span></div>
+          <div class="ofbot-row"><span class="ofbot-lbl">Intents Confirmed</span><span class="ofbot-val" id="ofbot-iconf">0</span></div>
         </div>
 
         <div class="ofbot-sec">
           <div class="ofbot-sec-title">My Stats</div>
           <div class="ofbot-row"><span class="ofbot-lbl">Troops</span><span class="ofbot-val trp" id="ofbot-trp">0</span></div>
           <div class="ofbot-row"><span class="ofbot-lbl">Max Troops</span><span class="ofbot-val" id="ofbot-mtrp">0</span></div>
+          <div class="ofbot-row"><span class="ofbot-lbl">Troop %</span><span class="ofbot-val" id="ofbot-tratio">0%</span></div>
           <div class="ofbot-row"><span class="ofbot-lbl">Gold</span><span class="ofbot-val gold" id="ofbot-gld">0</span></div>
           <div class="ofbot-row"><span class="ofbot-lbl">Tiles</span><span class="ofbot-val" id="ofbot-tls">0</span></div>
           <div class="ofbot-row"><span class="ofbot-lbl">Structures</span><span class="ofbot-val" id="ofbot-str">0</span></div>
           <div class="ofbot-row"><span class="ofbot-lbl">Allies</span><span class="ofbot-val" id="ofbot-als">0</span></div>
+          <div class="ofbot-row"><span class="ofbot-lbl">Out Attacks</span><span class="ofbot-val" id="ofbot-oatk">0</span></div>
+          <div class="ofbot-row"><span class="ofbot-lbl">In Attacks</span><span class="ofbot-val warn" id="ofbot-iatk">0</span></div>
         </div>
 
         <div class="ofbot-sec">
@@ -1123,7 +1273,14 @@
         </div>
 
         <div class="ofbot-sec">
-          <div class="ofbot-sec-title">Log</div>
+          <div class="ofbot-sec-title">Decision Log</div>
+          <div class="ofbot-log" id="ofbot-dlog" style="max-height:100px;">
+            <div class="ofbot-log-entry">Waiting for decisions...</div>
+          </div>
+        </div>
+
+        <div class="ofbot-sec">
+          <div class="ofbot-sec-title">Activity Log</div>
           <div class="ofbot-log" id="ofbot-log">
             <div class="ofbot-log-entry">Bot v${BOT_VERSION} loaded</div>
           </div>
@@ -1177,16 +1334,21 @@
     set("ofbot-act", bot.currentAction);
     set("ofbot-tick", String(bot.tick));
     set("ofbot-game", bot.gameStarted ? (bot.spawned ? "Active" : "Spawn Phase") : "Waiting");
-    set("ofbot-arate", "every " + bot.attackRate + " ticks");
+    set("ofbot-arate", "atk:" + bot.attackRate + " exp:" + bot.expandRate);
+    set("ofbot-isent", String(bot.intentsSent));
+    set("ofbot-iconf", String(bot.intentsConfirmed));
 
     if (s) {
       set("ofbot-trp", fmt(s.troops));
       set("ofbot-mtrp", fmt(s.maxTroops));
+      set("ofbot-tratio", (s.troopRatio * 100).toFixed(0) + "%");
       set("ofbot-gld", fmt(s.gold));
       set("ofbot-tls", fmt(s.tiles));
       set("ofbot-str", String(s.structures));
       set("ofbot-als", String(s.allies));
       set("ofbot-ecnt", String(s.enemies));
+      set("ofbot-oatk", String(s.outgoingAttacks));
+      set("ofbot-iatk", String(s.incomingAttacks));
     }
 
     // Enemy list
@@ -1206,7 +1368,15 @@
       } catch (_) {}
     }
 
-    // Log
+    // Decision log
+    const dlogEl = document.getElementById("ofbot-dlog");
+    if (dlogEl) {
+      const recent = bot.decisionLog.slice(-20);
+      dlogEl.innerHTML = recent.map(l => '<div class="ofbot-log-entry">' + escHtml(l) + '</div>').join("");
+      dlogEl.scrollTop = dlogEl.scrollHeight;
+    }
+
+    // Activity log
     const logEl = document.getElementById("ofbot-log");
     if (logEl) {
       const recent = bot.log.slice(-25);
