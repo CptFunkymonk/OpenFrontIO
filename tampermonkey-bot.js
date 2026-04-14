@@ -181,6 +181,7 @@
     gameStarted: false,
     spawned: false,
     tick: 0,
+    mode: null, // "multiplayer" or "singleplayer"
 
     // Cooldown tracking (in ticks)
     lastAttackTick: -999,
@@ -229,7 +230,7 @@
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  //  WEBSOCKET INTERCEPTION
+  //  WEBSOCKET INTERCEPTION (multiplayer)
   //  We hook the native WebSocket to capture the game-protocol socket.
   //  The game connects to a path like /w/<gameID> for the game itself;
   //  lobby/matchmaking sockets are excluded.
@@ -247,8 +248,9 @@
       !urlStr.includes("/lobbies") && !urlStr.includes("/matchmaking");
 
     if (isGameSocket) {
-      botLog("Game socket intercepted: " + urlStr);
+      botLog("Game socket intercepted (multiplayer): " + urlStr);
       bot.socket = ws;
+      bot.mode = "multiplayer";
 
       ws.addEventListener("message", function (event) {
         try {
@@ -282,6 +284,124 @@
   Object.defineProperty(window.WebSocket, "CLOSED", {
     value: NativeWebSocket.CLOSED,
   });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  SINGLEPLAYER SUPPORT
+  //  In singleplayer, there is no WebSocket. The game uses LocalServer
+  //  which communicates via direct function calls:
+  //    Transport.sendMsg() → localServer.onMessage(msg)
+  //    LocalServer.endTurn() → clientMessage({type:"turn",...})
+  //
+  //  We hook into this by:
+  //  1. Patching console.log to detect "local server starting"
+  //  2. Periodically scanning for the LocalServer object via DOM walking
+  //  3. Reading turns from the GameView tick count (no message interception)
+  //  4. Calling localServer.onMessage() to inject our intents
+  // ═══════════════════════════════════════════════════════════════════════
+
+  let localServerRef = null;
+  let lastPolledTick = -1;
+
+  // Detect singleplayer start via console.log hook
+  const origConsoleLog = console.log;
+  console.log = function (...args) {
+    origConsoleLog.apply(console, args);
+    if (args.length > 0 && typeof args[0] === "string") {
+      if (args[0] === "local server starting") {
+        botLog("Singleplayer detected — searching for LocalServer");
+        bot.mode = "singleplayer";
+        bot.gameStarted = true;
+        bot.spawned = false;
+        bot.tick = 0;
+      }
+    }
+  };
+
+  /** Search for the LocalServer instance through DOM / module objects. */
+  function findLocalServer() {
+    if (localServerRef) {
+      try { if (typeof localServerRef.onMessage === "function") return localServerRef; } catch (_) {}
+      localServerRef = null;
+    }
+    try {
+      const els = document.querySelectorAll("*");
+      for (const el of els) {
+        const sources = [el];
+        if (el.shadowRoot) sources.push(el.shadowRoot);
+        for (const src of sources) {
+          for (const k of Object.getOwnPropertyNames(src)) {
+            try {
+              const v = src[k];
+              if (!v || typeof v !== "object") continue;
+              // LocalServer has onMessage, turnComplete, endGame
+              if (typeof v.onMessage === "function" && typeof v.turnComplete === "function") {
+                localServerRef = v;
+                botLog("LocalServer found via DOM element");
+                return v;
+              }
+              // One level deeper — Transport has localServer
+              if (v.localServer && typeof v.localServer === "object" && typeof v.localServer.onMessage === "function") {
+                localServerRef = v.localServer;
+                botLog("LocalServer found via Transport");
+                return localServerRef;
+              }
+              // Check for isLocal flag on Transport
+              if (v.isLocal === true && v.localServer) {
+                localServerRef = v.localServer;
+                botLog("LocalServer found via Transport.isLocal");
+                return localServerRef;
+              }
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /**
+   * In singleplayer, poll the GameView tick count to drive the AI loop
+   * (since we can't intercept turn messages).
+   */
+  function singleplayerPoll() {
+    if (bot.mode !== "singleplayer") return;
+    if (!bot.gameStarted) return;
+
+    const g = gv();
+    if (!g) {
+      bot.gameView = findGameView();
+      return;
+    }
+
+    const currentTick = g.ticks();
+    if (currentTick <= lastPolledTick) return;
+    lastPolledTick = currentTick;
+    bot.tick = currentTick;
+
+    // Detect spawn by checking if myPlayer exists
+    const myP = me();
+    if (myP && !bot.spawned) {
+      bot.spawned = true;
+      botLog("Spawned (singleplayer)!");
+    }
+    if (!myP && !g.inSpawnPhase()) {
+      return;
+    }
+
+    // Find LocalServer if we haven't yet
+    if (!localServerRef) findLocalServer();
+
+    // Run AI
+    if (bot.enabled && bot.spawned) {
+      try { runAI(); } catch (e) {
+        console.error("[OFBot] AI error:", e);
+        decisionLog("AI ERROR: " + e.message);
+      }
+    }
+  }
+
+  // Poll for singleplayer ticks at ~10Hz (the game runs at 10 ticks/sec)
+  setInterval(singleplayerPoll, 80);
 
   // ═══════════════════════════════════════════════════════════════════════
   //  GAME VIEW DISCOVERY
@@ -375,6 +495,22 @@
   // ═══════════════════════════════════════════════════════════════════════
 
   function sendRaw(obj) {
+    if (bot.mode === "singleplayer") {
+      // In singleplayer, call LocalServer.onMessage() directly
+      const ls = localServerRef || findLocalServer();
+      if (!ls) {
+        decisionLog("SEND FAIL: LocalServer not found (singleplayer)");
+        return false;
+      }
+      try {
+        ls.onMessage(obj);
+        return true;
+      } catch (e) {
+        decisionLog("SEND FAIL: LocalServer.onMessage error: " + e.message);
+        return false;
+      }
+    }
+    // Multiplayer: send via WebSocket
     if (!bot.socket) {
       decisionLog("SEND FAIL: no socket reference");
       return false;
@@ -1548,7 +1684,7 @@
     set("ofbot-strat", bot.strategy);
     set("ofbot-act", bot.currentAction);
     set("ofbot-tick", String(bot.tick));
-    set("ofbot-game", bot.gameStarted ? (bot.spawned ? "Active" : "Spawn Phase") : "Waiting");
+    set("ofbot-game", bot.gameStarted ? (bot.spawned ? "Active" : "Spawn Phase") + " (" + (bot.mode || "?") + ")" : "Waiting");
     set("ofbot-arate", "atk:" + bot.attackRate + " exp:" + bot.expandRate);
     set("ofbot-isent", String(bot.intentsSent));
     set("ofbot-iconf", String(bot.intentsConfirmed));
