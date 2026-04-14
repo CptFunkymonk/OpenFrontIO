@@ -557,6 +557,62 @@
     });
   }
 
+  /**
+   * Find which enemies we share a border with by sampling our territory.
+   * This is the CRITICAL filter — attacks against non-adjacent players
+   * immediately retreat in AttackExecution.tick() because there are no
+   * tiles to conquer (toConquer is empty → refreshToConquer → retreat).
+   *
+   * We sample random tiles we own, check if they're border tiles, and
+   * look at their neighbors to find adjacent enemy smallIDs.
+   */
+  function borderingEnemyIDs() {
+    const g = gv();
+    const myP = me();
+    if (!g || !myP) return new Set();
+
+    const mySID = myP.smallID();
+    const adjacentSIDs = new Set();
+    const w = g.width();
+    const h = g.height();
+
+    // Sample territory tiles and check neighbors
+    // More samples = more accurate but slower. 500 is a good balance.
+    for (let i = 0; i < 500; i++) {
+      const x = Math.floor(Math.random() * w);
+      const y = Math.floor(Math.random() * h);
+      if (!g.isValidCoord(x, y)) continue;
+      const ref = g.ref(x, y);
+      if (!g.isLand(ref)) continue;
+      if (g.ownerID(ref) !== mySID) continue;
+
+      // Check if this is a border tile (has a neighbor owned by someone else)
+      for (const n of g.neighbors(ref)) {
+        const nOwner = g.ownerID(n);
+        if (nOwner !== mySID && nOwner !== 0) {
+          adjacentSIDs.add(nOwner);
+        }
+        // Also check for TerraNullius (ownerID 0) border
+        if (nOwner === 0 && g.isLand(n)) {
+          adjacentSIDs.add(0); // TerraNullius
+        }
+      }
+    }
+    return adjacentSIDs;
+  }
+
+  /** Return only enemies we share a land border with. */
+  function borderingEnemies() {
+    const adjSIDs = borderingEnemyIDs();
+    if (adjSIDs.size === 0) return [];
+    return enemies().filter(e => adjSIDs.has(e.smallID()));
+  }
+
+  /** Check if we border any TerraNullius (unowned land). */
+  function bordersTerraNullius() {
+    return borderingEnemyIDs().has(0);
+  }
+
   function myUnits(...types) {
     const g = gv();
     const myP = me();
@@ -681,18 +737,22 @@
     const outAtk = myP.outgoingAttacks();
     const inAtk = myP.incomingAttacks();
 
+    const bordEnems = borderingEnemies();
     const enemBots = enems.filter(e => { try { return e.type() !== PlayerType.Human; } catch(_) { return false; } }).length;
     const enemHumans = enems.length - enemBots;
+    const bordersTN = bordersTerraNullius();
 
     bot.statsSnapshot = {
       troops, gold, tiles, maxTroops: maxT,
       structures: structs.length,
       allies: alls.length,
       enemies: enems.length,
+      borderingEnemies: bordEnems.length,
       enemBots, enemHumans,
       outgoingAttacks: outAtk.length,
       incomingAttacks: inAtk.length,
       troopRatio: ratio,
+      bordersTN,
       intentsSent: bot.intentsSent,
       intentsConfirmed: bot.intentsConfirmed,
     };
@@ -705,10 +765,17 @@
         " gold=" + fmt(gold) + " tiles=" + fmt(tiles) +
         " structs=" + structs.length +
         " enemies=" + enems.length + "(" + enemBots + " AI+" + enemHumans + " human)" +
+        " BORDERING=" + bordEnems.length +
+        " bordersTN=" + bordersTN +
         " allies=" + alls.length +
         " outAtk=" + outAtk.length + " inAtk=" + inAtk.length +
         " sent=" + bot.intentsSent + " confirmed=" + bot.intentsConfirmed
       );
+      if (bordEnems.length > 0) {
+        decisionLog("  Adjacent enemies: " + bordEnems.map(e => safePlayerName(e) + "[" + safePlayerType(e) + "]").join(", "));
+      } else {
+        decisionLog("  NO ADJACENT ENEMIES — can only expand into TerraNullius or use boats");
+      }
       // Log optimal attack analysis for each enemy
       if (enems.length > 0) {
         const top = [...enems].sort((a, b) => a.troops() - b.troops()).slice(0, 3);
@@ -725,10 +792,11 @@
     }
 
     // ── EXPANSION: checked every tick on its own cooldown ──
-    aiExpand(troops, maxT, ratio);
+    aiExpand(troops, maxT, ratio, bordersTN);
 
     // ── COMBAT: checked every tick on its own cooldown ──
-    aiCombat(troops, maxT, ratio, enems, inAtk);
+    // Only attack bordering enemies — non-adjacent attacks immediately retreat!
+    aiCombat(troops, maxT, ratio, bordEnems, inAtk);
 
     // ── SECONDARY SYSTEMS: rotate through remaining phases ──
     const phase = bot.tick % 4;
@@ -749,9 +817,14 @@
   //  Sends attack with targetID=null which the server maps to TerraNullius.
   // ──────────────────────────────────────────────────────────────────────
 
-  function aiExpand(troops, maxT, ratio) {
+  function aiExpand(troops, maxT, ratio, bordersTN) {
     const expandCd = bot.tick - bot.lastExpandTick;
     if (expandCd < bot.expandRate) return;
+
+    if (!bordersTN) {
+      decisionLog("EXPAND SKIP: no bordering unclaimed land");
+      return;
+    }
 
     const calc = calcExpandTroops(troops, maxT, bot.expandReserve);
     if (calc.troops <= 0) {
@@ -777,14 +850,14 @@
     if (combatCd < bot.attackRate) return;
 
     if (enems.length === 0) {
-      decisionLog("COMBAT: no enemies alive");
-      bot.currentAction = "No enemies — expanding only";
+      decisionLog("COMBAT: no ADJACENT enemies (attacks only work on bordering players)");
+      bot.currentAction = "No adjacent enemies — expanding only";
       return;
     }
 
     decisionLog(
       "COMBAT EVAL: troops=" + fmtTroops(troops) + " maxT=" + fmtTroops(maxT) +
-      " ratio=" + (ratio * 100).toFixed(0) + "% enemies=" + enems.length +
+      " ratio=" + (ratio * 100).toFixed(0) + "% adjacent_enemies=" + enems.length +
       " incoming=" + incomingAttacks.length
     );
 
@@ -1479,7 +1552,7 @@
       set("ofbot-tls", fmt(s.tiles));
       set("ofbot-str", String(s.structures));
       set("ofbot-als", String(s.allies));
-      set("ofbot-ecnt", String(s.enemies) + " (" + (s.enemBots||0) + " AI)");
+      set("ofbot-ecnt", String(s.borderingEnemies || 0) + " adjacent / " + String(s.enemies) + " total (" + (s.enemBots||0) + " AI)");
       set("ofbot-oatk", String(s.outgoingAttacks));
       set("ofbot-iatk", String(s.incomingAttacks));
     }
