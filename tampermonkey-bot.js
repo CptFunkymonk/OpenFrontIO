@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io AI Opponent Bot
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.4.0
 // @description  Autonomous AI bot for OpenFront.io with full game-state awareness and strategic decision-making
 // @author       OpenFront Bot
 // @match        https://openfront.io/*
@@ -17,7 +17,7 @@
   //  CONSTANTS & ENUMS (mirrored from src/core/game/Game.ts)
   // ═══════════════════════════════════════════════════════════════════════
 
-  const BOT_VERSION = "1.3.0";
+  const BOT_VERSION = "1.4.0";
 
   // Internal troop values are 10x what the game displays to the user.
   // renderTroops() in Utils.ts does: renderNumber(troops / 10)
