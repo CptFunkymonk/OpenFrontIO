@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io AI Opponent Bot
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.5.0
 // @description  Autonomous AI bot for OpenFront.io with full game-state awareness and strategic decision-making
 // @author       OpenFront Bot
 // @match        https://openfront.io/*
@@ -17,7 +17,7 @@
   //  CONSTANTS & ENUMS (mirrored from src/core/game/Game.ts)
   // ═══════════════════════════════════════════════════════════════════════
 
-  const BOT_VERSION = "1.4.0";
+  const BOT_VERSION = "1.5.0";
 
   // Internal troop values are 10x what the game displays to the user.
   // renderTroops() in Utils.ts does: renderNumber(troops / 10)
@@ -791,20 +791,25 @@
       }
     }
 
-    // ── EXPANSION: checked every tick on its own cooldown ──
+    // ── EXPANSION: checked every tick — #1 priority always ──
     aiExpand(troops, maxT, ratio, bordersTN);
 
-    // ── COMBAT: checked every tick on its own cooldown ──
-    // Only attack bordering enemies — non-adjacent attacks immediately retreat!
+    // ── COMBAT: checked every tick — #2 priority always ──
     aiCombat(troops, maxT, ratio, bordEnems, inAtk);
 
-    // ── SECONDARY SYSTEMS: rotate through remaining phases ──
-    const phase = bot.tick % 4;
-    switch (phase) {
-      case 0: aiEconomy(); break;
-      case 1: aiDiplomacy(); break;
-      case 2: aiNukes(); break;
-      case 3: aiNaval(); break;
+    // ── ECONOMY: checked frequently (every 3 ticks) — #3 priority ──
+    if (bot.tick % 3 === 0) aiEconomy(tiles);
+
+    // ── SECONDARY SYSTEMS: phase-gated by game progress ──
+    // Early game (< 500 tiles): ONLY expand, fight, build cities/factories
+    // Mid game (500-3000 tiles): add diplomacy, defense posts, ports
+    // Late game (3000+ tiles): add nukes, naval, SAMs, silos
+    if (tiles >= 300) {
+      if (bot.tick % 8 === 0) aiDiplomacy();
+    }
+    if (tiles >= 2000) {
+      if (bot.tick % 12 === 0) aiNukes();
+      if (bot.tick % 16 === 0) aiNaval();
     }
 
     // Adaptive parameters every tick
@@ -996,16 +1001,12 @@
   //  Mirrors NationStructureBehavior logic with aggressive build cadence
   // ──────────────────────────────────────────────────────────────────────
 
-  function aiEconomy() {
+  function aiEconomy(tiles) {
     bot.strategy = "Economy";
-    if (bot.tick - bot.lastBuildTick < 30) {
-      decisionLog("ECON SKIP: build cooldown (" + (bot.tick - bot.lastBuildTick) + "/30)");
-      return;
-    }
+    if (bot.tick - bot.lastBuildTick < 20) return;
 
     const gold = myGold();
     const structures = myStructures();
-    decisionLog("ECON EVAL: gold=" + fmt(gold) + " structures=" + structures.length);
 
     const cities = structures.filter(s => s.type() === UnitType.City && !s.isUnderConstruction());
     const factories = structures.filter(s => s.type() === UnitType.Factory && !s.isUnderConstruction());
@@ -1021,21 +1022,34 @@
     const numSilos = silos.length;
     const numSAMs = sams.length;
 
-    // Build priority order
-    const builds = [
-      { type: UnitType.City, cost: cityCost(numCities), condition: numCities < 8 },
-      { type: UnitType.Factory, cost: cityCost(Math.min(numPorts, numFactories)), condition: numFactories < numCities && numFactories < 4 },
-      { type: UnitType.Port, cost: cityCost(Math.min(numPorts, numFactories)), condition: numPorts < 2 && numCities >= 1 },
-      { type: UnitType.DefensePost, cost: defensePostCost(numDP), condition: numDP < numCities * 2 + 2 },
-      { type: UnitType.MissileSilo, cost: SILO_COST, condition: numSilos < Math.max(1, Math.floor(numCities / 2)) },
-      { type: UnitType.SAMLauncher, cost: samCost(numSAMs), condition: numSAMs < Math.max(1, Math.floor(numCities / 2)) },
-    ];
+    // Phase-based build priorities:
+    // Early (< 500 tiles): City, Factory only — maximize troop cap and gold income
+    // Mid (500-2000): add DefensePost, Port
+    // Late (2000+): add MissileSilo, SAMLauncher
+    const builds = [];
+
+    // ALWAYS: Cities are king — they boost maxTroops by 250K per level
+    builds.push({ type: UnitType.City, cost: cityCost(numCities), condition: numCities < 8 });
+
+    // ALWAYS: Factories generate gold via trains
+    builds.push({ type: UnitType.Factory, cost: cityCost(Math.min(numPorts, numFactories)), condition: numFactories < numCities && numFactories < 4 });
+
+    // MID GAME: Ports for trade income, defense posts for border protection
+    if (tiles >= 500) {
+      builds.push({ type: UnitType.Port, cost: cityCost(Math.min(numPorts, numFactories)), condition: numPorts < 2 && numCities >= 1 });
+      builds.push({ type: UnitType.DefensePost, cost: defensePostCost(numDP), condition: numDP < numCities * 2 + 2 });
+    }
+
+    // LATE GAME: Military structures only after we have territory and economy
+    if (tiles >= 2000 && numCities >= 2) {
+      builds.push({ type: UnitType.MissileSilo, cost: SILO_COST, condition: numSilos < Math.max(1, Math.floor(numCities / 3)) });
+      builds.push({ type: UnitType.SAMLauncher, cost: samCost(numSAMs), condition: numSAMs < Math.max(1, Math.floor(numCities / 3)) });
+    }
+
+    decisionLog("ECON EVAL: gold=" + fmt(gold) + " tiles=" + fmt(tiles) + " structs=" + structures.length + " phase=" + (tiles < 500 ? "EARLY" : tiles < 2000 ? "MID" : "LATE"));
 
     for (const b of builds) {
-      if (!b.condition) {
-        decisionLog("ECON: " + b.type + " condition not met");
-        continue;
-      }
+      if (!b.condition) continue;
       if (gold < b.cost) {
         decisionLog("ECON: " + b.type + " too expensive (need " + fmt(b.cost) + ", have " + fmt(gold) + ")");
         continue;
@@ -1050,22 +1064,17 @@
       decisionLog("ECON: " + b.type + " — could not find valid build tile");
     }
 
-    // Upgrade existing structures (cheapest first for rapid value)
-    if (bot.tick - bot.lastUpgradeTick < 40) return;
-    const upgradable = structures.filter(s => {
-      const t = s.type();
-      return !s.isUnderConstruction() && (
-        t === UnitType.City || t === UnitType.Port ||
-        t === UnitType.Factory || t === UnitType.MissileSilo ||
-        t === UnitType.SAMLauncher
-      );
-    });
+    // Upgrade existing structures — cities first, always
+    if (bot.tick - bot.lastUpgradeTick < 30) return;
+    const upgradeOrder = [UnitType.City, UnitType.Factory, UnitType.Port];
+    // Only upgrade military in late game
+    if (tiles >= 2000) {
+      upgradeOrder.push(UnitType.MissileSilo, UnitType.SAMLauncher);
+    }
 
-    // Prioritize upgrading cities and silos
-    const upgradeOrder = [UnitType.City, UnitType.MissileSilo, UnitType.SAMLauncher, UnitType.Port, UnitType.Factory];
     for (const targetType of upgradeOrder) {
-      for (const s of upgradable) {
-        if (s.type() === targetType && gold >= 200_000) {
+      for (const s of structures) {
+        if (s.type() === targetType && !s.isUnderConstruction() && gold >= 200_000) {
           doUpgrade(s.id(), s.type());
           bot.currentAction = "Upgrading " + s.type();
           botLog("Upgrading " + s.type() + " (level " + s.level() + ")");
