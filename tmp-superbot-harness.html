@@ -175,6 +175,9 @@
         samRange(level) {
           return 70 + (level - 1) * 10;
         },
+        boatMaxNumber() {
+          return 3;
+        },
       };
 
       const myPlayer = {
@@ -748,6 +751,8 @@
       }
 
       const results = {};
+      const scenario =
+        new URLSearchParams(window.location.search).get("scenario") || "all";
 
       function wait(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
@@ -762,58 +767,94 @@
         );
       }
 
-      async function run() {
-        setSpawnManualState();
-        await wait(900);
-        results.hooks =
+      function hasHooks() {
+        return (
           !!document.querySelector("#superbot-panel") &&
           document.body.textContent.includes("GameView") &&
-          document.body.textContent.includes("captured");
-        results.spawnManual = hasIntent("spawn");
+          document.body.textContent.includes("captured")
+        );
+      }
 
-        window.sentMessages.length = 0;
-        setSpawnRandomState();
-        await wait(700);
-        results.spawnRandom = !hasIntent("spawn");
-
-        window.sentMessages.length = 0;
-        setExpandState();
-        await wait(900);
-        results.expand = hasIntent("attack", (intent) => intent.targetID === null);
-
-        window.sentMessages.length = 0;
+      async function runCombatScenario() {
         setCombatState();
         await wait(900);
-        results.combat = hasIntent("attack", (intent) => intent.targetID === "player-2");
-
-        window.sentMessages.length = 0;
-        setNukeState();
-        await wait(1100);
-        results.nuke = hasIntent(
-          "build_unit",
-          (intent) => intent.unit === "Atom Bomb" && intent.tile === state.enemyCityTile,
+        results.hooks = hasHooks();
+        results.combat = hasIntent(
+          "attack",
+          (intent) => intent.targetID === "player-2",
         );
+      }
 
-        window.sentMessages.length = 0;
-        setEconomyState();
-        await wait(1100);
-        results.economy = hasIntent(
-          "build_unit",
-          (intent) => intent.unit === "City",
-        );
-
-        window.sentMessages.length = 0;
+      async function runNavalScenario() {
         setNavalState();
         await wait(1200);
+        results.hooks = hasHooks();
         results.naval = hasIntent("boat");
+      }
 
-        window.sentMessages.length = 0;
-        setDiplomacyState();
-        await wait(1200);
-        results.diplomacy = hasIntent(
-          "donate_troops",
-          (intent) => intent.recipient === "player-3",
-        );
+      async function run() {
+        if (scenario === "combat") {
+          await runCombatScenario();
+        } else if (scenario === "naval") {
+          await runNavalScenario();
+        } else {
+          setSpawnManualState();
+          await wait(900);
+          results.hooks = hasHooks();
+          results.spawnManual = hasIntent("spawn");
+
+          window.sentMessages.length = 0;
+          setSpawnRandomState();
+          await wait(700);
+          results.spawnRandom = !hasIntent("spawn");
+
+          window.sentMessages.length = 0;
+          setExpandState();
+          await wait(900);
+          results.expand = hasIntent(
+            "attack",
+            (intent) => intent.targetID === null,
+          );
+
+          window.sentMessages.length = 0;
+          setCombatState();
+          await wait(900);
+          results.combat = hasIntent(
+            "attack",
+            (intent) => intent.targetID === "player-2",
+          );
+
+          window.sentMessages.length = 0;
+          setNukeState();
+          await wait(1100);
+          results.nuke = hasIntent(
+            "build_unit",
+            (intent) =>
+              intent.unit === "Atom Bomb" &&
+              intent.tile === state.enemyCityTile,
+          );
+
+          window.sentMessages.length = 0;
+          setEconomyState();
+          await wait(1100);
+          results.economy = hasIntent(
+            "build_unit",
+            (intent) => intent.unit === "City",
+          );
+
+          window.sentMessages.length = 0;
+          setNavalState();
+          await wait(1200);
+          results.naval = hasIntent("boat");
+
+          window.sentMessages.length = 0;
+          setDiplomacyState();
+          await wait(1200);
+          results.diplomacy = hasIntent(
+            "donate_troops",
+            (intent) => intent.recipient === "player-3",
+          );
+        }
 
         const pass = Object.values(results).every(Boolean);
         document.body.setAttribute("data-status", pass ? "pass" : "fail");
