@@ -181,6 +181,9 @@
         smallID() {
           return 1;
         },
+        isPlayer() {
+          return true;
+        },
         id() {
           return "player-1";
         },
@@ -332,6 +335,9 @@
         smallID() {
           return 2;
         },
+        isPlayer() {
+          return true;
+        },
         id() {
           return "player-2";
         },
@@ -389,6 +395,9 @@
       const allyPlayer = {
         smallID() {
           return 3;
+        },
+        isPlayer() {
+          return true;
         },
         id() {
           return "player-3";
@@ -713,7 +722,7 @@
           ref(31, 31),
         ]);
         state.allyTiles = new Set();
-        state.borderTiles = [ref(6, 5), ref(6, 6)];
+        state.borderTiles = [];
         resetCommon();
         state.transportSpawnTargets = new Set([ref(30, 30)]);
         state.myCoastTiles = new Set([ref(6, 5), ref(6, 6)]);
