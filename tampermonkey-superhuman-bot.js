@@ -749,6 +749,25 @@
     return safeCall(() => me.units(type), []);
   }
 
+  function getUnitLevelCount(player, type) {
+    if (!player) return 0;
+    if (typeof player.totalUnitLevels === "function") {
+      return safeCall(() => player.totalUnitLevels(type), 0);
+    }
+    return safeCall(
+      () =>
+        player
+          .units(type)
+          .reduce((sum, unit) => sum + Math.max(1, safeCall(() => unit.level(), 1)), 0),
+      0,
+    );
+  }
+
+  function getUnitEntityCount(player, type) {
+    if (!player) return 0;
+    return safeCall(() => player.units(type).length, 0);
+  }
+
   function chooseCounterTarget(incomingAttacks) {
     if (!incomingAttacks || incomingAttacks.length === 0) return null;
     let largest = incomingAttacks[0];
@@ -1061,12 +1080,15 @@
   }
 
   function shouldBuildType(type, me, enemies) {
-    const count = safeCall(() => me.unitsOwned(type), 0);
-    const cities = safeCall(() => me.unitsOwned(UnitType.City), 0);
+    const count = getUnitLevelCount(me, type);
+    const cities = getUnitLevelCount(me, UnitType.City);
     const hasCoast = runtime.state.borderCache.tiles.some((tile) =>
       safeCall(() => getGameView().isOceanShore(tile), false),
     );
-    const nukesEnabled = true;
+    const nukesEnabled =
+      !safeCall(() => getGameView().config().isUnitDisabled(UnitType.AtomBomb), false) ||
+      !safeCall(() => getGameView().config().isUnitDisabled(UnitType.HydrogenBomb), false) ||
+      !safeCall(() => getGameView().config().isUnitDisabled(UnitType.MIRV), false);
 
     switch (type) {
       case UnitType.City:
@@ -1198,7 +1220,7 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.naval < 36) return false;
 
-    const currentBoats = safeCall(() => me.unitCount(UnitType.TransportShip), 0);
+    const currentBoats = getUnitEntityCount(me, UnitType.TransportShip);
     if (currentBoats >= gameView.config().boatMaxNumber()) {
       decisionLog("naval: transport cap reached");
       return false;
@@ -1470,7 +1492,7 @@
       borderTiles: borderTiles.length,
       outgoingAttacks: me.outgoingAttacks().length,
       incomingAttacks: me.incomingAttacks().length,
-      boats: safeCall(() => me.unitCount(UnitType.TransportShip), 0),
+      boats: getUnitEntityCount(me, UnitType.TransportShip),
       intentsSent: runtime.state.intentsSent,
       intentsConfirmed: runtime.state.intentsConfirmed,
     };
