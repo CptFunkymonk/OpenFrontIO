@@ -341,7 +341,7 @@
     const me = getMyLivingPlayer();
     if (!me) return null;
     try {
-      return await me.actions(tile, units || null);
+      return await me.actions(tile, units === undefined ? null : units);
     } catch (error) {
       decisionLog("player actions query failed: " + error.message);
       return null;
@@ -352,7 +352,7 @@
     const me = getMyLivingPlayer();
     if (!me) return [];
     try {
-      return await me.buildables(tile, units);
+      return await me.buildables(tile, units === undefined ? undefined : units);
     } catch (error) {
       decisionLog("buildables query failed: " + error.message);
       return [];
@@ -781,6 +781,10 @@
     return safeCall(() => gameView.playerBySmallID(largest.attackerID), null);
   }
 
+  function isTeamMode(gameView) {
+    return safeCall(() => gameView.config().gameConfig().gameMode === "Team", false);
+  }
+
   function getEnemyStrengthScore(enemy, me, borderContacts) {
     const meTroops = me.troops();
     const enemyTroops = enemy.troops();
@@ -793,7 +797,7 @@
     if (safeCall(() => enemy.isDisconnected(), false)) score += 26;
     if (safeCall(() => enemy.isTraitor(), false)) score += 20;
     if (enemy.numTilesOwned() > me.numTilesOwned() * 1.35) score += 14;
-    if (enemy.incomingAttacks().length > 0) score += 11;
+    if (safeCall(() => enemy.incomingAttacks().length > 0, false)) score += 11;
     if (troopRatio > 1.8) score += 22;
     else if (troopRatio > 1.25) score += 15;
     else if (troopRatio > 0.9) score += 8;
@@ -851,7 +855,7 @@
       );
       for (const sam of nearbySams) {
         const owner = sam.unit.owner();
-        if (owner.isMe && owner.isMe()) continue;
+        if (safeCall(() => owner.isMe(), false)) continue;
         if (
           ignoreFriendlyAlliedBlast &&
           safeCall(() => me.isFriendly(owner), false)
@@ -1384,13 +1388,13 @@
     const allies = getAllies();
     const enemies = getEnemies();
 
-    if (gameView.config().gameConfig().gameMode === "Team" && allies.length > 0) {
+    if (isTeamMode(gameView) && allies.length > 0) {
       let mostNeedy = null;
       for (const ally of allies) {
         const allyMax = gameView.config().maxTroops(ally);
         const ratio = ally.troops() / Math.max(allyMax, 1);
         if (
-          ally.incomingAttacks().length > 0 &&
+          safeCall(() => ally.incomingAttacks().length > 0, false) &&
           (!mostNeedy || ratio < mostNeedy.ratio)
         ) {
           mostNeedy = { ally, ratio };
@@ -2027,6 +2031,8 @@
   }
 
   function init() {
+    window.__superhumanBotRuntime = runtime;
+    window.__superhumanBotRefreshOverlay = refreshOverlay;
     installWebSocketHook();
     installWorkerHook();
     bootstrapOverlay();
