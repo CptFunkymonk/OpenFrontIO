@@ -677,6 +677,34 @@
     return Array.from(counts.values());
   }
 
+  async function getAdjacentEnemyInfoWithActions(borderTiles, me) {
+    const adjacentEnemies = getAdjacentEnemyInfo(borderTiles, me);
+    const enriched = [];
+
+    for (const info of adjacentEnemies) {
+      let legalFrontCount = 0;
+      const sampleTiles = uniqueBy(info.hostileTiles, (tile) => tile).slice(0, 6);
+
+      for (const tile of sampleTiles) {
+        const actions = await queryPlayerActions(tile, null);
+        if (actions && actions.canAttack) {
+          legalFrontCount += 1;
+        }
+      }
+
+      if (legalFrontCount > 0) {
+        enriched.push({
+          player: info.player,
+          borderContacts: info.borderContacts,
+          hostileTiles: info.hostileTiles,
+          legalFrontCount,
+        });
+      }
+    }
+
+    return enriched;
+  }
+
   function getAdjacentExpansionSegments(borderTiles, me) {
     const gameView = getGameView();
     if (!gameView || !me) return [];
@@ -1020,7 +1048,7 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.combat < 8) return false;
 
-    const adjacentEnemies = getAdjacentEnemyInfo(borderTiles, me);
+    const adjacentEnemies = await getAdjacentEnemyInfoWithActions(borderTiles, me);
     if (adjacentEnemies.length === 0) {
       decisionLog("combat: no adjacent enemies");
       return false;
@@ -1046,8 +1074,10 @@
     }
 
     adjacentEnemies.sort((a, b) => {
-      const aScore = getEnemyStrengthScore(a.player, me, a.borderContacts);
-      const bScore = getEnemyStrengthScore(b.player, me, b.borderContacts);
+      const aScore =
+        getEnemyStrengthScore(a.player, me, a.borderContacts) + a.legalFrontCount * 3;
+      const bScore =
+        getEnemyStrengthScore(b.player, me, b.borderContacts) + b.legalFrontCount * 3;
       return bScore - aScore;
     });
 
