@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
+// @version      2.0.1
 // @description  Standalone legality-aware OpenFront bot built from repo source
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -13,7 +13,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.0.0";
+  const BOT_VERSION = "2.0.1";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -87,6 +87,13 @@
         attempted: false,
         lastAttemptTick: -999,
         lastChosenTile: null,
+        /** @type {Map<number, { center: number, score: number }>} */
+        candidateByCenter: null,
+        /** @type {{ center: number, score: number }[] | null} */
+        sortedCandidates: null,
+        finalIndex: 0,
+        maxCandidateCenters: 2000,
+        randomSpawnIntentSent: false,
       },
       cooldowns: {
         expand: -999,
@@ -132,7 +139,8 @@
 
   function decisionLog(message) {
     const tick =
-      runtime.hooks.gameView && typeof runtime.hooks.gameView.ticks === "function"
+      runtime.hooks.gameView &&
+      typeof runtime.hooks.gameView.ticks === "function"
         ? runtime.hooks.gameView.ticks()
         : 0;
     const entry = "T" + tick + " " + message;
@@ -239,11 +247,20 @@
         if (descriptor.uiKey && element[descriptor.uiKey]) {
           runtime.hooks.uiState = element[descriptor.uiKey];
         }
-        botLog("GameView discovered via " + descriptor.selector + "." + descriptor.gameKey);
+        botLog(
+          "GameView discovered via " +
+            descriptor.selector +
+            "." +
+            descriptor.gameKey,
+        );
         return candidate;
       }
 
-      if (descriptor.uiKey && element[descriptor.uiKey] && !runtime.hooks.uiState) {
+      if (
+        descriptor.uiKey &&
+        element[descriptor.uiKey] &&
+        !runtime.hooks.uiState
+      ) {
         runtime.hooks.uiState = element[descriptor.uiKey];
       }
     }
@@ -272,7 +289,10 @@
 
   function getRocketDirectionUp() {
     return safeCall(
-      () => Boolean(runtime.hooks.uiState && runtime.hooks.uiState.rocketDirectionUp),
+      () =>
+        Boolean(
+          runtime.hooks.uiState && runtime.hooks.uiState.rocketDirectionUp,
+        ),
       true,
     );
   }
@@ -292,7 +312,10 @@
   function getAllPlayers() {
     const gameView = getGameView();
     if (!gameView) return [];
-    return safeCall(() => gameView.playerViews().filter((player) => player.isAlive()), []);
+    return safeCall(
+      () => gameView.playerViews().filter((player) => player.isAlive()),
+      [],
+    );
   }
 
   function getEnemies() {
@@ -318,7 +341,10 @@
     const gameView = getGameView();
     if (!me || !gameView) return runtime.state.borderCache.tiles;
 
-    const tick = safeCall(() => gameView.ticks(), runtime.state.borderCache.tick);
+    const tick = safeCall(
+      () => gameView.ticks(),
+      runtime.state.borderCache.tick,
+    );
     if (!force && tick - runtime.state.borderCache.tick < 8) {
       return runtime.state.borderCache.tiles;
     }
@@ -423,7 +449,10 @@
   function sendSpawn(tile) {
     const success = sendIntent({ type: "spawn", tile });
     if (success) {
-      runtime.state.spawn.lastAttemptTick = safeCall(() => getGameView().ticks(), 0);
+      runtime.state.spawn.lastAttemptTick = safeCall(
+        () => getGameView().ticks(),
+        0,
+      );
       runtime.state.spawn.lastChosenTile = tile;
       runtime.state.lastAction = "spawning";
       runtime.state.strategy = "spawn";
@@ -534,6 +563,13 @@
     return uniqueBy(results, (tile) => tile);
   }
 
+  /** Matches core TerrainType: Plains=0, Highland=1, Mountain=2 */
+  const TerrainType = Object.freeze({
+    Plains: 0,
+    Highland: 1,
+    Mountain: 2,
+  });
+
   function getManualSpawnTiles(centerTile) {
     const gameView = getGameView();
     if (!gameView) return null;
@@ -554,6 +590,101 @@
     }
 
     return tiles;
+  }
+
+  /**
+   * Score for a legal spawn center: prioritize Plains in the spawn patch, then
+   * existing expansion heuristics (open land, flood, penalties). Returns null if invalid.
+   */
+  function computeSpawnCenterScore(gameView, center) {
+    if (!gameView.isLand(center) || gameView.hasOwner(center)) return null;
+    if (safeCall(() => gameView.isBorder(center), false)) return null;
+
+    const spawnTiles = getManualSpawnTiles(center);
+    if (!spawnTiles || spawnTiles.length === 0) return null;
+
+    const minDist = safeCall(
+      () => gameView.config().minDistanceBetweenPlayers(),
+      0,
+    );
+    const me = getMyPlayer();
+    const mySmall = me ? safeCall(() => me.smallID(), -1) : -1;
+    for (const p of safeCall(() => gameView.playerViews(), [])) {
+      if (!p) continue;
+      if (mySmall >= 0 && p.smallID() === mySmall) continue;
+      const st = safeCall(() => p.spawnTile(), undefined);
+      if (st === undefined || st === null) continue;
+      if (gameView.manhattanDist(center, st) < minDist) {
+        return null;
+      }
+    }
+
+    let plains = 0;
+    let highland = 0;
+    let mountain = 0;
+    for (const t of spawnTiles) {
+      const typ = safeCall(() => gameView.terrainType(t), -1);
+      if (typ === TerrainType.Plains) plains += 1;
+      else if (typ === TerrainType.Highland) highland += 1;
+      else if (typ === TerrainType.Mountain) mountain += 1;
+    }
+
+    let ownedPenalty = 0;
+    for (const tile of gameView.circleSearch(center, 18)) {
+      if (gameView.ownerID(tile) > 0) {
+        ownedPenalty += 3;
+      }
+    }
+
+    let oceanPenalty = 0;
+    for (const tile of gameView.circleSearch(center, 6)) {
+      if (gameView.isWater(tile)) {
+        oceanPenalty += 0.5;
+      }
+    }
+
+    const localOpen = countUnownedLandNear(center, 12);
+    const flood = floodScoreFrom(center, 220);
+    const terrainPoints =
+      plains * 1000 + highland * 100 + mountain + spawnTiles.length;
+    const strategic = localOpen * 2 + flood * 3 - ownedPenalty - oceanPenalty;
+    return terrainPoints * 1.5 + strategic;
+  }
+
+  function trySampleSpawnCandidate(gameView) {
+    const x = randomInt(0, gameView.width() - 1);
+    const y = randomInt(0, gameView.height() - 1);
+    if (!gameView.isValidCoord(x, y)) return null;
+    const center = gameView.ref(x, y);
+    const score = computeSpawnCenterScore(gameView, center);
+    if (score === null) return null;
+    return { center, score };
+  }
+
+  function rememberSpawnCandidate(entry) {
+    const map = runtime.state.spawn.candidateByCenter;
+    if (!map) return;
+    const prev = map.get(entry.center);
+    if (prev !== undefined && prev.score >= entry.score) {
+      return;
+    }
+    const maxCenters = runtime.state.spawn.maxCandidateCenters || 2000;
+    if (map.size >= maxCenters && prev === undefined) {
+      let worstCenter = null;
+      let worstScore = Infinity;
+      for (const [c, s] of map) {
+        if (s.score < worstScore) {
+          worstScore = s.score;
+          worstCenter = c;
+        }
+      }
+      if (worstCenter !== null && worstScore < entry.score) {
+        map.delete(worstCenter);
+      } else {
+        return;
+      }
+    }
+    map.set(entry.center, entry);
   }
 
   function countUnownedLandNear(tile, radius) {
@@ -600,35 +731,9 @@
 
     const candidates = [];
     for (let i = 0; i < 320; i++) {
-      const x = randomInt(0, gameView.width() - 1);
-      const y = randomInt(0, gameView.height() - 1);
-      if (!gameView.isValidCoord(x, y)) continue;
-      const center = gameView.ref(x, y);
-      if (!gameView.isLand(center)) continue;
-      if (gameView.hasOwner(center)) continue;
-      if (safeCall(() => gameView.isBorder(center), false)) continue;
-
-      const spawnTiles = getManualSpawnTiles(center);
-      if (!spawnTiles || spawnTiles.length === 0) continue;
-
-      let ownedPenalty = 0;
-      for (const tile of gameView.circleSearch(center, 18)) {
-        if (gameView.ownerID(tile) > 0) {
-          ownedPenalty += 3;
-        }
-      }
-
-      let oceanPenalty = 0;
-      for (const tile of gameView.circleSearch(center, 6)) {
-        if (gameView.isWater(tile)) {
-          oceanPenalty += 0.5;
-        }
-      }
-
-      const localOpen = countUnownedLandNear(center, 12);
-      const flood = floodScoreFrom(center, 220);
-      const score = localOpen * 2 + flood * 3 - ownedPenalty - oceanPenalty;
-      candidates.push({ center, score });
+      const sampled = trySampleSpawnCandidate(gameView);
+      if (!sampled) continue;
+      candidates.push(sampled);
     }
 
     if (candidates.length === 0) return null;
@@ -683,7 +788,10 @@
 
     for (const info of adjacentEnemies) {
       let legalFrontCount = 0;
-      const sampleTiles = uniqueBy(info.hostileTiles, (tile) => tile).slice(0, 6);
+      const sampleTiles = uniqueBy(info.hostileTiles, (tile) => tile).slice(
+        0,
+        6,
+      );
 
       for (const tile of sampleTiles) {
         const actions = await queryPlayerActions(tile, null);
@@ -784,9 +892,15 @@
     }
     return safeCall(
       () =>
-        player
-          .units(type)
-          .reduce((sum, unit) => sum + Math.max(1, safeCall(() => unit.level(), 1)), 0),
+        player.units(type).reduce(
+          (sum, unit) =>
+            sum +
+            Math.max(
+              1,
+              safeCall(() => unit.level(), 1),
+            ),
+          0,
+        ),
       0,
     );
   }
@@ -810,7 +924,10 @@
   }
 
   function isTeamMode(gameView) {
-    return safeCall(() => gameView.config().gameConfig().gameMode === "Team", false);
+    return safeCall(
+      () => gameView.config().gameConfig().gameMode === "Team",
+      false,
+    );
   }
 
   function getEnemyStrengthScore(enemy, me, borderContacts) {
@@ -861,7 +978,11 @@
     return 0;
   }
 
-  function lineIntersectsEnemySam(sourceTile, targetTile, ignoreFriendlyAlliedBlast) {
+  function lineIntersectsEnemySam(
+    sourceTile,
+    targetTile,
+    ignoreFriendlyAlliedBlast,
+  ) {
     const gameView = getGameView();
     const me = getMyLivingPlayer();
     if (!gameView || !me || sourceTile === false || !sourceTile) return false;
@@ -960,7 +1081,10 @@
       const units = safeCall(() => player.units(type), []);
       for (const unit of units) {
         if (!safeCall(() => unit.isActive(), true)) continue;
-        const distanceSquared = getGameView().euclideanDistSquared(targetTile, unit.tile());
+        const distanceSquared = getGameView().euclideanDistSquared(
+          targetTile,
+          unit.tile(),
+        );
         if (distanceSquared > radius * radius) continue;
         score += structureWeights.get(type) || 8;
         score += (safeCall(() => unit.level(), 1) - 1) * 8;
@@ -975,13 +1099,113 @@
 
     runtime.state.matchPhase = "spawn";
 
+    const me = getMyPlayer();
+    if (me && safeCall(() => me.hasSpawned(), false)) {
+      return false;
+    }
+
     if (gameView.config().isRandomSpawn()) {
-      runtime.state.lastAction = "waiting for random spawn";
+      if (runtime.state.spawn.randomSpawnIntentSent) {
+        runtime.state.lastAction = "waiting for random spawn confirm";
+        runtime.state.strategy = "random-spawn";
+        return false;
+      }
+
+      if (!runtime.state.spawn.candidateByCenter) {
+        runtime.state.spawn.candidateByCenter = new Map();
+      }
+
+      const numSpawnPhaseTurns = safeCall(
+        () => gameView.config().numSpawnPhaseTurns(),
+        300,
+      );
+      const collectionEnd = Math.floor((2 * numSpawnPhaseTurns) / 3);
+      const tick = gameView.ticks();
+
+      if (tick <= collectionEnd) {
+        const sampled = trySampleSpawnCandidate(gameView);
+        if (sampled) {
+          rememberSpawnCandidate(sampled);
+        }
+        runtime.state.lastAction =
+          "scoring spawns (" +
+          (runtime.state.spawn.candidateByCenter &&
+            runtime.state.spawn.candidateByCenter.size) +
+          " spots)";
+        runtime.state.strategy = "random-spawn-sample";
+        return false;
+      }
+
+      if (!runtime.state.spawn.sortedCandidates) {
+        runtime.state.spawn.sortedCandidates = Array.from(
+          runtime.state.spawn.candidateByCenter.values(),
+        ).sort((a, b) => b.score - a.score);
+        runtime.state.spawn.finalIndex = 0;
+      }
+
+      const list = runtime.state.spawn.sortedCandidates;
+      while (runtime.state.spawn.finalIndex < list.length) {
+        const cand = list[runtime.state.spawn.finalIndex];
+        runtime.state.spawn.finalIndex += 1;
+        const fresh = computeSpawnCenterScore(gameView, cand.center);
+        if (fresh === null) {
+          continue;
+        }
+        const ok = sendSpawn(cand.center);
+        if (ok) {
+          runtime.state.spawn.randomSpawnIntentSent = true;
+          runtime.state.spawn.attempted = true;
+          decisionLog(
+            "random spawn intent " +
+              gameView.x(cand.center) +
+              "," +
+              gameView.y(cand.center) +
+              " score~" +
+              fresh.toFixed(0),
+          );
+          botLog(
+            "Spawn (random override) -> (" +
+              gameView.x(cand.center) +
+              "," +
+              gameView.y(cand.center) +
+              ")",
+          );
+          return true;
+        }
+      }
+
+      for (let attempt = 0; attempt < 48; attempt++) {
+        const sampled = trySampleSpawnCandidate(gameView);
+        if (!sampled) continue;
+        if (sendSpawn(sampled.center)) {
+          runtime.state.spawn.randomSpawnIntentSent = true;
+          runtime.state.spawn.attempted = true;
+          decisionLog(
+            "random spawn fallback " +
+              gameView.x(sampled.center) +
+              "," +
+              gameView.y(sampled.center),
+          );
+          botLog(
+            "Spawn (random fallback) -> (" +
+              gameView.x(sampled.center) +
+              "," +
+              gameView.y(sampled.center) +
+              ")",
+          );
+          return true;
+        }
+      }
+
+      runtime.state.lastAction = "random spawn: no intent accepted";
       runtime.state.strategy = "random-spawn";
       return false;
     }
 
-    if (runtime.state.spawn.attempted && gameView.ticks() - runtime.state.spawn.lastAttemptTick < 20) {
+    if (
+      runtime.state.spawn.attempted &&
+      gameView.ticks() - runtime.state.spawn.lastAttemptTick < 20
+    ) {
       runtime.state.lastAction = "waiting for spawn confirmation";
       runtime.state.strategy = "manual-spawn";
       return false;
@@ -1025,7 +1249,12 @@
 
     const maxTroops = gameView.config().maxTroops(me);
     const reserveRatio = computeReserveRatio(me, maxTroops);
-    const troops = calculateAttackTroops(me, null, reserveRatio - 0.08, maxTroops);
+    const troops = calculateAttackTroops(
+      me,
+      null,
+      reserveRatio - 0.08,
+      maxTroops,
+    );
     if (troops <= 0) {
       decisionLog("expand: insufficient troops");
       return false;
@@ -1048,7 +1277,10 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.combat < 8) return false;
 
-    const adjacentEnemies = await getAdjacentEnemyInfoWithActions(borderTiles, me);
+    const adjacentEnemies = await getAdjacentEnemyInfoWithActions(
+      borderTiles,
+      me,
+    );
     if (adjacentEnemies.length === 0) {
       decisionLog("combat: no adjacent enemies");
       return false;
@@ -1059,7 +1291,12 @@
     const reserveRatio = computeReserveRatio(me, maxTroops);
 
     if (counterTarget && counterTarget.isPlayer && counterTarget.isPlayer()) {
-      const troops = calculateAttackTroops(me, counterTarget, reserveRatio - 0.08, maxTroops);
+      const troops = calculateAttackTroops(
+        me,
+        counterTarget,
+        reserveRatio - 0.08,
+        maxTroops,
+      );
       if (troops > 0) {
         const success = sendAttack(counterTarget.id(), troops);
         if (success) {
@@ -1075,9 +1312,11 @@
 
     adjacentEnemies.sort((a, b) => {
       const aScore =
-        getEnemyStrengthScore(a.player, me, a.borderContacts) + a.legalFrontCount * 3;
+        getEnemyStrengthScore(a.player, me, a.borderContacts) +
+        a.legalFrontCount * 3;
       const bScore =
-        getEnemyStrengthScore(b.player, me, b.borderContacts) + b.legalFrontCount * 3;
+        getEnemyStrengthScore(b.player, me, b.borderContacts) +
+        b.legalFrontCount * 3;
       return bScore - aScore;
     });
 
@@ -1120,21 +1359,38 @@
       safeCall(() => getGameView().isOceanShore(tile), false),
     );
     const nukesEnabled =
-      !safeCall(() => getGameView().config().isUnitDisabled(UnitType.AtomBomb), false) ||
-      !safeCall(() => getGameView().config().isUnitDisabled(UnitType.HydrogenBomb), false) ||
-      !safeCall(() => getGameView().config().isUnitDisabled(UnitType.MIRV), false);
+      !safeCall(
+        () => getGameView().config().isUnitDisabled(UnitType.AtomBomb),
+        false,
+      ) ||
+      !safeCall(
+        () => getGameView().config().isUnitDisabled(UnitType.HydrogenBomb),
+        false,
+      ) ||
+      !safeCall(
+        () => getGameView().config().isUnitDisabled(UnitType.MIRV),
+        false,
+      );
 
     switch (type) {
       case UnitType.City:
         return count < Math.max(2, Math.floor(me.numTilesOwned() / 3500));
       case UnitType.Factory:
-        return count < Math.max(1, Math.floor(cities * (hasCoast ? 0.4 : 0.75)));
+        return (
+          count < Math.max(1, Math.floor(cities * (hasCoast ? 0.4 : 0.75)))
+        );
       case UnitType.Port:
         return hasCoast && count < Math.max(1, Math.floor(cities * 0.6));
       case UnitType.DefensePost:
-        return enemies.length > 0 && count < Math.max(2, Math.floor(cities * 0.5));
+        return (
+          enemies.length > 0 && count < Math.max(2, Math.floor(cities * 0.5))
+        );
       case UnitType.MissileSilo:
-        return nukesEnabled && cities >= 2 && count < Math.min(3, Math.max(1, Math.floor(cities * 0.22)));
+        return (
+          nukesEnabled &&
+          cities >= 2 &&
+          count < Math.min(3, Math.max(1, Math.floor(cities * 0.22)))
+        );
       case UnitType.SAMLauncher:
         return cities >= 2 && count < Math.max(1, Math.floor(cities * 0.25));
       default:
@@ -1196,7 +1452,9 @@
   function getOwnedCandidateTiles(me, limit) {
     const gameView = getGameView();
     const borderTiles = runtime.state.borderCache.tiles.slice(0, limit);
-    const randomTiles = sampleTilesForOwner(me.smallID(), limit, { requireLand: true });
+    const randomTiles = sampleTilesForOwner(me.smallID(), limit, {
+      requireLand: true,
+    });
     const unitTiles = [];
 
     for (const type of StructureTypes) {
@@ -1290,7 +1548,11 @@
         );
         if (available < 8000) continue;
 
-        const troops = clamp(Math.floor(available * 0.28), 8000, Math.floor(me.troops() * 0.35));
+        const troops = clamp(
+          Math.floor(available * 0.28),
+          8000,
+          Math.floor(me.troops() * 0.35),
+        );
         const success = sendBoat(candidate, troops);
         if (!success) continue;
 
@@ -1333,13 +1595,18 @@
     }
 
     let bestPlan = null;
-    for (const enemy of enemies.slice().sort((a, b) => b.numTilesOwned() - a.numTilesOwned()).slice(0, 5)) {
+    for (const enemy of enemies
+      .slice()
+      .sort((a, b) => b.numTilesOwned() - a.numTilesOwned())
+      .slice(0, 5)) {
       const profile = await queryPlayerProfile(enemy);
       const candidateTiles = uniqueBy(
-        gatherStructureTiles(enemy).concat(sampleTilesForOwner(enemy.smallID(), 16, {
-          requireLand: true,
-          maxSamples: 320,
-        })),
+        gatherStructureTiles(enemy).concat(
+          sampleTilesForOwner(enemy.smallID(), 16, {
+            requireLand: true,
+            maxSamples: 320,
+          }),
+        ),
         (tile) => tile,
       );
 
@@ -1355,7 +1622,9 @@
           nukeMagnitude(nukeType).outer,
         );
         const spawnTile = buildable.canBuild;
-        const samRisk = lineIntersectsEnemySam(spawnTile, candidate, false) ? 50 : 0;
+        const samRisk = lineIntersectsEnemySam(spawnTile, candidate, false)
+          ? 50
+          : 0;
         const crownPressure =
           enemy.numTilesOwned() > me.numTilesOwned() * 1.35 ? 25 : 0;
         const alliancePressure =
@@ -1397,7 +1666,11 @@
 
     runtime.state.cooldowns.nuke = tick;
     runtime.state.lastAction =
-      "nuke -> " + bestPlan.enemy.displayName() + " (" + bestPlan.nukeType + ")";
+      "nuke -> " +
+      bestPlan.enemy.displayName() +
+      " (" +
+      bestPlan.nukeType +
+      ")";
     runtime.state.strategy = "nuke";
     botLog(
       "Nuke -> " +
@@ -1449,12 +1722,16 @@
       }
     }
 
-    const topEnemy = enemies.sort((a, b) => b.numTilesOwned() - a.numTilesOwned())[0];
+    const topEnemy = enemies.sort(
+      (a, b) => b.numTilesOwned() - a.numTilesOwned(),
+    )[0];
     if (topEnemy) {
-      const targetTile = gatherStructureTiles(topEnemy)[0] || sampleTilesForOwner(topEnemy.smallID(), 1, {
-        requireLand: true,
-        maxSamples: 200,
-      })[0];
+      const targetTile =
+        gatherStructureTiles(topEnemy)[0] ||
+        sampleTilesForOwner(topEnemy.smallID(), 1, {
+          requireLand: true,
+          maxSamples: 200,
+        })[0];
 
       if (targetTile !== undefined) {
         const actions = await queryPlayerActions(targetTile, null);
@@ -1491,14 +1768,22 @@
       const targetTile = gatherStructureTiles(ally)[0];
       if (targetTile === undefined) continue;
       const actions = await queryPlayerActions(targetTile, null);
-      if (!actions || !actions.interaction || !actions.interaction.canBreakAlliance) {
+      if (
+        !actions ||
+        !actions.interaction ||
+        !actions.interaction.canBreakAlliance
+      ) {
         continue;
       }
 
-      if (safeCall(() => ally.isDisconnected(), false) || safeCall(() => ally.isTraitor(), false)) {
+      if (
+        safeCall(() => ally.isDisconnected(), false) ||
+        safeCall(() => ally.isTraitor(), false)
+      ) {
         if (sendBreakAlliance(ally.id())) {
           runtime.state.cooldowns.diplomacy = tick;
-          runtime.state.lastAction = "breaking alliance with " + ally.displayName();
+          runtime.state.lastAction =
+            "breaking alliance with " + ally.displayName();
           runtime.state.strategy = "diplomacy";
           botLog("Break alliance -> " + ally.displayName());
           return true;
@@ -1613,7 +1898,10 @@
 
     if (data.type === "lobby_info") {
       runtime.identity.clientID = data.myClientID || runtime.identity.clientID;
-      runtime.identity.gameID = data.lobby && data.lobby.gameID ? data.lobby.gameID : runtime.identity.gameID;
+      runtime.identity.gameID =
+        data.lobby && data.lobby.gameID
+          ? data.lobby.gameID
+          : runtime.identity.gameID;
       botLog("Lobby info received");
       return;
     }
@@ -1623,9 +1911,14 @@
       runtime.state.matchPhase = "start";
       runtime.identity.clientID = data.myClientID || runtime.identity.clientID;
       runtime.identity.gameID =
-        (data.gameStartInfo && data.gameStartInfo.gameID) || runtime.identity.gameID;
+        (data.gameStartInfo && data.gameStartInfo.gameID) ||
+        runtime.identity.gameID;
       runtime.state.spawn.attempted = false;
       runtime.state.spawn.lastAttemptTick = -999;
+      runtime.state.spawn.candidateByCenter = null;
+      runtime.state.spawn.sortedCandidates = null;
+      runtime.state.spawn.finalIndex = 0;
+      runtime.state.spawn.randomSpawnIntentSent = false;
       runtime.state.profileCache.clear();
       botLog("Game started");
       return;
@@ -1641,7 +1934,10 @@
   }
 
   function installWebSocketHook() {
-    if (window.WebSocket === NativeWebSocket && window.__superBotWebSocketWrapped) {
+    if (
+      window.WebSocket === NativeWebSocket &&
+      window.__superBotWebSocketWrapped
+    ) {
       return;
     }
     if (window.__superBotWebSocketWrapped) return;
@@ -1726,7 +2022,11 @@
       };
 
       worker.addEventListener("message", (event) => {
-        if (runtime.hooks.worker === worker && event.data && event.data.type === "initialized") {
+        if (
+          runtime.hooks.worker === worker &&
+          event.data &&
+          event.data.type === "initialized"
+        ) {
           botLog("Game worker initialized");
         }
       });
@@ -1948,8 +2248,11 @@
     const hooksRoot = runtime.overlay.root.querySelector("#superbot-hooks");
     const stateRoot = runtime.overlay.root.querySelector("#superbot-state");
     const statsRoot = runtime.overlay.root.querySelector("#superbot-stats");
-    const decisionsRoot = runtime.overlay.root.querySelector("#superbot-decisions");
-    const activityRoot = runtime.overlay.root.querySelector("#superbot-activity");
+    const decisionsRoot = runtime.overlay.root.querySelector(
+      "#superbot-decisions",
+    );
+    const activityRoot =
+      runtime.overlay.root.querySelector("#superbot-activity");
     const toggleButton = runtime.overlay.root.querySelector("#superbot-toggle");
     const modeButton = runtime.overlay.root.querySelector("#superbot-mode");
 
@@ -1971,22 +2274,30 @@
         {
           label: "WebSocket",
           value: runtime.hooks.socket ? "captured" : "missing",
-          className: runtime.hooks.socket ? "superbot-hook-ok" : "superbot-hook-miss",
+          className: runtime.hooks.socket
+            ? "superbot-hook-ok"
+            : "superbot-hook-miss",
         },
         {
           label: "Worker",
           value: runtime.hooks.worker ? "captured" : "fallback",
-          className: runtime.hooks.worker ? "superbot-hook-ok" : "superbot-hook-miss",
+          className: runtime.hooks.worker
+            ? "superbot-hook-ok"
+            : "superbot-hook-miss",
         },
         {
           label: "GameView",
           value: runtime.hooks.gameView ? "ready" : "waiting",
-          className: runtime.hooks.gameView ? "superbot-hook-ok" : "superbot-hook-miss",
+          className: runtime.hooks.gameView
+            ? "superbot-hook-ok"
+            : "superbot-hook-miss",
         },
         {
           label: "UI State",
           value: runtime.hooks.uiState ? "ready" : "waiting",
-          className: runtime.hooks.uiState ? "superbot-hook-ok" : "superbot-hook-miss",
+          className: runtime.hooks.uiState
+            ? "superbot-hook-ok"
+            : "superbot-hook-miss",
         },
       ]);
     }
@@ -1996,7 +2307,10 @@
         { label: "Phase", value: runtime.state.matchPhase },
         { label: "Strategy", value: runtime.state.strategy },
         { label: "Action", value: runtime.state.lastAction },
-        { label: "Attack Ratio", value: (getAttackRatio() * 100).toFixed(0) + "%" },
+        {
+          label: "Attack Ratio",
+          value: (getAttackRatio() * 100).toFixed(0) + "%",
+        },
         { label: "Rocket Arc", value: getRocketDirectionUp() ? "up" : "down" },
       ]);
     }

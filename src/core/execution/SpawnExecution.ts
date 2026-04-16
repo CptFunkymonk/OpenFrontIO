@@ -5,7 +5,6 @@ import {
   PlayerInfo,
   PlayerType,
   SpawnArea,
-  TerrainType,
 } from "../game/Game";
 import { TileRef } from "../game/GameMap";
 import { PseudoRandom } from "../PseudoRandom";
@@ -17,18 +16,11 @@ import { getSpawnTiles } from "./Util";
 
 type Spawn = { center: TileRef; tiles: TileRef[] };
 
-type ScoredSpawn = Spawn & { score: number };
-
 export class SpawnExecution implements Execution {
   private random: PseudoRandom;
   active: boolean = true;
   private mg: Game;
   private static readonly MAX_SPAWN_TRIES = 1_000;
-  /** Avoid unbounded growth while sampling random spawn points each tick. */
-  private static readonly MAX_CANDIDATE_CENTERS = 2_000;
-
-  private readonly candidateByCenter = new Map<TileRef, ScoredSpawn>();
-  private loggedSpawnFailure = false;
 
   constructor(
     gameID: GameID,
@@ -45,6 +37,8 @@ export class SpawnExecution implements Execution {
   }
 
   tick(ticks: number) {
+    this.active = false;
+
     if (!this.mg.inSpawnPhase()) {
       this.active = false;
       return;
@@ -63,80 +57,13 @@ export class SpawnExecution implements Execution {
     }
 
     player.tiles().forEach((t) => player.relinquish(t));
-
-    const usePhasedRandomPlains =
-      this.tile === undefined &&
-      this.mg.config().isRandomSpawn() &&
-      this.playerInfo.playerType === PlayerType.Human;
-
-    if (usePhasedRandomPlains) {
-      this.active = true;
-      const spawnPhaseEnd = this.mg.config().numSpawnPhaseTurns();
-      const collectionEnd = Math.floor((2 * spawnPhaseEnd) / 3);
-
-      if (ticks <= collectionEnd) {
-        const sampled = this.tryRandomScoredSpawn();
-        if (sampled !== undefined) {
-          this.rememberCandidate(sampled);
-        }
-        return;
-      }
-
-      const sorted = [...this.candidateByCenter.values()].sort(
-        (a, b) => b.score - a.score,
-      );
-      for (const cand of sorted) {
-        if (this.isSpawnStillValid(cand)) {
-          this.applySpawn(player, cand);
-          this.active = false;
-          return;
-        }
-      }
-
-      let attempts = 0;
-      while (attempts < SpawnExecution.MAX_SPAWN_TRIES) {
-        attempts++;
-        const sampled = this.tryRandomScoredSpawn();
-        if (sampled !== undefined && this.isSpawnStillValid(sampled)) {
-          this.applySpawn(player, sampled);
-          this.active = false;
-          return;
-        }
-      }
-
-      this.logSpawnFailureOnce();
-      this.active = false;
-      return;
-    }
-
     const spawn = this.getSpawn(this.tile);
 
     if (!spawn) {
-      this.logSpawnFailureOnce();
+      console.warn(`SpawnExecution: cannot spawn ${this.playerInfo.name}`);
       return;
     }
 
-    this.applySpawn(player, spawn);
-    this.active = false;
-  }
-
-  isActive(): boolean {
-    return this.active;
-  }
-
-  activeDuringSpawnPhase(): boolean {
-    return true;
-  }
-
-  private logSpawnFailureOnce() {
-    if (this.loggedSpawnFailure) {
-      return;
-    }
-    this.loggedSpawnFailure = true;
-    console.warn(`SpawnExecution: cannot spawn ${this.playerInfo.name}`);
-  }
-
-  private applySpawn(player: Player, spawn: Spawn) {
     spawn.tiles.forEach((t) => {
       player.conquer(t);
     });
@@ -151,128 +78,12 @@ export class SpawnExecution implements Execution {
     player.setSpawnTile(spawn.center);
   }
 
-  private rememberCandidate(spawn: ScoredSpawn) {
-    const prev = this.candidateByCenter.get(spawn.center);
-    if (prev !== undefined && prev.score >= spawn.score) {
-      return;
-    }
-    if (
-      this.candidateByCenter.size >= SpawnExecution.MAX_CANDIDATE_CENTERS &&
-      prev === undefined
-    ) {
-      let worstCenter: TileRef | undefined;
-      let worstScore = Infinity;
-      for (const [c, s] of this.candidateByCenter) {
-        if (s.score < worstScore) {
-          worstScore = s.score;
-          worstCenter = c;
-        }
-      }
-      if (worstCenter !== undefined && worstScore < spawn.score) {
-        this.candidateByCenter.delete(worstCenter);
-      } else {
-        return;
-      }
-    }
-    this.candidateByCenter.set(spawn.center, spawn);
+  isActive(): boolean {
+    return this.active;
   }
 
-  private scoreSpawnPatch(tiles: TileRef[]): number {
-    let plains = 0;
-    let highland = 0;
-    for (const t of tiles) {
-      switch (this.mg.terrainType(t)) {
-        case TerrainType.Plains:
-          plains++;
-          break;
-        case TerrainType.Highland:
-          highland++;
-          break;
-        default:
-          break;
-      }
-    }
-    // Plains-first: weight plains heavily vs highland; patch size breaks ties.
-    return plains * 1000 + highland * 100 + tiles.length;
-  }
-
-  private isSpawnStillValid(spawn: Spawn): boolean {
-    if (
-      !this.mg.isLand(spawn.center) ||
-      this.mg.hasOwner(spawn.center) ||
-      this.mg.isBorder(spawn.center)
-    ) {
-      return false;
-    }
-
-    const tooClose = this.mg
-      .allPlayers()
-      .filter((p) => p.id() !== this.playerInfo.id)
-      .some((p) => {
-        const st = p.spawnTile();
-        if (st === undefined) {
-          return false;
-        }
-        return (
-          this.mg.manhattanDist(st, spawn.center) <
-          this.mg.config().minDistanceBetweenPlayers()
-        );
-      });
-
-    if (tooClose) {
-      return false;
-    }
-
-    return getSpawnTiles(this.mg, spawn.center, true) !== null;
-  }
-
-  private tryRandomScoredSpawn(): ScoredSpawn | undefined {
-    const spawnArea = this.getTeamSpawnArea();
-    let tries = 0;
-
-    while (tries < SpawnExecution.MAX_SPAWN_TRIES) {
-      tries++;
-
-      const center = this.randTile(spawnArea);
-
-      if (
-        !this.mg.isLand(center) ||
-        this.mg.hasOwner(center) ||
-        this.mg.isBorder(center)
-      ) {
-        continue;
-      }
-
-      const isOtherPlayerSpawnedNearby = this.mg
-        .allPlayers()
-        .filter((p) => p.id() !== this.playerInfo.id)
-        .some((p) => {
-          const spawnTile = p.spawnTile();
-
-          if (spawnTile === undefined) {
-            return false;
-          }
-
-          return (
-            this.mg.manhattanDist(spawnTile, center) <
-            this.mg.config().minDistanceBetweenPlayers()
-          );
-        });
-
-      if (isOtherPlayerSpawnedNearby) {
-        continue;
-      }
-
-      const tiles = getSpawnTiles(this.mg, center, true);
-      if (!tiles) {
-        continue;
-      }
-
-      const score = this.scoreSpawnPatch(tiles);
-      return { center, tiles, score };
-    }
-
-    return;
+  activeDuringSpawnPhase(): boolean {
+    return true;
   }
 
   private getSpawn(center?: TileRef): Spawn | undefined {
