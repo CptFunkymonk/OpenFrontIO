@@ -1,0 +1,890 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Superbot Harness</title>
+    <script>
+      window.sentMessages = [];
+      window.workerMessages = [];
+
+      class FakeWebSocket {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+
+        constructor(url) {
+          this.url = String(url);
+          this.readyState = FakeWebSocket.OPEN;
+          this.listeners = {};
+          setTimeout(() => this.dispatch("open", {}), 0);
+        }
+
+        addEventListener(type, callback) {
+          (this.listeners[type] ||= []).push(callback);
+        }
+
+        dispatch(type, event) {
+          for (const callback of this.listeners[type] || []) {
+            callback(event);
+          }
+        }
+
+        send(payload) {
+          try {
+            window.sentMessages.push(JSON.parse(payload));
+          } catch (error) {
+            window.sentMessages.push({ parseError: String(error), payload });
+          }
+        }
+
+        emitMessage(data) {
+          this.dispatch("message", {
+            data: JSON.stringify(data),
+          });
+        }
+
+        close() {
+          this.readyState = FakeWebSocket.CLOSED;
+          this.dispatch("close", {});
+        }
+      }
+
+      class FakeWorker {
+        constructor(url) {
+          this.url = String(url);
+          this.listeners = {};
+        }
+
+        addEventListener(type, callback) {
+          (this.listeners[type] ||= []).push(callback);
+        }
+
+        postMessage(message) {
+          window.workerMessages.push(message);
+        }
+
+        emitMessage(data) {
+          for (const callback of this.listeners.message || []) {
+            callback({ data });
+          }
+        }
+      }
+
+      window.WebSocket = FakeWebSocket;
+      window.Worker = FakeWorker;
+    </script>
+    <script src="./tampermonkey-superhuman-bot.js"></script>
+  </head>
+  <body data-status="booting">
+    <pre id="results">running</pre>
+    <script>
+      const WIDTH = 50;
+      const HEIGHT = 50;
+
+      const state = {
+        mode: "spawn-manual",
+        tick: 1,
+        myTroops: 0,
+        myGold: 0,
+        myTiles: new Set(),
+        enemyTiles: new Set(),
+        allyTiles: new Set(),
+        borderTiles: [],
+        myUnits: [],
+        enemyUnits: [],
+        allyUnits: [],
+        myIncomingAttacks: [],
+        myOutgoingAttacks: [],
+        enemyIncomingAttacks: [],
+        allyIncomingAttacks: [],
+        transportSpawnTargets: new Set(),
+      };
+
+      const terraNullius = {
+        isPlayer() {
+          return false;
+        },
+        smallID() {
+          return 0;
+        },
+        id() {
+          return null;
+        },
+      };
+
+      function ref(x, y) {
+        return y * WIDTH + x;
+      }
+
+      function xOf(tile) {
+        return tile % WIDTH;
+      }
+
+      function yOf(tile) {
+        return Math.floor(tile / WIDTH);
+      }
+
+      function makeUnit(type, ownerRef, tileRef, level = 1) {
+        return {
+          type() {
+            return type;
+          },
+          owner() {
+            return ownerRef;
+          },
+          tile() {
+            return tileRef;
+          },
+          isActive() {
+            return true;
+          },
+          isUnderConstruction() {
+            return false;
+          },
+          level() {
+            return level;
+          },
+        };
+      }
+
+      function ownerID(tile) {
+        if (state.myTiles.has(tile)) return 1;
+        if (state.enemyTiles.has(tile)) return 2;
+        if (state.allyTiles.has(tile)) return 3;
+        return 0;
+      }
+
+      const fakeConfig = {
+        isRandomSpawn() {
+          return state.mode === "spawn-random";
+        },
+        maxTroops(player) {
+          if (player && player.smallID && player.smallID() === 2) return 90000;
+          if (player && player.smallID && player.smallID() === 3) return 95000;
+          return 100000;
+        },
+        gameConfig() {
+          return {
+            gameMode: state.mode === "diplomacy" ? "Team" : "Free For All",
+          };
+        },
+        maxSamRange() {
+          return 150;
+        },
+        samRange(level) {
+          return 70 + (level - 1) * 10;
+        },
+        boatMaxNumber() {
+          return 3;
+        },
+      };
+
+      const myPlayer = {
+        smallID() {
+          return 1;
+        },
+        isPlayer() {
+          return true;
+        },
+        id() {
+          return "player-1";
+        },
+        isAlive() {
+          return state.mode !== "spawn-manual" && state.mode !== "spawn-random";
+        },
+        isMe() {
+          return true;
+        },
+        displayName() {
+          return "Me";
+        },
+        name() {
+          return "Me";
+        },
+        type() {
+          return "HUMAN";
+        },
+        troops() {
+          return state.myTroops;
+        },
+        gold() {
+          return state.myGold;
+        },
+        numTilesOwned() {
+          return state.myTiles.size;
+        },
+        team() {
+          return state.mode === "diplomacy" ? "Blue" : null;
+        },
+        isFriendly(other) {
+          return state.mode === "diplomacy" && other && other.smallID && other.smallID() === 3;
+        },
+        incomingAttacks() {
+          return state.myIncomingAttacks.slice();
+        },
+        outgoingAttacks() {
+          return state.myOutgoingAttacks.slice();
+        },
+        units(type) {
+          if (!type) return state.myUnits.slice();
+          return state.myUnits.filter((unit) => unit.type() === type);
+        },
+        totalUnitLevels(type) {
+          return this.units(type).reduce((sum, unit) => sum + unit.level(), 0);
+        },
+        borderTiles() {
+          return Promise.resolve({
+            borderTiles: new Set(state.borderTiles),
+          });
+        },
+        bestTransportShipSpawn(targetTile) {
+          return Promise.resolve(
+            state.transportSpawnTargets.has(targetTile) ? ref(5, 5) : false,
+          );
+        },
+        profile() {
+          return Promise.resolve({
+            alliances: [],
+            relations: {},
+          });
+        },
+        buildables(tile, units) {
+          const selectedUnits = Array.isArray(units) ? units : [];
+          const results = [];
+
+          for (const unitType of selectedUnits) {
+            if (
+              state.mode === "nuke" &&
+              unitType === "Atom Bomb" &&
+              tile === state.enemyCityTile
+            ) {
+              results.push({
+                type: unitType,
+                canBuild: state.siloTile,
+                canUpgrade: false,
+                cost: 750000,
+              });
+              continue;
+            }
+
+            if (
+              state.mode === "economy" &&
+              unitType === "City" &&
+              state.myTiles.has(tile)
+            ) {
+              results.push({
+                type: unitType,
+                canBuild: tile,
+                canUpgrade: false,
+                cost: 125000,
+              });
+              continue;
+            }
+
+            results.push({
+              type: unitType,
+              canBuild: false,
+              canUpgrade: false,
+              cost: 0,
+            });
+          }
+
+          return Promise.resolve(results);
+        },
+        actions(tile) {
+          if (state.mode === "diplomacy" && state.allyTiles.has(tile)) {
+            return Promise.resolve({
+              canAttack: false,
+              buildableUnits: [],
+              interaction: {
+                canDonateTroops: true,
+                canDonateGold: true,
+                canBreakAlliance: false,
+                canSendAllianceRequest: false,
+                canEmbargo: false,
+              },
+            });
+          }
+
+          if (state.mode === "combat" && state.enemyTiles.has(tile)) {
+            return Promise.resolve({
+              canAttack: true,
+              buildableUnits: [],
+              interaction: {},
+            });
+          }
+
+          if (state.mode === "nuke" && tile === state.enemyCityTile) {
+            return Promise.resolve({
+              canAttack: false,
+              buildableUnits: [],
+              interaction: {
+                canEmbargo: false,
+                canSendAllianceRequest: false,
+              },
+            });
+          }
+
+          return Promise.resolve({
+            canAttack: false,
+            buildableUnits: [],
+            interaction: {},
+          });
+        },
+      };
+
+      const enemyPlayer = {
+        smallID() {
+          return 2;
+        },
+        isPlayer() {
+          return true;
+        },
+        id() {
+          return "player-2";
+        },
+        isAlive() {
+          return true;
+        },
+        isMe() {
+          return false;
+        },
+        displayName() {
+          return "Enemy";
+        },
+        name() {
+          return "Enemy";
+        },
+        type() {
+          return "HUMAN";
+        },
+        troops() {
+          return state.enemyTroops ?? 25000;
+        },
+        gold() {
+          return 0;
+        },
+        numTilesOwned() {
+          return state.enemyTiles.size;
+        },
+        isFriendly() {
+          return false;
+        },
+        isDisconnected() {
+          return false;
+        },
+        isTraitor() {
+          return false;
+        },
+        incomingAttacks() {
+          return state.enemyIncomingAttacks.slice();
+        },
+        outgoingAttacks() {
+          return [];
+        },
+        units(type) {
+          if (!type) return state.enemyUnits.slice();
+          return state.enemyUnits.filter((unit) => unit.type() === type);
+        },
+        profile() {
+          return Promise.resolve({
+            alliances: [],
+            relations: {},
+          });
+        },
+      };
+
+      const allyPlayer = {
+        smallID() {
+          return 3;
+        },
+        isPlayer() {
+          return true;
+        },
+        id() {
+          return "player-3";
+        },
+        isAlive() {
+          return true;
+        },
+        isMe() {
+          return false;
+        },
+        displayName() {
+          return "Ally";
+        },
+        name() {
+          return "Ally";
+        },
+        type() {
+          return "HUMAN";
+        },
+        troops() {
+          return 12000;
+        },
+        gold() {
+          return 0;
+        },
+        numTilesOwned() {
+          return state.allyTiles.size;
+        },
+        isFriendly(other) {
+          return other && other.smallID && other.smallID() === 1;
+        },
+        isDisconnected() {
+          return false;
+        },
+        isTraitor() {
+          return false;
+        },
+        incomingAttacks() {
+          return state.allyIncomingAttacks.slice();
+        },
+        outgoingAttacks() {
+          return [];
+        },
+        units(type) {
+          if (!type) return state.allyUnits.slice();
+          return state.allyUnits.filter((unit) => unit.type() === type);
+        },
+        profile() {
+          return Promise.resolve({
+            alliances: [1],
+            relations: { 1: 3 },
+          });
+        },
+      };
+
+      function playerBySmallID(id) {
+        if (id === 1) return myPlayer;
+        if (id === 2) return enemyPlayer;
+        if (id === 3) return allyPlayer;
+        return terraNullius;
+      }
+
+      function owner(tile) {
+        return playerBySmallID(ownerID(tile));
+      }
+
+      const fakeGameView = {
+        ticks() {
+          return state.tick;
+        },
+        inSpawnPhase() {
+          return state.mode === "spawn-manual" || state.mode === "spawn-random";
+        },
+        myPlayer() {
+          return this.inSpawnPhase() ? null : myPlayer;
+        },
+        playerViews() {
+          if (this.inSpawnPhase()) return [];
+          if (state.mode === "diplomacy") return [myPlayer, allyPlayer];
+          if (state.enemyTiles.size > 0 || state.enemyUnits.length > 0) {
+            return [myPlayer, enemyPlayer];
+          }
+          return [myPlayer];
+        },
+        width() {
+          return WIDTH;
+        },
+        height() {
+          return HEIGHT;
+        },
+        ref,
+        x: xOf,
+        y: yOf,
+        isValidCoord(x, y) {
+          return x >= 0 && y >= 0 && x < WIDTH && y < HEIGHT;
+        },
+        isValidRef(tile) {
+          return tile >= 0 && tile < WIDTH * HEIGHT;
+        },
+        isLand() {
+          return true;
+        },
+        isWater() {
+          return false;
+        },
+        isOceanShore(tile) {
+          return state.myCoastTiles ? state.myCoastTiles.has(tile) : false;
+        },
+        isBorder() {
+          return false;
+        },
+        hasOwner(tile) {
+          return ownerID(tile) > 0;
+        },
+        ownerID,
+        owner,
+        hasFallout() {
+          return false;
+        },
+        neighbors(tile) {
+          const x = xOf(tile);
+          const y = yOf(tile);
+          const neighbors = [];
+          for (const [dx, dy] of [
+            [1, 0],
+            [-1, 0],
+            [0, 1],
+            [0, -1],
+          ]) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx >= 0 && ny >= 0 && nx < WIDTH && ny < HEIGHT) {
+              neighbors.push(ref(nx, ny));
+            }
+          }
+          return neighbors;
+        },
+        manhattanDist(a, b) {
+          return Math.abs(xOf(a) - xOf(b)) + Math.abs(yOf(a) - yOf(b));
+        },
+        euclideanDistSquared(a, b) {
+          const dx = xOf(a) - xOf(b);
+          const dy = yOf(a) - yOf(b);
+          return dx * dx + dy * dy;
+        },
+        circleSearch(centerTile, radius) {
+          const centerX = xOf(centerTile);
+          const centerY = yOf(centerTile);
+          const result = new Set();
+          for (let x = 0; x < WIDTH; x++) {
+            for (let y = 0; y < HEIGHT; y++) {
+              const dx = x - centerX;
+              const dy = y - centerY;
+              if (dx * dx + dy * dy <= radius * radius) {
+                result.add(ref(x, y));
+              }
+            }
+          }
+          return result;
+        },
+        nearbyUnits(tile, radius, types) {
+          const typeList = Array.isArray(types) ? types : [types];
+          const allUnits = state.myUnits.concat(state.enemyUnits, state.allyUnits);
+          const matches = [];
+          for (const unit of allUnits) {
+            if (!typeList.includes(unit.type())) continue;
+            const distSquared = this.euclideanDistSquared(tile, unit.tile());
+            if (distSquared > radius * radius) continue;
+            matches.push({ unit, distSquared });
+          }
+          return matches;
+        },
+        units(...types) {
+          const allUnits = state.myUnits.concat(state.enemyUnits, state.allyUnits);
+          if (types.length === 0) return allUnits.slice();
+          return allUnits.filter((unit) => types.includes(unit.type()));
+        },
+        playerBySmallID,
+        config() {
+          return fakeConfig;
+        },
+      };
+
+      const controlPanel = document.createElement("control-panel");
+      controlPanel.game = fakeGameView;
+      controlPanel.uiState = {
+        attackRatio: 0.25,
+        rocketDirectionUp: true,
+      };
+      document.body.appendChild(controlPanel);
+
+      const gameSocket = new WebSocket("ws://game");
+      const worker = new Worker("Worker.worker.js");
+      worker.postMessage({
+        type: "init",
+        gameStartInfo: { gameID: "TEST" },
+        clientID: "client-1",
+      });
+
+      function resetCommon() {
+        state.myUnits = [];
+        state.enemyUnits = [];
+        state.allyUnits = [];
+        state.myIncomingAttacks = [];
+        state.myOutgoingAttacks = [];
+        state.enemyIncomingAttacks = [];
+        state.allyIncomingAttacks = [];
+        state.transportSpawnTargets = new Set();
+        state.myCoastTiles = new Set();
+      }
+
+      function setSpawnManualState() {
+        state.mode = "spawn-manual";
+        state.tick = 1;
+        state.myTroops = 0;
+        state.myGold = 0;
+        state.myTiles = new Set();
+        state.enemyTiles = new Set();
+        state.allyTiles = new Set();
+        state.borderTiles = [];
+        resetCommon();
+      }
+
+      function setSpawnRandomState() {
+        state.mode = "spawn-random";
+        state.tick = 10;
+        state.myTiles = new Set();
+        state.enemyTiles = new Set();
+        state.allyTiles = new Set();
+        state.borderTiles = [];
+        resetCommon();
+      }
+
+      function setExpandState() {
+        state.mode = "expand";
+        state.tick = 40;
+        state.myTroops = 60000;
+        state.myGold = 0;
+        state.myTiles = new Set([
+          ref(4, 4),
+          ref(4, 5),
+          ref(5, 4),
+          ref(5, 5),
+          ref(6, 4),
+          ref(6, 5),
+        ]);
+        state.enemyTiles = new Set();
+        state.allyTiles = new Set();
+        state.borderTiles = [ref(6, 4), ref(6, 5)];
+        resetCommon();
+      }
+
+      function setCombatState() {
+        state.mode = "combat";
+        state.tick = 60;
+        state.myTroops = 70000;
+        state.myGold = 0;
+        state.enemyTroops = 22000;
+        state.myTiles = new Set([
+          ref(10, 10),
+          ref(10, 11),
+          ref(11, 10),
+          ref(11, 11),
+        ]);
+        state.enemyTiles = new Set([ref(12, 10), ref(12, 11)]);
+        state.allyTiles = new Set();
+        state.borderTiles = [ref(11, 10), ref(11, 11)];
+        resetCommon();
+      }
+
+      function setNukeState() {
+        state.mode = "nuke";
+        state.tick = 80;
+        state.myTroops = 22000;
+        state.myGold = 800000;
+        state.siloTile = ref(8, 8);
+        state.enemyCityTile = ref(28, 28);
+        state.myTiles = new Set([ref(7, 7), ref(7, 8), ref(8, 7), ref(8, 8)]);
+        state.enemyTiles = new Set([ref(28, 28), ref(28, 27), ref(27, 28)]);
+        state.allyTiles = new Set();
+        state.borderTiles = [ref(8, 8)];
+        resetCommon();
+        state.myUnits = [makeUnit("Missile Silo", myPlayer, state.siloTile)];
+        state.enemyUnits = [makeUnit("City", enemyPlayer, state.enemyCityTile)];
+      }
+
+      function setEconomyState() {
+        state.mode = "economy";
+        state.tick = 120;
+        state.myTroops = 15000;
+        state.myGold = 300000;
+        state.myTiles = new Set([
+          ref(10, 10),
+          ref(10, 11),
+          ref(11, 10),
+          ref(11, 11),
+          ref(12, 10),
+          ref(12, 11),
+        ]);
+        state.enemyTiles = new Set();
+        state.allyTiles = new Set();
+        state.borderTiles = [ref(12, 10), ref(12, 11)];
+        resetCommon();
+      }
+
+      function setNavalState() {
+        state.mode = "naval";
+        state.tick = 160;
+        state.myTroops = 90000;
+        state.myGold = 1000;
+        state.enemyTroops = 10000;
+        state.myTiles = new Set([
+          ref(5, 5),
+          ref(5, 6),
+          ref(6, 5),
+          ref(6, 6),
+        ]);
+        state.enemyTiles = new Set([
+          ref(30, 30),
+          ref(30, 31),
+          ref(31, 30),
+          ref(31, 31),
+        ]);
+        state.allyTiles = new Set();
+        state.borderTiles = [];
+        resetCommon();
+        state.transportSpawnTargets = new Set([ref(30, 30)]);
+        state.myCoastTiles = new Set([ref(6, 5), ref(6, 6)]);
+        state.enemyUnits = [makeUnit("City", enemyPlayer, ref(30, 30))];
+      }
+
+      function setDiplomacyState() {
+        state.mode = "diplomacy";
+        state.tick = 240;
+        state.myTroops = 95000;
+        state.myGold = 0;
+        state.myTiles = new Set([
+          ref(15, 15),
+          ref(15, 16),
+          ref(16, 15),
+          ref(16, 16),
+        ]);
+        state.enemyTiles = new Set();
+        state.allyTiles = new Set([ref(18, 15), ref(18, 16)]);
+        state.borderTiles = [ref(16, 15), ref(16, 16)];
+        resetCommon();
+        state.allyIncomingAttacks = [{ troops: 10000 }];
+      }
+
+      const results = {};
+      const scenario =
+        new URLSearchParams(window.location.search).get("scenario") || "all";
+
+      function wait(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function hasIntent(type, predicate) {
+        return window.sentMessages.some(
+          (entry) =>
+            entry.intent &&
+            entry.intent.type === type &&
+            (!predicate || predicate(entry.intent)),
+        );
+      }
+
+      function hasHooks() {
+        return (
+          !!document.querySelector("#superbot-panel") &&
+          document.body.textContent.includes("GameView") &&
+          document.body.textContent.includes("captured")
+        );
+      }
+
+      async function runCombatScenario() {
+        setCombatState();
+        await wait(900);
+        results.hooks = hasHooks();
+        results.combat = hasIntent(
+          "attack",
+          (intent) => intent.targetID === "player-2",
+        );
+      }
+
+      async function runNavalScenario() {
+        setNavalState();
+        await wait(1200);
+        results.hooks = hasHooks();
+        results.naval = hasIntent("boat");
+      }
+
+      async function run() {
+        if (scenario === "combat") {
+          await runCombatScenario();
+        } else if (scenario === "naval") {
+          await runNavalScenario();
+        } else {
+          setSpawnManualState();
+          await wait(900);
+          results.hooks = hasHooks();
+          results.spawnManual = hasIntent("spawn");
+
+          window.sentMessages.length = 0;
+          setSpawnRandomState();
+          await wait(700);
+          results.spawnRandom = !hasIntent("spawn");
+
+          window.sentMessages.length = 0;
+          setExpandState();
+          await wait(900);
+          results.expand = hasIntent(
+            "attack",
+            (intent) => intent.targetID === null,
+          );
+
+          window.sentMessages.length = 0;
+          setCombatState();
+          await wait(900);
+          results.combat = hasIntent(
+            "attack",
+            (intent) => intent.targetID === "player-2",
+          );
+
+          window.sentMessages.length = 0;
+          setNukeState();
+          await wait(1100);
+          results.nuke = hasIntent(
+            "build_unit",
+            (intent) =>
+              intent.unit === "Atom Bomb" &&
+              intent.tile === state.enemyCityTile,
+          );
+
+          window.sentMessages.length = 0;
+          setEconomyState();
+          await wait(1100);
+          results.economy = hasIntent(
+            "build_unit",
+            (intent) => intent.unit === "City",
+          );
+
+          window.sentMessages.length = 0;
+          setNavalState();
+          await wait(1200);
+          results.naval = hasIntent("boat");
+
+          window.sentMessages.length = 0;
+          setDiplomacyState();
+          await wait(1200);
+          results.diplomacy = hasIntent(
+            "donate_troops",
+            (intent) => intent.recipient === "player-3",
+          );
+        }
+
+        const pass = Object.values(results).every(Boolean);
+        document.body.setAttribute("data-status", pass ? "pass" : "fail");
+        document.querySelector("#results").textContent = JSON.stringify(
+          {
+            results,
+            finalMessages: window.sentMessages,
+          },
+          null,
+          2,
+        );
+      }
+
+      gameSocket.emitMessage({
+        type: "lobby_info",
+        myClientID: "client-1",
+        lobby: { gameID: "TEST" },
+      });
+      gameSocket.emitMessage({
+        type: "start",
+        myClientID: "client-1",
+        gameStartInfo: { gameID: "TEST" },
+      });
+
+      run().catch((error) => {
+        document.body.setAttribute("data-status", "fail");
+        document.querySelector("#results").textContent = String(
+          (error && error.stack) || error,
+        );
+      });
+    </script>
+  </body>
+</html>
