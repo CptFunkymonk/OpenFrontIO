@@ -687,6 +687,66 @@
     map.set(entry.center, entry);
   }
 
+  function refreshSpawnCandidateList() {
+    const map = runtime.state.spawn.candidateByCenter;
+    if (!map) {
+      runtime.state.spawn.sortedCandidates = [];
+      return [];
+    }
+    const sorted = Array.from(map.values()).sort((a, b) => b.score - a.score);
+    runtime.state.spawn.sortedCandidates = sorted;
+    return sorted;
+  }
+
+  function chooseBestRandomSpawnCandidate(gameView) {
+    const sorted = refreshSpawnCandidateList();
+    let best = null;
+    for (const cand of sorted.slice(0, 72)) {
+      const fresh = computeSpawnCenterScore(gameView, cand.center);
+      if (fresh === null) continue;
+      const refreshed = { center: cand.center, score: fresh };
+      rememberSpawnCandidate(refreshed);
+      if (!best || refreshed.score > best.score) {
+        best = refreshed;
+      }
+    }
+    if (best) {
+      refreshSpawnCandidateList();
+    }
+    return best;
+  }
+
+  function getActiveMatchTicks(gameView) {
+    return Math.max(
+      0,
+      gameView.ticks() - safeCall(() => gameView.config().numSpawnPhaseTurns(), 0),
+    );
+  }
+
+  function getBoatDistanceLimit(gameView, me) {
+    const activeTicks = getActiveMatchTicks(gameView);
+    const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
+    const mapShare = me.numTilesOwned() / totalLand;
+    const alivePlayers = Math.max(
+      1,
+      safeCall(
+        () => gameView.playerViews().filter((player) => player.isAlive()).length,
+        getEnemies().filter((player) => player.isAlive()).length + 1,
+      ),
+    );
+
+    if (alivePlayers <= 3 || mapShare >= 0.22 || activeTicks >= 14400) {
+      return Number.POSITIVE_INFINITY;
+    }
+    if (alivePlayers <= 5 || mapShare >= 0.16 || activeTicks >= 10800) {
+      return 120;
+    }
+    if (mapShare >= 0.1 || activeTicks >= 7200) {
+      return 80;
+    }
+    return 48;
+  }
+
   function countUnownedLandNear(tile, radius) {
     const gameView = getGameView();
     if (!gameView) return 0;
@@ -1105,12 +1165,6 @@
     }
 
     if (gameView.config().isRandomSpawn()) {
-      if (runtime.state.spawn.randomSpawnIntentSent) {
-        runtime.state.lastAction = "waiting for random spawn confirm";
-        runtime.state.strategy = "random-spawn";
-        return false;
-      }
-
       if (!runtime.state.spawn.candidateByCenter) {
         runtime.state.spawn.candidateByCenter = new Map();
       }
@@ -1136,38 +1190,49 @@
         return false;
       }
 
-      if (!runtime.state.spawn.sortedCandidates) {
-        runtime.state.spawn.sortedCandidates = Array.from(
-          runtime.state.spawn.candidateByCenter.values(),
-        ).sort((a, b) => b.score - a.score);
-        runtime.state.spawn.finalIndex = 0;
-      }
-
-      const list = runtime.state.spawn.sortedCandidates;
-      while (runtime.state.spawn.finalIndex < list.length) {
-        const cand = list[runtime.state.spawn.finalIndex];
-        runtime.state.spawn.finalIndex += 1;
-        const fresh = computeSpawnCenterScore(gameView, cand.center);
-        if (fresh === null) {
-          continue;
+      const bestCandidate = chooseBestRandomSpawnCandidate(gameView);
+      if (bestCandidate) {
+        runtime.state.spawn.attempted = true;
+        if (runtime.state.spawn.lastChosenTile === bestCandidate.center) {
+          if (tick - runtime.state.spawn.lastAttemptTick >= 12) {
+            runtime.state.lastIntentSignature = "";
+            if (sendSpawn(bestCandidate.center)) {
+              runtime.state.spawn.randomSpawnIntentSent = true;
+              decisionLog(
+                "random spawn reaffirm " +
+                  gameView.x(bestCandidate.center) +
+                  "," +
+                  gameView.y(bestCandidate.center),
+              );
+              return true;
+            }
+          }
+          runtime.state.lastAction =
+            "holding best spawn (" +
+            gameView.x(bestCandidate.center) +
+            "," +
+            gameView.y(bestCandidate.center) +
+            ")";
+          runtime.state.strategy = "random-spawn-lock";
+          return false;
         }
-        const ok = sendSpawn(cand.center);
+
+        const ok = sendSpawn(bestCandidate.center);
         if (ok) {
           runtime.state.spawn.randomSpawnIntentSent = true;
-          runtime.state.spawn.attempted = true;
           decisionLog(
-            "random spawn intent " +
-              gameView.x(cand.center) +
+            "random spawn lock " +
+              gameView.x(bestCandidate.center) +
               "," +
-              gameView.y(cand.center) +
+              gameView.y(bestCandidate.center) +
               " score~" +
-              fresh.toFixed(0),
+              bestCandidate.score.toFixed(0),
           );
           botLog(
-            "Spawn (random override) -> (" +
-              gameView.x(cand.center) +
+            "Spawn (random lock) -> (" +
+              gameView.x(bestCandidate.center) +
               "," +
-              gameView.y(cand.center) +
+              gameView.y(bestCandidate.center) +
               ")",
           );
           return true;
@@ -1177,6 +1242,7 @@
       for (let attempt = 0; attempt < 48; attempt++) {
         const sampled = trySampleSpawnCandidate(gameView);
         if (!sampled) continue;
+        rememberSpawnCandidate(sampled);
         if (sendSpawn(sampled.center)) {
           runtime.state.spawn.randomSpawnIntentSent = true;
           runtime.state.spawn.attempted = true;
@@ -1523,9 +1589,20 @@
       return false;
     }
 
+    const maxTroops = gameView.config().maxTroops(me);
+    const reserveRatio = computeReserveRatio(me, maxTroops);
+    const available = Math.floor(me.troops() - maxTroops * reserveRatio);
+    if (available < 8000) {
+      decisionLog("naval: reserve too low");
+      return false;
+    }
+
+    const maxBoatDistance = getBoatDistanceLimit(gameView, me);
+    const plans = [];
     const enemies = getEnemies().sort((a, b) => a.troops() - b.troops());
     for (const enemy of enemies.slice(0, 4)) {
       const structureTiles = gatherStructureTiles(enemy);
+      const structureTileSet = new Set(structureTiles);
       const randomTiles = sampleTilesForOwner(enemy.smallID(), 12, {
         requireLand: true,
         maxSamples: 260,
@@ -1538,34 +1615,58 @@
       for (const candidate of candidates.slice(0, 12)) {
         const spawnTile = await queryTransportShipSpawn(candidate);
         if (spawnTile === false) continue;
-
-        const reserveRatio = computeReserveRatio(
-          me,
-          gameView.config().maxTroops(me),
-        );
-        const available = Math.floor(
-          me.troops() - gameView.config().maxTroops(me) * reserveRatio,
-        );
-        if (available < 8000) continue;
+        const boatDistance = gameView.manhattanDist(spawnTile, candidate);
+        if (boatDistance > maxBoatDistance) continue;
 
         const troops = clamp(
           Math.floor(available * 0.28),
           8000,
           Math.floor(me.troops() * 0.35),
         );
-        const success = sendBoat(candidate, troops);
-        if (!success) continue;
-
-        runtime.state.cooldowns.naval = tick;
-        runtime.state.lastAction =
-          "naval invasion -> " + enemy.displayName() + " " + fmtTroops(troops);
-        runtime.state.strategy = "naval";
-        botLog("Boat -> " + enemy.displayName() + " " + fmtTroops(troops));
-        return true;
+        let score = countEnemyStructuresNear(enemy, candidate, 8) * 14;
+        if (structureTileSet.has(candidate)) score += 28;
+        if (enemy.troops() < me.troops() * 0.7) score += 18;
+        if (enemy.numTilesOwned() > me.numTilesOwned() * 1.2) score += 8;
+        score -= Math.floor(boatDistance / 2);
+        plans.push({
+          enemy,
+          candidate,
+          troops,
+          boatDistance,
+          score,
+        });
       }
     }
 
-    decisionLog("naval: no legal invasion path");
+    plans.sort((a, b) => b.score - a.score);
+    for (const plan of plans) {
+      const success = sendBoat(plan.candidate, plan.troops);
+      if (!success) continue;
+
+      runtime.state.cooldowns.naval = tick;
+      runtime.state.lastAction =
+        "naval invasion -> " +
+        plan.enemy.displayName() +
+        " " +
+        fmtTroops(plan.troops);
+      runtime.state.strategy = "naval";
+      botLog(
+        "Boat -> " +
+          plan.enemy.displayName() +
+          " " +
+          fmtTroops(plan.troops) +
+          " @ " +
+          plan.boatDistance +
+          " tiles",
+      );
+      return true;
+    }
+
+    decisionLog(
+      "naval: no worthwhile invasion within " +
+        (Number.isFinite(maxBoatDistance) ? maxBoatDistance : "full-map") +
+        " tiles",
+    );
     return false;
   }
 
@@ -1915,6 +2016,7 @@
         runtime.identity.gameID;
       runtime.state.spawn.attempted = false;
       runtime.state.spawn.lastAttemptTick = -999;
+      runtime.state.spawn.lastChosenTile = null;
       runtime.state.spawn.candidateByCenter = null;
       runtime.state.spawn.sortedCandidates = null;
       runtime.state.spawn.finalIndex = 0;
