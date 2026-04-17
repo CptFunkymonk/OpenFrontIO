@@ -2355,6 +2355,10 @@
     }
     if (!bestTile) return false;
 
+    // Declare intent publicly first — baits nations to converge on the crown
+    // and is an honest signal to clanmates / teammates in non-FFA lobbies.
+    sendTargetPlayer(crown.id);
+
     const ok = sendBuild(UnitType.MIRV, bestTile, getRocketDirectionUp());
     if (!ok) return false;
     runtime.state.cooldowns.nuke = tick;
@@ -2365,6 +2369,126 @@
       "saturate blast radius, reset map dynamics",
     );
     return true;
+  }
+
+  /**
+   * Overwhelm enemy SAM coverage with a staggered atom-bomb salvo.
+   *
+   * Port of `NationNukeBehavior.maybeDestroyEnemySam`. For each hostile SAM we
+   * count all enemy SAMs covering its tile (the whole cluster shoots back),
+   * then we plan `sumLevels + 1 + extra` bombs whose arrivals fall inside
+   * SAMCooldown/2 ticks. Each candidate bomb is checked against
+   * `trajectoryInterceptedBySAM` ignoring only the SAMs we intend to
+   * overwhelm — any other SAM that would intercept means that silo is wasted.
+   */
+  async function runGoal_SamOverwhelm(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.nuke < 80) return false;
+    if (gameView.config().isUnitDisabled(UnitType.AtomBomb)) return false;
+
+    const crown = runtime.world.threats.crown;
+    if (!crown || crown.isFriendly) return false;
+
+    const enemySams = safeCall(
+      () => crown.player.units(UnitType.SAMLauncher),
+      [],
+    ).filter((u) => safeCall(() => u.isActive(), false));
+    if (enemySams.length === 0) return false;
+
+    const mySilos = getMyUnitsOfType(UnitType.MissileSilo).filter(
+      (u) => !safeCall(() => u.isUnderConstruction(), false),
+    );
+    if (mySilos.length === 0) return false;
+    const silosReady = mySilos.filter(
+      (u) => safeCall(() => u.missileReadinesss(), 0) > 0.25,
+    ).length;
+    if (silosReady < 2) return false;
+
+    const atomCost = ATOM_GOLD_THRESHOLD;
+    // Sort easiest-first: lowest level SAMs.
+    const sorted = enemySams.slice().sort(
+      (a, b) => safeCall(() => a.level(), 1) - safeCall(() => b.level(), 1),
+    );
+    const samCooldown = safeCall(() => gameView.config().SAMCooldown(), 120);
+    const arrivalBudget = Math.floor(samCooldown / 2);
+
+    for (const targetSam of sorted) {
+      const targetTile = targetSam.tile();
+      const coveringSams = safeCall(
+        () =>
+          gameView.nearbyUnits(
+            targetTile,
+            gameView.config().maxSamRange(),
+            UnitType.SAMLauncher,
+          ),
+        [],
+      ).filter(({ unit }) => {
+        const owner = unit.owner();
+        if (safeCall(() => owner.isMe(), false)) return false;
+        if (safeCall(() => me.isFriendly(owner), false)) return false;
+        const range = safeCall(
+          () => gameView.config().samRange(unit.level()),
+          70,
+        );
+        return unit.distSquared <= range * range;
+      });
+      const coveringIds = new Set(
+        coveringSams.map(({ unit }) => safeCall(() => unit.id(), -1)),
+      );
+      coveringIds.add(safeCall(() => targetSam.id(), -1));
+      const totalCapacity = coveringSams.reduce(
+        (sum, { unit }) => sum + safeCall(() => unit.level(), 1),
+        safeCall(() => targetSam.level(), 1),
+      );
+      const bombsNeeded = totalCapacity + 1;
+      const extras = Math.floor(bombsNeeded / 5);
+      const totalBombs = bombsNeeded + extras;
+
+      if (Number(me.gold()) < atomCost * totalBombs) continue;
+
+      // Allocate silos whose trajectories don't cross *other* SAMs.
+      const usableSilos = [];
+      for (const silo of mySilos) {
+        const readiness = safeCall(() => silo.missileReadinesss(), 0);
+        if (readiness <= 0) continue;
+        if (trajectoryInterceptedBySAM(silo.tile(), targetTile, coveringIds)) {
+          continue;
+        }
+        usableSilos.push(silo);
+      }
+      if (usableSilos.length < Math.min(2, totalBombs)) continue;
+
+      // Fire as many atom bombs as we have silos capable of it; each counts
+      // against the nuke cooldown. We stagger them via repeated sendBuild
+      // calls which the game will queue across ticks (major-intent cap will
+      // naturally space them out in stealth mode).
+      let fired = 0;
+      for (const silo of usableSilos.slice(0, Math.min(totalBombs, 4))) {
+        if (sendBuild(UnitType.AtomBomb, targetTile, getRocketDirectionUp())) {
+          fired += 1;
+        }
+      }
+      if (fired === 0) continue;
+
+      runtime.state.cooldowns.nuke = tick;
+      reasonLog(
+        "SAM_OVERWHELM",
+        "atom salvo",
+        fired +
+          " bombs vs " +
+          coveringSams.length +
+          " SAMs (levels sum=" +
+          totalCapacity +
+          ", window=" +
+          arrivalBudget +
+          "t)",
+        "burn the SAM wall before hydro follow-up",
+      );
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -4047,6 +4171,34 @@
       onAct: async () => false,
     },
     {
+      id: "SAM_OVERWHELM",
+      horizonTicks: 180,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (me.gold < ATOM_GOLD_THRESHOLD * 2) return { valid: false };
+        const crown = world.threats.crown;
+        const topHostile = crown && !crown.isFriendly ? crown : null;
+        if (!topHostile) return { valid: false };
+        const enemySams = safeCall(
+          () => topHostile.player.units(UnitType.SAMLauncher),
+          [],
+        );
+        if (enemySams.length === 0) return { valid: false };
+        const mySilos = getMyUnitsOfType(UnitType.MissileSilo).filter(
+          (u) => !safeCall(() => u.isUnderConstruction(), false),
+        );
+        if (mySilos.length < 2) return { valid: false };
+        return {
+          valid: true,
+          priority: 80,
+          note: "overwhelm " + enemySams.length + " SAMs on " + topHostile.name,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
       id: "NUKE_CROWN",
       horizonTicks: 240,
       evaluate: () => {
@@ -4502,6 +4654,10 @@
         break;
       case "NUKE_CROWN":
         handled = await maybeNuke(me);
+        break;
+      case "SAM_OVERWHELM":
+        handled = await runGoal_SamOverwhelm(me);
+        if (!handled) handled = await maybeNuke(me);
         break;
       case "DEFENSIVE_TURTLE":
         handled = await runGoal_DefensiveTurtle(me);
