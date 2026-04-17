@@ -1329,17 +1329,36 @@
       }
 
       if (tiles.length > 0) {
+        // Count enemy-owned tiles within a short radius of the segment so we
+        // can prefer quieter frontiers. Crowded borders often trigger a
+        // simultaneous attack race with a neighbor, costing troops and time.
+        let crowdedEnemyBorders = 0;
+        const probe = tiles.slice(0, 12);
+        const seenCrowd = new Set();
+        for (const t of probe) {
+          for (const n of gameView.neighbors(t)) {
+            const ownerID = gameView.ownerID(n);
+            if (ownerID === 0 || ownerID === me.smallID()) continue;
+            const key = ownerID + ":" + t;
+            if (seenCrowd.has(key)) continue;
+            seenCrowd.add(key);
+            crowdedEnemyBorders += 1;
+          }
+        }
         segments.push({
           entryTile: seed,
           size: tiles.length,
           falloutCount,
+          crowdedEnemyBorders,
         });
       }
     }
 
     segments.sort((a, b) => {
-      const aScore = a.size - a.falloutCount * 4;
-      const bScore = b.size - b.falloutCount * 4;
+      const aScore =
+        a.size - a.falloutCount * 4 - a.crowdedEnemyBorders * 1;
+      const bScore =
+        b.size - b.falloutCount * 4 - b.crowdedEnemyBorders * 1;
       return bScore - aScore;
     });
     return segments;
@@ -1910,6 +1929,12 @@
     runtime.state.lastAction =
       "expanding " + fmtTroops(troops) + " into " + best.size + " tiles";
     runtime.state.strategy = "expansion";
+    reasonLog(
+      "TERRA_NULLIUS_RUSH",
+      "land grab",
+      `best segment: size=${best.size} fallout=${best.falloutCount} crowded=${best.crowdedEnemyBorders}`,
+      `claim ~${best.size} tiles`,
+    );
     botLog("Expand -> " + fmtTroops(troops) + " troops");
     return true;
   }
@@ -3069,20 +3094,33 @@
 
     // Build a bias: tiles adjacent to our top adjacent enemy get tried first.
     const adjacent = runtime.world.threats.adjacentEnemies[0];
-    const sortedBorder = borderTiles.slice().sort((a, b) => {
-      if (!adjacent) return 0;
-      const aa = gameView.neighbors(a).some(
-        (t) => gameView.ownerID(t) === adjacent.smallID,
+    // 1-deep interior candidates — step one neighbor inward from a border
+    // tile that touches the threat. Mirrors
+    // `NationStructureBehavior.defensePostValue` which prefers a band one
+    // inside the border.
+    const borderAdjacent = borderTiles.filter((t) => {
+      if (!adjacent) return true;
+      return gameView.neighbors(t).some(
+        (n) => gameView.ownerID(n) === adjacent.smallID,
       );
-      const bb = gameView.neighbors(b).some(
-        (t) => gameView.ownerID(t) === adjacent.smallID,
-      );
-      if (aa && !bb) return -1;
-      if (bb && !aa) return 1;
-      return 0;
     });
+    const interiorSet = new Set();
+    for (const t of borderAdjacent.slice(0, 48)) {
+      for (const n of gameView.neighbors(t)) {
+        if (gameView.ownerID(n) !== me.smallID()) continue;
+        // require that the interior tile itself is NOT on the border, so it
+        // sits 1-deep behind the front line.
+        if (safeCall(() => gameView.isBorder(n), false)) continue;
+        interiorSet.add(n);
+      }
+    }
+    const interior = Array.from(interiorSet);
+    const sortedBorder = borderAdjacent.slice();
+    // Try interior tiles first, then fall back to border tiles if no interior
+    // placement is legal.
+    const combined = interior.concat(sortedBorder);
 
-    for (const tile of sortedBorder.slice(0, 24)) {
+    for (const tile of combined.slice(0, 32)) {
       const buildables = await queryPlayerBuildables(tile, [
         UnitType.DefensePost,
       ]);
@@ -5047,6 +5085,25 @@
       default:
         // Fall through to legacy pipeline; also handles pre-goal behavior.
         break;
+    }
+    // Phase 3: secondary-goal opportunity. If the active goal is offensive
+    // (combat / retaliation / farming), we can still squeeze in a single
+    // background economy action without conflicting — long as the gate in
+    // `economyBanned()` hasn't blocked us. Combat + economy routines operate
+    // on independent cooldowns (cooldowns.combat vs cooldowns.economy).
+    if (handled && runtime.enabled) {
+      const ECONOMY_SECONDARY_GOALS = new Set([
+        "RETALIATION",
+        "NEUTRALIZE_RISING_STAR",
+        "FARM_TRIBE",
+        "TERRA_NULLIUS_RUSH",
+        "DIPLOMACY_ISOLATE_CROWN",
+      ]);
+      if (ECONOMY_SECONDARY_GOALS.has(activeGoalId)) {
+        // Don't gate on failure — we treat the economy pass as purely
+        // opportunistic; it silently skips when it's already on cooldown.
+        await maybeEconomy(me, getEnemies());
+      }
     }
     if (handled) {
       refreshOverlay();
