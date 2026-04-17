@@ -555,16 +555,142 @@
     return true;
   }
 
+  /**
+   * Classify an intent as "major" (attack/build/boat/allianceRequest/
+   * targetPlayer/upgrade/embargo/breakAlliance/donate) or minor. Major intents
+   * are subject to stricter pacing rules.
+   */
+  function isMajorIntent(intent) {
+    if (!intent || !intent.type) return false;
+    switch (intent.type) {
+      case "attack":
+      case "boat":
+      case "build_unit":
+      case "upgrade_structure":
+      case "allianceRequest":
+      case "breakAlliance":
+      case "targetPlayer":
+      case "embargo":
+      case "donate_troops":
+      case "donate_gold":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /** Which target player (if any) does this intent affect? */
+  function intentTargetSmallID(intent) {
+    if (!intent || !intent.type) return null;
+    const id = intent.targetID || intent.recipient || intent.target;
+    if (!id) return null;
+    const player = runtime.world.everyone.find((e) => e.id === id);
+    return player ? player.smallID : null;
+  }
+
+  function intentActionKind(intent) {
+    if (!intent || !intent.type) return "other";
+    if (intent.type === "attack" || intent.type === "boat") return "attack";
+    if (intent.type === "build_unit" || intent.type === "upgrade_structure") return "build";
+    if (intent.type === "targetPlayer") return "target";
+    if (intent.type === "embargo") return "embargo";
+    if (intent.type === "allianceRequest" || intent.type === "breakAlliance") return "diplomacy";
+    return "other";
+  }
+
+  /**
+   * Phase 9: stealth pacing. Returns true if this intent is allowed to go out
+   * right now. We enforce:
+   * - at most one intent per STEALTH_MIN_INTENT_GAP_MS (120 ms)
+   * - at most 3 major intents in any 2-second window
+   * - per-player action diversity: no more than 3 distinct action kinds in a
+   *   rolling 3-second window (prevents target+embargo+attack combos that
+   *   scream "I'm a bot")
+   * - combo cooldown: same player can't receive back-to-back major intents
+   *   within 500 ms
+   */
+  function stealthPermits(intent) {
+    const nowMs = Date.now();
+    const gap = nowMs - runtime.stealth.lastIntentAtMs;
+    if (gap < STEALTH_MIN_INTENT_GAP_MS) {
+      return { ok: false, reason: "intent-gap " + gap + "ms" };
+    }
+
+    if (isMajorIntent(intent)) {
+      runtime.stealth.lastMajorIntentMs = runtime.stealth.lastMajorIntentMs.filter(
+        (ts) => nowMs - ts <= 2000,
+      );
+      if (runtime.stealth.lastMajorIntentMs.length >= STEALTH_MAX_MAJOR_PER_2S) {
+        return { ok: false, reason: "major-burst" };
+      }
+
+      const targetSmallID = intentTargetSmallID(intent);
+      if (targetSmallID !== null) {
+        const combo = runtime.stealth.combos.get(targetSmallID);
+        if (
+          combo &&
+          nowMs - combo.lastAtMs < STEALTH_COMBO_COOLDOWN_MS
+        ) {
+          return { ok: false, reason: "combo on player " + targetSmallID };
+        }
+
+        // Per-player action diversity — rolling 3s window.
+        const actions =
+          runtime.stealth.perPlayerActions.get(targetSmallID) || [];
+        const windowed = actions.filter(
+          (a) => nowMs - a.atMs <= STEALTH_PER_PLAYER_DIVERSITY_WINDOW_MS,
+        );
+        const distinctKinds = new Set(windowed.map((a) => a.kind));
+        const kind = intentActionKind(intent);
+        distinctKinds.add(kind);
+        if (distinctKinds.size > STEALTH_PER_PLAYER_DIVERSITY_CAP) {
+          return { ok: false, reason: "diversity-cap on player " + targetSmallID };
+        }
+      }
+    }
+
+    return { ok: true };
+  }
+
+  function recordStealthIntent(intent) {
+    const nowMs = Date.now();
+    runtime.stealth.lastIntentAtMs = nowMs;
+    if (!isMajorIntent(intent)) return;
+    runtime.stealth.lastMajorIntentMs.push(nowMs);
+    const targetSmallID = intentTargetSmallID(intent);
+    if (targetSmallID === null) return;
+    const kind = intentActionKind(intent);
+    const actions =
+      runtime.stealth.perPlayerActions.get(targetSmallID) || [];
+    actions.push({ kind, atMs: nowMs });
+    const trimmed = actions.filter(
+      (a) => nowMs - a.atMs <= STEALTH_PER_PLAYER_DIVERSITY_WINDOW_MS,
+    );
+    runtime.stealth.perPlayerActions.set(targetSmallID, trimmed);
+    runtime.stealth.combos.set(targetSmallID, { lastKind: kind, lastAtMs: nowMs });
+  }
+
   function sendIntent(intent) {
     if (!runtime.enabled) return false;
     const signature = intent.type + ":" + JSON.stringify(intent);
     if (runtime.state.lastIntentSignature === signature) {
       return false;
     }
+    const permits = stealthPermits(intent);
+    if (!permits.ok) {
+      // Don't spam this into the decisions log — only log once per ~500ms.
+      const nowMs = Date.now();
+      if (nowMs - (runtime.stealth.lastGateLogMs || 0) > 500) {
+        runtime.stealth.lastGateLogMs = nowMs;
+        decisionLog("stealth gate " + permits.reason + " blocked " + intent.type);
+      }
+      return false;
+    }
     const success = sendRawMessage({ type: "intent", intent });
     if (success) {
       runtime.state.lastIntentSignature = signature;
       runtime.state.intentsSent += 1;
+      recordStealthIntent(intent);
       decisionLog("sent " + intent.type);
     }
     return success;
@@ -4444,6 +4570,17 @@
     if (runtime.processing) return;
     runtime.processing = true;
     try {
+      // Phase 9: add a small, jittered reaction delay to mimic a human's
+      // perception/decision time. Keeps us in the "fast human" range
+      // (300–900 ms) rather than the "frame-perfect bot" range.
+      if (runtime.enabled && !runtime.world.archetypeLocked) {
+        const delay =
+          STEALTH_REACTION_MIN_MS +
+          Math.floor(Math.random() * (STEALTH_REACTION_MAX_MS - STEALTH_REACTION_MIN_MS));
+        // Only the first few jitters matter; further ones are dominated by the
+        // loop interval anyway. Skip when disabled or paused.
+        await new Promise((resolve) => setTimeout(resolve, Math.min(delay, 260)));
+      }
       await runModulesForTick();
     } catch (error) {
       decisionLog("loop error: " + error.message);
