@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.0.1
-// @description  Standalone legality-aware OpenFront bot built from repo source
+// @version      2.1.0
+// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -13,12 +13,35 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.0.1";
+  const BOT_VERSION = "2.1.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
-  const MAX_DECISION_ENTRIES = 180;
+  const MAX_DECISION_ENTRIES = 220;
+  const MAX_REASON_ENTRIES = 40;
   const LOOP_INTERVAL_MS = 140;
   const DISCOVERY_INTERVAL_MS = 400;
+
+  // History / world model tuning.
+  const HISTORY_WINDOW_TICKS = 600;
+  const HISTORY_SAMPLE_EVERY = 10;
+  const HISTORY_MAX_SAMPLES = Math.ceil(HISTORY_WINDOW_TICKS / HISTORY_SAMPLE_EVERY) + 2;
+  const THREAT_CROWN_THRESHOLD = 0.2;
+  const THREAT_CROWN_HYSTERESIS = 0.02;
+  const MIRV_GOLD_THRESHOLD = 20_000_000;
+  const HYDRO_GOLD_THRESHOLD = 5_000_000;
+  const ATOM_GOLD_THRESHOLD = 750_000;
+  const TICKS_PER_SECOND = 10;
+  const TICKS_PER_MINUTE = 60 * TICKS_PER_SECOND;
+
+  // Stealth pacing (human-grade top-player, not wall-clock optimal).
+  const STEALTH_MIN_INTENT_GAP_MS = 120;
+  const STEALTH_MAX_MAJOR_PER_2S = 3;
+  const STEALTH_REACTION_MIN_MS = 300;
+  const STEALTH_REACTION_MAX_MS = 900;
+  const STEALTH_SPAWN_THINK_MS = 8000;
+  const STEALTH_COMBO_COOLDOWN_MS = 500;
+  const STEALTH_PER_PLAYER_DIVERSITY_WINDOW_MS = 3000;
+  const STEALTH_PER_PLAYER_DIVERSITY_CAP = 3;
 
   const UnitType = Object.freeze({
     TransportShip: "Transport",
@@ -79,6 +102,7 @@
     identity: {
       clientID: null,
       gameID: null,
+      clanTag: null,
     },
     state: {
       gameStarted: false,
@@ -94,6 +118,7 @@
         finalIndex: 0,
         maxCandidateCenters: 2000,
         randomSpawnIntentSent: false,
+        thinkUntilMs: 0,
       },
       cooldowns: {
         expand: -999,
@@ -102,6 +127,8 @@
         naval: -999,
         nuke: -999,
         diplomacy: -999,
+        warship: -999,
+        betray: -999,
       },
       borderCache: {
         tick: -999,
@@ -118,10 +145,79 @@
     overlay: {
       root: null,
       mounted: false,
+      expanded: true,
     },
     statsSnapshot: null,
     logs: [],
     decisions: [],
+    reasons: [], // structured "why we did that" entries
+    /**
+     * Rich world model computed every tick once the match is active.
+     * Populated by updateWorldModel(); consumed by threat scorer, planner, tactics.
+     */
+    world: {
+      tick: 0,
+      me: null,
+      meSmallID: null,
+      everyone: [],
+      bySmallID: new Map(),
+      history: new Map(), // smallID -> { samples: [{tick, troops, tiles, gold}], lastSampleTick }
+      totals: {
+        alivePlayers: 0,
+        humanCount: 0,
+        nationCount: 0,
+        botCount: 0,
+        totalLand: 0,
+        usableLand: 0,
+        crownShare: 0,
+        myShare: 0,
+        secondShare: 0,
+      },
+      rankings: {
+        byTiles: [],
+        byTroops: [],
+        byTilesVelocity: [],
+        byTroopsVelocity: [],
+      },
+      allianceGraph: {
+        edges: new Map(),
+        cliques: [],
+        largestBlocShare: 0,
+        coalitionThreat: false,
+      },
+      threats: {
+        crownSmallID: null,
+        crown: null,
+        prevCrownSmallID: null,
+        risingStars: [],
+        softTargets: [],
+        nearestDanger: null,
+        mirvRisk: false,
+        mirvCapable: [],
+        adjacentEnemies: [],
+        inboundTroopTotal: 0,
+      },
+      archetype: "unknown",
+      archetypeLocked: null, // manual override from overlay
+      classifiedAt: -1,
+    },
+    planner: {
+      activeGoalId: null,
+      activeGoal: null,
+      activeGoalCreatedTick: -1,
+      activeGoalExpiresTick: -1,
+      lastSwitchTick: -1,
+      forcedGoalId: null,
+      forcedGoalExpiresMs: 0,
+      /** @type {Array<{id: string, priority: number, valid: boolean, note?: string}>} */
+      lastEvaluation: [],
+    },
+    stealth: {
+      lastIntentAtMs: 0,
+      lastMajorIntentMs: [],
+      perPlayerActions: new Map(), // smallID -> [{ kind, atMs }]
+      combos: new Map(), // smallID -> { lastKind, lastAtMs }
+    },
   };
 
   const NativeWebSocket = window.WebSocket;
@@ -150,6 +246,34 @@
     }
     console.log("[SuperBot:decision] " + entry);
     refreshOverlay();
+  }
+
+  /**
+   * Record a structured "why we did that" entry. Keep the message short and
+   * the trigger/outcome fields readable at a glance in the overlay.
+   */
+  function reasonLog(goalId, action, trigger, outcome) {
+    const tick =
+      runtime.hooks.gameView &&
+      typeof runtime.hooks.gameView.ticks === "function"
+        ? runtime.hooks.gameView.ticks()
+        : 0;
+    const entry = {
+      tick,
+      goalId: goalId || "-",
+      action: action || "-",
+      trigger: trigger || "",
+      outcome: outcome || "",
+    };
+    runtime.reasons.push(entry);
+    if (runtime.reasons.length > MAX_REASON_ENTRIES) {
+      runtime.reasons.shift();
+    }
+    decisionLog(
+      "[" + entry.goalId + "] " + entry.action +
+      (entry.trigger ? " | because " + entry.trigger : "") +
+      (entry.outcome ? ", expect " + entry.outcome : "")
+    );
   }
 
   function safeCall(fn, fallback) {
@@ -1918,6 +2042,383 @@
     };
   }
 
+  // ---------- Phase 1: world model ----------
+
+  /**
+   * Count active structures (not under construction) grouped by type for the
+   * given player. Missing units fall back to 0 so callers don't have to null-check.
+   */
+  function collectStructureCounts(player) {
+    const counts = {
+      [UnitType.City]: 0,
+      [UnitType.Factory]: 0,
+      [UnitType.Port]: 0,
+      [UnitType.DefensePost]: 0,
+      [UnitType.MissileSilo]: 0,
+      [UnitType.SAMLauncher]: 0,
+    };
+    const levels = { ...counts };
+    for (const type of StructureTypes) {
+      const units = safeCall(() => player.units(type), []);
+      for (const unit of units) {
+        if (!safeCall(() => unit.isActive(), false)) continue;
+        if (safeCall(() => unit.isUnderConstruction(), false)) continue;
+        counts[type] = (counts[type] || 0) + 1;
+        levels[type] = (levels[type] || 0) + Math.max(1, safeCall(() => unit.level(), 1));
+      }
+    }
+    return { counts, levels };
+  }
+
+  function normalizeClanTag(value) {
+    if (!value || typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return trimmed.toUpperCase();
+  }
+
+  /**
+   * Derive a player's clan tag from anything we can observe. The game sometimes
+   * stores a raw clanTag; other times it's embedded in the display name as
+   * "[TAG] Player" or "[TAG]Player". We scan both.
+   */
+  function extractClanTag(player) {
+    if (!player) return null;
+    const raw =
+      safeCall(() => player.data && player.data.clanTag, null) ||
+      safeCall(() => player.clanTag && player.clanTag(), null);
+    if (raw) return normalizeClanTag(raw);
+    const display =
+      safeCall(() => player.displayName(), null) ||
+      safeCall(() => player.name(), null) ||
+      "";
+    const match = display.match(/^\s*\[([A-Za-z0-9_.-]{1,6})\]/);
+    if (match) return normalizeClanTag(match[1]);
+    return null;
+  }
+
+  function trustedClanTags() {
+    const tags = new Set();
+    const own = normalizeClanTag(runtime.identity.clanTag);
+    if (own) tags.add(own);
+    const extras = runtime.identity.extraClanTags;
+    if (Array.isArray(extras)) {
+      for (const t of extras) {
+        const norm = normalizeClanTag(t);
+        if (norm) tags.add(norm);
+      }
+    }
+    return tags;
+  }
+
+  /** Push a single history sample, trimming to HISTORY_MAX_SAMPLES. */
+  function pushHistorySample(smallID, sample) {
+    let entry = runtime.world.history.get(smallID);
+    if (!entry) {
+      entry = { samples: [], lastSampleTick: -999 };
+      runtime.world.history.set(smallID, entry);
+    }
+    entry.samples.push(sample);
+    if (entry.samples.length > HISTORY_MAX_SAMPLES) {
+      entry.samples.splice(0, entry.samples.length - HISTORY_MAX_SAMPLES);
+    }
+    entry.lastSampleTick = sample.tick;
+    return entry;
+  }
+
+  /** Compute per-minute velocity for a player from its ring buffer samples. */
+  function computeVelocities(entry, tick) {
+    if (!entry || entry.samples.length === 0) {
+      return { tilesPerMin: 0, troopsPerMin: 0, goldPerMin: 0, spanTicks: 0 };
+    }
+    const latest = entry.samples[entry.samples.length - 1];
+    let reference = entry.samples[0];
+    // Prefer a reference point within the configured window so bursts don't dominate.
+    for (const sample of entry.samples) {
+      if (latest.tick - sample.tick <= HISTORY_WINDOW_TICKS) {
+        reference = sample;
+        break;
+      }
+    }
+    const span = Math.max(1, latest.tick - reference.tick);
+    const tilesPerMin =
+      ((latest.tiles - reference.tiles) * TICKS_PER_MINUTE) / span;
+    const troopsPerMin =
+      ((latest.troops - reference.troops) * TICKS_PER_MINUTE) / span;
+    const goldPerMin =
+      ((latest.gold - reference.gold) * TICKS_PER_MINUTE) / span;
+    return { tilesPerMin, troopsPerMin, goldPerMin, spanTicks: span };
+  }
+
+  /**
+   * Drop history entries for players that have died (no longer in the live view).
+   * Called each tick so the ring buffer doesn't grow unbounded across respawns.
+   */
+  function pruneStaleHistory(livingSmallIDs) {
+    if (runtime.world.history.size === 0) return;
+    for (const smallID of Array.from(runtime.world.history.keys())) {
+      if (!livingSmallIDs.has(smallID)) {
+        runtime.world.history.delete(smallID);
+      }
+    }
+  }
+
+  /**
+   * Refresh the world model. Called at the top of every active-phase tick.
+   * Cheap: only uses synchronous GameView reads, no worker RPCs.
+   */
+  function updateWorldModel(me, borderTiles) {
+    const gameView = getGameView();
+    if (!gameView || !me) return;
+
+    const tick = safeCall(() => gameView.ticks(), 0);
+    const allPlayers = safeCall(() => gameView.playerViews(), []);
+    const alive = allPlayers.filter((p) => safeCall(() => p.isAlive(), false));
+
+    // Identity: learn our clan tag once, when the game starts.
+    if (!runtime.identity.clanTag) {
+      const selfTag = extractClanTag(me);
+      if (selfTag) {
+        runtime.identity.clanTag = selfTag;
+        botLog("Detected own clan tag: [" + selfTag + "]");
+      }
+    }
+
+    const meSmallID = safeCall(() => me.smallID(), null);
+    const trustedTags = trustedClanTags();
+    const sample = (player) => {
+      const troops = safeCall(() => player.troops(), 0);
+      const tiles = safeCall(() => player.numTilesOwned(), 0);
+      const gold = Number(safeCall(() => player.gold(), 0));
+      return { tick, troops, tiles, gold };
+    };
+
+    const shouldSample =
+      runtime.world.tick === 0 ||
+      tick - runtime.world.tick >= HISTORY_SAMPLE_EVERY ||
+      runtime.world.history.size === 0;
+
+    const everyone = [];
+    const livingSmallIDs = new Set();
+    let humanCount = 0;
+    let nationCount = 0;
+    let botCount = 0;
+
+    for (const player of alive) {
+      const smallID = safeCall(() => player.smallID(), null);
+      if (smallID === null) continue;
+      livingSmallIDs.add(smallID);
+
+      const type = safeCall(() => player.type(), null);
+      if (type === PlayerType.Bot) botCount += 1;
+      else if (type === PlayerType.Nation) nationCount += 1;
+      else if (type === PlayerType.Human) humanCount += 1;
+
+      if (shouldSample) {
+        pushHistorySample(smallID, sample(player));
+      }
+      const historyEntry = runtime.world.history.get(smallID);
+      const velocities = computeVelocities(historyEntry, tick);
+      const { counts, levels } = collectStructureCounts(player);
+      const clanTag = extractClanTag(player);
+      const isClanmate =
+        smallID !== meSmallID && clanTag && trustedTags.has(clanTag);
+      const isFriendly =
+        smallID === meSmallID ||
+        safeCall(() => me.isFriendly(player), false) ||
+        Boolean(isClanmate);
+      const isAlly =
+        smallID !== meSmallID &&
+        (safeCall(() => me.isAlliedWith(player), false) ||
+          safeCall(() => me.isOnSameTeam(player), false));
+      const maxTroops = safeCall(
+        () => gameView.config().maxTroops(player),
+        1,
+      );
+      const incomingAttacks = safeCall(
+        () => player.incomingAttacks(),
+        [],
+      );
+      const outgoingAttacks = safeCall(
+        () => player.outgoingAttacks(),
+        [],
+      );
+      const incomingTroops = incomingAttacks.reduce(
+        (sum, attack) => sum + safeCall(() => attack.troops(), 0),
+        0,
+      );
+      const outgoingTroops = outgoingAttacks.reduce(
+        (sum, attack) => sum + safeCall(() => attack.troops(), 0),
+        0,
+      );
+
+      const alliances = safeCall(() => player.alliances(), []);
+      const allyIDs = safeCall(
+        () =>
+          safeCall(() => player.allies(), []).map((a) =>
+            safeCall(() => a.smallID(), null),
+          ),
+        [],
+      ).filter((id) => id !== null);
+
+      everyone.push({
+        smallID,
+        id: safeCall(() => player.id(), null),
+        player,
+        name: safeCall(() => player.displayName(), "?"),
+        type,
+        clanTag,
+        isMe: smallID === meSmallID,
+        isClanmate: Boolean(isClanmate),
+        isFriendly,
+        isAlly,
+        isEnemy: !isFriendly,
+        isDisconnected: safeCall(() => player.isDisconnected(), false),
+        isTraitor: safeCall(() => player.isTraitor(), false),
+        traitorRemainingTicks: safeCall(
+          () => player.getTraitorRemainingTicks(),
+          0,
+        ),
+        hasSpawned: safeCall(() => player.hasSpawned(), false),
+        troops: sample(player).troops,
+        tiles: sample(player).tiles,
+        gold: sample(player).gold,
+        maxTroops,
+        troopRatio: maxTroops > 0 ? sample(player).troops / maxTroops : 0,
+        structures: counts,
+        structureLevels: levels,
+        tilesPerMin: velocities.tilesPerMin,
+        troopsPerMin: velocities.troopsPerMin,
+        goldPerMin: velocities.goldPerMin,
+        incomingAttacks,
+        outgoingAttacks,
+        incomingTroops,
+        outgoingTroops,
+        allyIDs,
+        alliances,
+      });
+    }
+
+    pruneStaleHistory(livingSmallIDs);
+
+    const bySmallID = new Map();
+    for (const entry of everyone) bySmallID.set(entry.smallID, entry);
+
+    // Totals & land shares.
+    const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
+    const falloutTiles = safeCall(() => gameView.numTilesWithFallout(), 0);
+    const usableLand = Math.max(1, totalLand - falloutTiles);
+    const sortedByTiles = everyone
+      .slice()
+      .sort((a, b) => b.tiles - a.tiles || a.smallID - b.smallID);
+    const firstTiles = sortedByTiles[0] ? sortedByTiles[0].tiles : 0;
+    const secondTiles = sortedByTiles[1] ? sortedByTiles[1].tiles : 0;
+    const myEntry = bySmallID.get(meSmallID) || null;
+
+    runtime.world.tick = tick;
+    runtime.world.me = myEntry;
+    runtime.world.meSmallID = meSmallID;
+    runtime.world.everyone = everyone;
+    runtime.world.bySmallID = bySmallID;
+    runtime.world.totals = {
+      alivePlayers: everyone.length,
+      humanCount,
+      nationCount,
+      botCount,
+      totalLand,
+      usableLand,
+      crownShare: firstTiles / usableLand,
+      myShare: myEntry ? myEntry.tiles / usableLand : 0,
+      secondShare: secondTiles / usableLand,
+    };
+    runtime.world.rankings.byTiles = sortedByTiles.map((e) => e.smallID);
+    runtime.world.rankings.byTroops = everyone
+      .slice()
+      .sort((a, b) => b.troops - a.troops || a.smallID - b.smallID)
+      .map((e) => e.smallID);
+    runtime.world.rankings.byTilesVelocity = everyone
+      .slice()
+      .sort((a, b) => b.tilesPerMin - a.tilesPerMin || a.smallID - b.smallID)
+      .map((e) => e.smallID);
+    runtime.world.rankings.byTroopsVelocity = everyone
+      .slice()
+      .sort((a, b) => b.troopsPerMin - a.troopsPerMin || a.smallID - b.smallID)
+      .map((e) => e.smallID);
+
+    buildAllianceGraph(everyone, bySmallID, usableLand);
+  }
+
+  /**
+   * Build the current-tick alliance graph. Two players are considered linked if
+   * they are actually allied OR on the same team. We then walk connected
+   * components (cliques) and compute the largest bloc's tile share so we can
+   * flag coalition threats.
+   */
+  function buildAllianceGraph(everyone, bySmallID, usableLand) {
+    const edges = new Map();
+    for (const entry of everyone) {
+      edges.set(entry.smallID, new Set());
+    }
+    for (const entry of everyone) {
+      for (const otherId of entry.allyIDs) {
+        if (!bySmallID.has(otherId)) continue;
+        edges.get(entry.smallID).add(otherId);
+        edges.get(otherId).add(entry.smallID);
+      }
+      // Team mode: add every teammate.
+      for (const other of everyone) {
+        if (other.smallID === entry.smallID) continue;
+        if (
+          safeCall(
+            () => entry.player.isOnSameTeam && entry.player.isOnSameTeam(other.player),
+            false,
+          )
+        ) {
+          edges.get(entry.smallID).add(other.smallID);
+          edges.get(other.smallID).add(entry.smallID);
+        }
+      }
+    }
+
+    // Connected components via BFS.
+    const cliques = [];
+    const visited = new Set();
+    for (const entry of everyone) {
+      if (visited.has(entry.smallID)) continue;
+      const component = [];
+      const queue = [entry.smallID];
+      visited.add(entry.smallID);
+      while (queue.length) {
+        const current = queue.shift();
+        component.push(current);
+        for (const neighbor of edges.get(current) || []) {
+          if (visited.has(neighbor)) continue;
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+      cliques.push(component);
+    }
+
+    let largestBlocShare = 0;
+    for (const component of cliques) {
+      if (component.length < 2) continue;
+      let blocTiles = 0;
+      for (const smallID of component) {
+        blocTiles += bySmallID.get(smallID)?.tiles || 0;
+      }
+      const share = blocTiles / usableLand;
+      if (share > largestBlocShare) largestBlocShare = share;
+    }
+
+    runtime.world.allianceGraph = {
+      edges,
+      cliques,
+      largestBlocShare,
+      coalitionThreat: largestBlocShare >= 0.45,
+    };
+  }
+
   async function runModulesForTick() {
     discoverRuntimeReferences();
     const gameView = getGameView();
@@ -1951,6 +2452,7 @@
     }
 
     const borderTiles = await queryExactBorderTiles(false);
+    updateWorldModel(me, borderTiles);
     updateSnapshot(me, borderTiles);
 
     const didDiplomacy = await maybeDiplomacy(me);
@@ -2014,6 +2516,7 @@
       runtime.identity.gameID =
         (data.gameStartInfo && data.gameStartInfo.gameID) ||
         runtime.identity.gameID;
+      runtime.identity.clanTag = null;
       runtime.state.spawn.attempted = false;
       runtime.state.spawn.lastAttemptTick = -999;
       runtime.state.spawn.lastChosenTile = null;
@@ -2021,7 +2524,24 @@
       runtime.state.spawn.sortedCandidates = null;
       runtime.state.spawn.finalIndex = 0;
       runtime.state.spawn.randomSpawnIntentSent = false;
+      runtime.state.spawn.thinkUntilMs = 0;
       runtime.state.profileCache.clear();
+      // Clear world model + planner on fresh game so velocities start clean.
+      runtime.world.history.clear();
+      runtime.world.tick = 0;
+      runtime.world.everyone = [];
+      runtime.world.bySmallID.clear();
+      runtime.world.archetype = "unknown";
+      runtime.world.classifiedAt = -1;
+      runtime.planner.activeGoalId = null;
+      runtime.planner.activeGoal = null;
+      runtime.planner.activeGoalCreatedTick = -1;
+      runtime.planner.activeGoalExpiresTick = -1;
+      runtime.planner.lastEvaluation = [];
+      runtime.reasons = [];
+      runtime.stealth.perPlayerActions.clear();
+      runtime.stealth.combos.clear();
+      runtime.stealth.lastMajorIntentMs = [];
       botLog("Game started");
       return;
     }
