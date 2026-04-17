@@ -4242,6 +4242,27 @@
     window.Worker.prototype = NativeWorker.prototype;
   }
 
+  const OVERRIDE_GOAL_BUTTONS = [
+    { id: "NUKE_CROWN", label: "Nuke Crown" },
+    { id: "MIRV_LAST_RESORT", label: "MIRV" },
+    { id: "SAVE_FOR_HYDRO", label: "Save Hydro" },
+    { id: "SAM_WALL_BUILDUP", label: "SAM Wall" },
+    { id: "DEFENSIVE_TURTLE", label: "Turtle" },
+    { id: "CONSOLIDATE_FRONT", label: "Hold Front" },
+    { id: "TERRA_NULLIUS_RUSH", label: "Rush Empty" },
+    { id: "NAVAL_LAND_GRAB", label: "Naval" },
+  ];
+
+  const ARCHETYPE_OPTIONS = [
+    "",
+    "CONTINENTAL",
+    "ISLAND",
+    "CHOKE_HEAVY",
+    "NUKE_RACE",
+    "ARENA",
+    "CONVENTIONAL",
+  ];
+
   function overlayHtml() {
     return `
       <style>
@@ -4249,8 +4270,8 @@
           position: fixed;
           top: 12px;
           right: 12px;
-          width: 340px;
-          max-height: 76vh;
+          width: 480px;
+          max-height: 88vh;
           display: flex;
           flex-direction: column;
           background: rgba(8, 12, 24, 0.94);
@@ -4287,6 +4308,7 @@
           display: flex;
           align-items: center;
           gap: 6px;
+          flex-wrap: wrap;
         }
         .superbot-controls button {
           border: 1px solid rgba(255, 255, 255, 0.12);
@@ -4297,23 +4319,36 @@
           cursor: pointer;
           font-size: 11px;
         }
+        .superbot-controls button.active-goal {
+          background: rgba(124, 230, 160, 0.22);
+          border-color: rgba(124, 230, 160, 0.6);
+          color: #b7ffd1;
+        }
         .superbot-body {
           overflow: auto;
           padding: 10px;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          grid-gap: 10px;
+        }
+        .superbot-body .wide {
+          grid-column: span 2;
         }
         .superbot-section {
-          margin-bottom: 10px;
-        }
-        .superbot-section:last-child {
-          margin-bottom: 0;
+          background: rgba(255, 255, 255, 0.02);
+          border: 1px solid rgba(255, 255, 255, 0.04);
+          border-radius: 8px;
+          padding: 8px 10px;
         }
         .superbot-section-title {
           text-transform: uppercase;
           font-size: 10px;
           letter-spacing: 0.08em;
           color: rgba(164, 190, 255, 0.74);
-          margin-bottom: 4px;
+          margin-bottom: 6px;
           font-weight: 700;
+          display: flex;
+          justify-content: space-between;
         }
         .superbot-row {
           display: flex;
@@ -4343,7 +4378,7 @@
           background: rgba(0, 0, 0, 0.22);
           border-radius: 8px;
           padding: 6px;
-          max-height: 118px;
+          max-height: 160px;
           overflow: auto;
           font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           font-size: 10px;
@@ -4354,8 +4389,81 @@
           margin-bottom: 2px;
           word-break: break-word;
         }
-        .superbot-log-line:last-child {
-          margin-bottom: 0;
+        .superbot-goal-row {
+          display: grid;
+          grid-template-columns: 96px 28px 1fr;
+          gap: 6px;
+          font-size: 11px;
+          padding: 1px 0;
+        }
+        .superbot-goal-row .gid {
+          color: #cfe0ff;
+          font-weight: 600;
+        }
+        .superbot-goal-row .gp {
+          color: #9ffcb8;
+          text-align: right;
+        }
+        .superbot-goal-row.inactive .gid {
+          color: rgba(200, 213, 244, 0.45);
+        }
+        .superbot-goal-row.inactive .gp {
+          color: rgba(150, 180, 220, 0.5);
+        }
+        .superbot-reason {
+          font-size: 11px;
+          line-height: 1.35;
+          padding: 4px 6px;
+          border-left: 2px solid rgba(140, 180, 255, 0.45);
+          margin-bottom: 4px;
+          background: rgba(140, 180, 255, 0.05);
+          border-radius: 0 6px 6px 0;
+        }
+        .superbot-reason .head {
+          color: #b7ffd1;
+          font-weight: 700;
+        }
+        .superbot-reason .tail {
+          color: rgba(216, 228, 255, 0.85);
+        }
+        .superbot-override-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
+          margin-top: 4px;
+        }
+        .superbot-override-row button {
+          border: 1px solid rgba(140, 180, 255, 0.2);
+          background: rgba(140, 180, 255, 0.08);
+          color: #cfe0ff;
+          border-radius: 5px;
+          padding: 2px 6px;
+          font-size: 10px;
+          cursor: pointer;
+        }
+        .superbot-override-row button.active {
+          background: rgba(124, 230, 160, 0.22);
+          border-color: rgba(124, 230, 160, 0.6);
+          color: #b7ffd1;
+        }
+        select.superbot-select {
+          background: rgba(255, 255, 255, 0.05);
+          color: #e6efff;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          border-radius: 5px;
+          padding: 2px 4px;
+          font-size: 11px;
+          margin-left: 6px;
+        }
+        input.superbot-input {
+          background: rgba(255, 255, 255, 0.05);
+          color: #e6efff;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          border-radius: 5px;
+          padding: 2px 6px;
+          font-size: 11px;
+          width: 100%;
+          margin-top: 4px;
         }
       </style>
       <div class="superbot-header">
@@ -4363,6 +4471,7 @@
         <div class="superbot-controls">
           <button id="superbot-toggle">ON</button>
           <button id="superbot-mode">BAL</button>
+          <button id="superbot-export">export</button>
           <button id="superbot-collapse">_</button>
         </div>
       </div>
@@ -4380,15 +4489,119 @@
           <div id="superbot-stats"></div>
         </div>
         <div class="superbot-section">
+          <div class="superbot-section-title">Intel</div>
+          <div id="superbot-intel"></div>
+        </div>
+        <div class="superbot-section wide">
+          <div class="superbot-section-title">Goal</div>
+          <div id="superbot-goal"></div>
+        </div>
+        <div class="superbot-section wide">
+          <div class="superbot-section-title">Why</div>
+          <div id="superbot-reasons"></div>
+        </div>
+        <div class="superbot-section wide">
+          <div class="superbot-section-title">
+            <span>Overrides</span>
+            <span id="superbot-override-timer" style="color: rgba(216, 228, 255, 0.5); font-weight: 500; text-transform: none; letter-spacing: 0;"></span>
+          </div>
+          <div class="superbot-override-row" id="superbot-override-goals"></div>
+          <div style="margin-top:6px">
+            <span style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">Archetype</span>
+            <select class="superbot-select" id="superbot-archetype"></select>
+          </div>
+          <div style="margin-top:6px">
+            <span style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">Trusted clan tags (comma-separated)</span>
+            <input class="superbot-input" id="superbot-clan" placeholder="e.g. UN, MLS" />
+          </div>
+        </div>
+        <div class="superbot-section wide">
           <div class="superbot-section-title">Decisions</div>
           <div id="superbot-decisions" class="superbot-log"></div>
         </div>
-        <div class="superbot-section">
+        <div class="superbot-section wide">
           <div class="superbot-section-title">Activity</div>
           <div id="superbot-activity" class="superbot-log"></div>
         </div>
       </div>
     `;
+  }
+
+  /** Force-goal activation (with 120s expiry, per plan). */
+  function setForcedGoal(goalId) {
+    const planner = runtime.planner;
+    if (planner.forcedGoalId === goalId) {
+      planner.forcedGoalId = null;
+      planner.forcedGoalExpiresMs = 0;
+      botLog("force-goal cleared");
+    } else {
+      planner.forcedGoalId = goalId;
+      planner.forcedGoalExpiresMs = Date.now() + 120_000;
+      botLog("force-goal -> " + goalId);
+    }
+    refreshOverlay();
+  }
+
+  function setArchetypeLock(value) {
+    runtime.world.archetypeLocked = value || null;
+    if (value) {
+      runtime.world.archetype = value;
+      botLog("archetype locked -> " + value);
+    } else {
+      botLog("archetype lock cleared");
+    }
+    refreshOverlay();
+  }
+
+  function setExtraClanTags(csv) {
+    if (!csv || !csv.trim()) {
+      runtime.identity.extraClanTags = [];
+      return;
+    }
+    runtime.identity.extraClanTags = csv
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    botLog(
+      "trusted clan tags: " +
+      runtime.identity.extraClanTags.map((t) => "[" + t + "]").join(", "),
+    );
+  }
+
+  function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+      return;
+    }
+    const el = document.createElement("textarea");
+    el.value = text;
+    document.body.appendChild(el);
+    el.select();
+    try {
+      document.execCommand("copy");
+    } catch (_) {}
+    el.remove();
+  }
+
+  function dumpWorldJson() {
+    // BigInts (gold) have already been coerced to Numbers in the world model;
+    // this stringify is safe.
+    try {
+      return JSON.stringify(
+        {
+          world: runtime.world,
+          planner: runtime.planner,
+          identity: runtime.identity,
+          mode: runtime.mode,
+          reasons: runtime.reasons,
+        },
+        (key, value) =>
+          typeof value === "bigint" ? value.toString() : value,
+        2,
+      );
+    } catch (err) {
+      return JSON.stringify({ error: err.message });
+    }
   }
 
   function ensureOverlay() {
@@ -4404,7 +4617,11 @@
 
     const toggleButton = panel.querySelector("#superbot-toggle");
     const modeButton = panel.querySelector("#superbot-mode");
+    const exportButton = panel.querySelector("#superbot-export");
     const collapseButton = panel.querySelector("#superbot-collapse");
+    const overrideRow = panel.querySelector("#superbot-override-goals");
+    const archetypeSelect = panel.querySelector("#superbot-archetype");
+    const clanInput = panel.querySelector("#superbot-clan");
 
     toggleButton.addEventListener("click", () => {
       runtime.enabled = !runtime.enabled;
@@ -4420,9 +4637,54 @@
       refreshOverlay();
     });
 
+    exportButton.addEventListener("click", () => {
+      copyToClipboard(dumpWorldJson());
+      botLog("world dump copied to clipboard");
+    });
+
     collapseButton.addEventListener("click", () => {
       panel.classList.toggle("collapsed");
     });
+
+    // Force-goal buttons.
+    if (overrideRow) {
+      for (const entry of OVERRIDE_GOAL_BUTTONS) {
+        const btn = document.createElement("button");
+        btn.dataset.goal = entry.id;
+        btn.textContent = entry.label;
+        btn.addEventListener("click", () => setForcedGoal(entry.id));
+        overrideRow.appendChild(btn);
+      }
+      const clearBtn = document.createElement("button");
+      clearBtn.textContent = "Clear";
+      clearBtn.addEventListener("click", () => {
+        runtime.planner.forcedGoalId = null;
+        runtime.planner.forcedGoalExpiresMs = 0;
+        refreshOverlay();
+      });
+      overrideRow.appendChild(clearBtn);
+    }
+
+    // Archetype override dropdown.
+    if (archetypeSelect) {
+      for (const option of ARCHETYPE_OPTIONS) {
+        const opt = document.createElement("option");
+        opt.value = option;
+        opt.textContent = option || "(auto)";
+        archetypeSelect.appendChild(opt);
+      }
+      archetypeSelect.value = runtime.world.archetypeLocked || "";
+      archetypeSelect.addEventListener("change", (e) => {
+        setArchetypeLock(e.target.value || null);
+      });
+    }
+
+    if (clanInput) {
+      clanInput.value = (runtime.identity.extraClanTags || []).join(", ");
+      clanInput.addEventListener("change", (e) => {
+        setExtraClanTags(e.target.value);
+      });
+    }
 
     refreshOverlay();
   }
@@ -4446,20 +4708,32 @@
       .join("");
   }
 
+  function escapeHtml(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   function refreshOverlay() {
     ensureOverlay();
     if (!runtime.overlay.root) return;
 
-    const hooksRoot = runtime.overlay.root.querySelector("#superbot-hooks");
-    const stateRoot = runtime.overlay.root.querySelector("#superbot-state");
-    const statsRoot = runtime.overlay.root.querySelector("#superbot-stats");
-    const decisionsRoot = runtime.overlay.root.querySelector(
-      "#superbot-decisions",
-    );
-    const activityRoot =
-      runtime.overlay.root.querySelector("#superbot-activity");
-    const toggleButton = runtime.overlay.root.querySelector("#superbot-toggle");
-    const modeButton = runtime.overlay.root.querySelector("#superbot-mode");
+    const root = runtime.overlay.root;
+    const hooksRoot = root.querySelector("#superbot-hooks");
+    const stateRoot = root.querySelector("#superbot-state");
+    const statsRoot = root.querySelector("#superbot-stats");
+    const intelRoot = root.querySelector("#superbot-intel");
+    const goalRoot = root.querySelector("#superbot-goal");
+    const reasonsRoot = root.querySelector("#superbot-reasons");
+    const decisionsRoot = root.querySelector("#superbot-decisions");
+    const activityRoot = root.querySelector("#superbot-activity");
+    const toggleButton = root.querySelector("#superbot-toggle");
+    const modeButton = root.querySelector("#superbot-mode");
+    const overrideTimer = root.querySelector("#superbot-override-timer");
+    const overrideRow = root.querySelector("#superbot-override-goals");
+    const archetypeSelect = root.querySelector("#superbot-archetype");
 
     if (toggleButton) {
       toggleButton.textContent = runtime.enabled ? "ON" : "OFF";
@@ -4517,6 +4791,12 @@
           value: (getAttackRatio() * 100).toFixed(0) + "%",
         },
         { label: "Rocket Arc", value: getRocketDirectionUp() ? "up" : "down" },
+        {
+          label: "Clan Tag",
+          value: runtime.identity.clanTag
+            ? "[" + runtime.identity.clanTag + "]"
+            : "auto",
+        },
       ]);
     }
 
@@ -4540,18 +4820,165 @@
       );
     }
 
+    if (intelRoot) {
+      const world = runtime.world;
+      const crown = world.threats.crown;
+      const rising = (world.threats.risingStars || [])
+        .slice(0, 2)
+        .map((s) => s.name + " (+" + s.tilesPerMin.toFixed(0) + "/m)")
+        .join(", ") || "-";
+      const danger = world.threats.nearestDanger;
+      intelRoot.innerHTML = renderRows([
+        { label: "Archetype", value: world.archetype || "unknown" },
+        {
+          label: "Coalition",
+          value:
+            (world.allianceGraph.largestBlocShare * 100).toFixed(0) +
+            "%" +
+            (world.allianceGraph.coalitionThreat ? " ⚠" : ""),
+        },
+        {
+          label: "My Share",
+          value: (world.totals.myShare * 100).toFixed(1) + "%",
+        },
+        {
+          label: "Crown",
+          value: crown
+            ? crown.name + " " + (world.totals.crownShare * 100).toFixed(0) + "%"
+            : "-",
+        },
+        {
+          label: "#2 Share",
+          value: (world.totals.secondShare * 100).toFixed(1) + "%",
+        },
+        { label: "Rising", value: rising },
+        {
+          label: "Danger",
+          value: danger
+            ? danger.name + " thr=" + danger.threatScore.toFixed(0)
+            : "-",
+        },
+        {
+          label: "MIRV Risk",
+          value: world.threats.mirvRisk ? "YES" : "no",
+          className: world.threats.mirvRisk
+            ? "superbot-hook-miss"
+            : "superbot-hook-ok",
+        },
+        {
+          label: "Players",
+          value:
+            world.totals.alivePlayers +
+            " (" +
+            world.totals.humanCount +
+            "H " +
+            world.totals.nationCount +
+            "N " +
+            world.totals.botCount +
+            "T)",
+        },
+      ]);
+    }
+
+    if (goalRoot) {
+      const planner = runtime.planner;
+      const activeId = planner.activeGoalId || "-";
+      const tick = runtime.world.tick;
+      const remaining = Math.max(0, planner.activeGoalExpiresTick - tick);
+      const activeNote =
+        planner.lastEvaluation.find((e) => e.id === activeId)?.note ||
+        "-";
+      const header =
+        `<div class="superbot-row"><span class="superbot-label">Active</span>` +
+        `<span class="superbot-value">${escapeHtml(activeId)}` +
+        (planner.forcedGoalId ? " (forced)" : "") +
+        `</span></div>` +
+        `<div class="superbot-row"><span class="superbot-label">Note</span>` +
+        `<span class="superbot-value">${escapeHtml(activeNote)}</span></div>` +
+        `<div class="superbot-row"><span class="superbot-label">Horizon</span>` +
+        `<span class="superbot-value">${remaining} ticks</span></div>` +
+        `<div class="superbot-row"><span class="superbot-label">Mode bias</span>` +
+        `<span class="superbot-value">${runtime.mode}</span></div>`;
+
+      const list = planner.lastEvaluation
+        .slice(0, 6)
+        .map((ev) => {
+          const cls =
+            ev.id === planner.activeGoalId ? "" : "inactive";
+          return (
+            `<div class="superbot-goal-row ${cls}">` +
+            `<span class="gid">${escapeHtml(ev.id)}</span>` +
+            `<span class="gp">${ev.priority.toFixed(0)}</span>` +
+            `<span class="gt">${escapeHtml(ev.note || (ev.valid ? "" : "invalid"))}</span>` +
+            `</div>`
+          );
+        })
+        .join("");
+      goalRoot.innerHTML = header + `<div style="margin-top:6px">${list}</div>`;
+    }
+
+    if (reasonsRoot) {
+      const entries = runtime.reasons.slice(-8).reverse();
+      if (entries.length === 0) {
+        reasonsRoot.innerHTML =
+          '<div style="color: rgba(216, 228, 255, 0.5); font-size: 11px;">no reasoned actions yet</div>';
+      } else {
+        reasonsRoot.innerHTML = entries
+          .map(
+            (entry) =>
+              `<div class="superbot-reason">` +
+              `<div><span class="head">T${entry.tick} [${escapeHtml(entry.goalId)}]</span> ` +
+              `<span class="tail">${escapeHtml(entry.action)}</span></div>` +
+              (entry.trigger
+                ? `<div class="tail">because ${escapeHtml(entry.trigger)}</div>`
+                : "") +
+              (entry.outcome
+                ? `<div class="tail">expect ${escapeHtml(entry.outcome)}</div>`
+                : "") +
+              `</div>`,
+          )
+          .join("");
+      }
+    }
+
+    if (overrideRow) {
+      for (const btn of overrideRow.querySelectorAll("button")) {
+        btn.classList.toggle(
+          "active",
+          runtime.planner.forcedGoalId === btn.dataset.goal,
+        );
+      }
+    }
+    if (overrideTimer) {
+      if (runtime.planner.forcedGoalId) {
+        const remainingMs =
+          runtime.planner.forcedGoalExpiresMs - Date.now();
+        if (remainingMs > 0) {
+          overrideTimer.textContent = Math.ceil(remainingMs / 1000) + "s";
+        } else {
+          overrideTimer.textContent = "expired";
+        }
+      } else {
+        overrideTimer.textContent = "";
+      }
+    }
+    if (archetypeSelect) {
+      const desired = runtime.world.archetypeLocked || "";
+      if (archetypeSelect.value !== desired) archetypeSelect.value = desired;
+    }
+
     if (decisionsRoot) {
       decisionsRoot.innerHTML = runtime.decisions
-        .slice(-14)
-        .map((entry) => '<div class="superbot-log-line">' + entry + "</div>")
+        .slice(-18)
+        .map((entry) => '<div class="superbot-log-line">' + escapeHtml(entry) + "</div>")
         .join("");
       decisionsRoot.scrollTop = decisionsRoot.scrollHeight;
     }
 
     if (activityRoot) {
       activityRoot.innerHTML = runtime.logs
-        .slice(-18)
-        .map((entry) => '<div class="superbot-log-line">' + entry + "</div>")
+        .slice(-22)
+        .map((entry) => '<div class="superbot-log-line">' + escapeHtml(entry) + "</div>")
         .join("");
       activityRoot.scrollTop = activityRoot.scrollHeight;
     }
@@ -4593,6 +5020,22 @@
   function init() {
     window.__superhumanBotRuntime = runtime;
     window.__superhumanBotRefreshOverlay = refreshOverlay;
+    window.__superhumanBotDebug = {
+      dumpWorld: () => dumpWorldJson(),
+      forceGoal: (id) => setForcedGoal(id),
+      clearForcedGoal: () => {
+        runtime.planner.forcedGoalId = null;
+        runtime.planner.forcedGoalExpiresMs = 0;
+        refreshOverlay();
+      },
+      lockArchetype: (a) => setArchetypeLock(a),
+      setClanTags: (csv) => setExtraClanTags(csv),
+      logOpponent: (name) => {
+        const entry = runtime.world.everyone.find((p) => p.name === name);
+        if (!entry) return "not found";
+        return entry;
+      },
+    };
     installWebSocketHook();
     installWorkerHook();
     bootstrapOverlay();
