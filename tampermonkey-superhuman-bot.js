@@ -16,7 +16,7 @@
   const BOT_VERSION = "2.1.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
-  const MAX_DECISION_ENTRIES = 220;
+  const MAX_DECISION_ENTRIES = 180;
   const MAX_REASON_ENTRIES = 40;
   const LOOP_INTERVAL_MS = 140;
   const DISCOVERY_INTERVAL_MS = 400;
@@ -87,11 +87,23 @@
     UnitType.SAMLauncher,
   ];
 
+  // Debug instrumentation flags. Off by default; the user can flip via console:
+  //   window.__superhumanBotDebug.debugFlags.timing = true;
+  //   window.__superhumanBotDebug.debugFlags.intel = true;
   const runtime = {
     enabled: true,
     mode: "balanced",
     processing: false,
     lastProcessedTick: -1,
+    debugFlags: {
+      timing: false, // log updateWorldModel duration once per 100 ticks
+      intel: false,  // periodic [intel] console log of crown / rising / soft
+    },
+    _lastDecisionByKey: null,
+    _intelLoggedAt: -999,
+    _timingLoggedAt: -999,
+    _timingSampleSum: 0,
+    _timingSampleCount: 0,
     hooks: {
       socket: null,
       worker: null,
@@ -233,17 +245,40 @@
     refreshOverlay();
   }
 
+  /**
+   * Decision log with 15-tick dedupe: identical (goal+body) messages that
+   * fire back-to-back are rolled up into a single line rather than spamming
+   * the panel. Returns the entry we appended for traceability.
+   */
   function decisionLog(message) {
     const tick =
       runtime.hooks.gameView &&
       typeof runtime.hooks.gameView.ticks === "function"
         ? runtime.hooks.gameView.ticks()
         : 0;
+    const goalId = runtime.planner.activeGoalId || "-";
+    const key = goalId + "|" + message;
+    const last = runtime._lastDecisionByKey;
+    if (last && last.key === key && tick - last.tick < 15) {
+      // Suppress duplicates within the dedupe window. Still update the last
+      // entry's tick so we don't lose the fact that it is ongoing.
+      last.tick = tick;
+      last.count += 1;
+      // Annotate the existing entry with the repeat count if this is the 2nd+.
+      if (runtime.decisions.length > 0) {
+        const idx = runtime.decisions.length - 1;
+        runtime.decisions[idx] =
+          "T" + tick + " " + message + " (×" + last.count + ")";
+      }
+      refreshOverlay();
+      return;
+    }
     const entry = "T" + tick + " " + message;
     runtime.decisions.push(entry);
     if (runtime.decisions.length > MAX_DECISION_ENTRIES) {
       runtime.decisions.shift();
     }
+    runtime._lastDecisionByKey = { key, tick, count: 1 };
     console.log("[SuperBot:decision] " + entry);
     refreshOverlay();
   }
@@ -3971,7 +4006,7 @@
     risingStars.sort((a, b) => b.tilesPerMin - a.tilesPerMin);
     softTargets.sort((a, b) => b.opportunityScore - a.opportunityScore);
 
-    // Update crown w/ hysteresis tracking.
+    // Update crown w/ hysteresis tracking (see Phase 2 acceptance criterion).
     runtime.world.prevCrownSmallID = runtime.world.threats.crownSmallID;
     runtime.world.threats = {
       crownSmallID: crownEntry ? crownEntry.smallID : null,
@@ -4108,6 +4143,41 @@
       if (gameView.isLand(neighbor)) count += 1;
     }
     return count;
+  }
+
+  /**
+   * Emit a one-liner intel summary to the console every ~200 ticks so the
+   * user can sanity-check the categorizer without cracking open the overlay.
+   * Gated behind `debugFlags.intel` (off by default).
+   */
+  function maybePeriodicIntelLog() {
+    if (!runtime.debugFlags.intel) return;
+    const tick = runtime.world.tick;
+    if (tick - runtime._intelLoggedAt < 200) return;
+    runtime._intelLoggedAt = tick;
+    const crown = runtime.world.threats.crown;
+    const rising = (runtime.world.threats.risingStars || [])
+      .slice(0, 3)
+      .map((s) => s.name + "+" + s.tilesPerMin.toFixed(0) + "/m")
+      .join(",");
+    const soft = (runtime.world.threats.softTargets || [])
+      .slice(0, 3)
+      .map((s) => s.name)
+      .join(",");
+    const crownStr = crown
+      ? crown.name + " " + (runtime.world.totals.crownShare * 100).toFixed(0) + "%"
+      : "-";
+    console.log(
+      "[SuperBot:intel] T" +
+        tick +
+        " crown=" +
+        crownStr +
+        " rising=[" +
+        (rising || "-") +
+        "] soft=[" +
+        (soft || "-") +
+        "]",
+    );
   }
 
   // ---------- Phase 3: goal planner ----------
@@ -4765,9 +4835,35 @@
     }
 
     const borderTiles = await queryExactBorderTiles(false);
+
+    // Phase 1 acceptance: instrument updateWorldModel timing behind a flag.
+    const tStart = runtime.debugFlags.timing ? performance.now() : 0;
     updateWorldModel(me, borderTiles);
+    if (runtime.debugFlags.timing) {
+      const dt = performance.now() - tStart;
+      runtime._timingSampleSum += dt;
+      runtime._timingSampleCount += 1;
+      if (runtime.world.tick - runtime._timingLoggedAt >= 100) {
+        runtime._timingLoggedAt = runtime.world.tick;
+        const avg =
+          runtime._timingSampleCount > 0
+            ? runtime._timingSampleSum / runtime._timingSampleCount
+            : 0;
+        console.log(
+          "[SuperBot:timing] updateWorldModel avg " +
+            avg.toFixed(2) +
+            " ms over " +
+            runtime._timingSampleCount +
+            " ticks",
+        );
+        runtime._timingSampleSum = 0;
+        runtime._timingSampleCount = 0;
+      }
+    }
+
     computeThreats(me, borderTiles);
     classifyMapIfNeeded(me);
+    maybePeriodicIntelLog();
     updateSnapshot(me, borderTiles);
     const selection = selectPrimaryGoal();
     adoptGoal(selection);
@@ -4939,6 +5035,11 @@
       runtime.stealth.perPlayerActions.clear();
       runtime.stealth.combos.clear();
       runtime.stealth.lastMajorIntentMs = [];
+      runtime._lastDecisionByKey = null;
+      runtime._intelLoggedAt = -999;
+      runtime._timingLoggedAt = -999;
+      runtime._timingSampleSum = 0;
+      runtime._timingSampleCount = 0;
       botLog("Game started");
       return;
     }
@@ -6087,6 +6188,7 @@
         return entry;
       },
       runPlannerSuite: () => runPlannerTestSuite(),
+      debugFlags: runtime.debugFlags,
     };
     runtime.test = { runSuite: runPlannerTestSuite };
     installWebSocketHook();
