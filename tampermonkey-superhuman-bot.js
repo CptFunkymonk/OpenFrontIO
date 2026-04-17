@@ -2617,6 +2617,571 @@
     };
   }
 
+  // ---------- Phase 3: goal planner ----------
+
+  /**
+   * Returns true if `me` can afford the minimum price of `type` right now.
+   * BigInt-safe — gold is stored as a Number approximation in the world model.
+   */
+  function canAffordApprox(me, minGold) {
+    return runtime.world.me ? runtime.world.me.gold >= minGold : false;
+  }
+
+  function anyPendingNuke(me) {
+    return (
+      getMyUnitsOfType(UnitType.AtomBomb).length > 0 ||
+      getMyUnitsOfType(UnitType.HydrogenBomb).length > 0 ||
+      getMyUnitsOfType(UnitType.MIRV).length > 0
+    );
+  }
+
+  /**
+   * Resolve the bloc tile share for the player-led coalition that includes
+   * `crown`. Used to judge whether the "crown" category is actually a coalition
+   * threat (45%+) so MIRV can activate as a last resort.
+   */
+  function coalitionShareForEntry(entry) {
+    if (!entry) return 0;
+    const graph = runtime.world.allianceGraph;
+    if (!graph || !graph.cliques) return 0;
+    for (const component of graph.cliques) {
+      if (!component.includes(entry.smallID)) continue;
+      let tiles = 0;
+      for (const id of component) {
+        tiles += runtime.world.bySmallID.get(id)?.tiles || 0;
+      }
+      return tiles / Math.max(1, runtime.world.totals.usableLand);
+    }
+    return entry.tiles / Math.max(1, runtime.world.totals.usableLand);
+  }
+
+  /**
+   * Small helper — does the current planner goal match `goalId`?
+   */
+  function currentGoalIs(goalId) {
+    return runtime.planner.activeGoalId === goalId;
+  }
+
+  /**
+   * Mode bias multiplier. The overlay exposes three modes: balanced (default),
+   * aggressive (biases offense/farming), turtle (biases defense/economy).
+   */
+  function modeBias(goalId) {
+    const mode = runtime.mode;
+    if (mode === "aggressive") {
+      switch (goalId) {
+        case "NEUTRALIZE_RISING_STAR":
+        case "FARM_TRIBE":
+        case "NUKE_CROWN":
+        case "NAVAL_LAND_GRAB":
+          return 12;
+        case "DEFENSIVE_TURTLE":
+        case "SAM_WALL_BUILDUP":
+          return -8;
+        default:
+          return 0;
+      }
+    }
+    if (mode === "turtle") {
+      switch (goalId) {
+        case "DEFENSIVE_TURTLE":
+        case "SAM_WALL_BUILDUP":
+        case "CONSOLIDATE_FRONT":
+        case "SAVE_FOR_HYDRO":
+        case "DEFENSE_NETWORK":
+          return 12;
+        case "NEUTRALIZE_RISING_STAR":
+        case "NAVAL_LAND_GRAB":
+          return -6;
+        default:
+          return 0;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Goal specifications. Each spec returns { valid, priority, note } from
+   * evaluate(). onAct() is awaited and is expected to return true if the goal
+   * actually caused an intent to be sent this tick. The goal list is
+   * authoritative — tactics in Phase 6 refine onAct per goal.
+   */
+  const GOAL_SPECS = [
+    {
+      id: "MIRV_LAST_RESORT",
+      horizonTicks: 180,
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const crown = world.threats.crown;
+        if (!crown) return { valid: false };
+        const coalition = coalitionShareForEntry(crown);
+        const aboutToDie =
+          me.troopRatio < 0.1 &&
+          me.incomingTroops >= me.troops &&
+          me.incomingTroops > 0;
+        const canAfford = me.gold >= MIRV_GOLD_THRESHOLD;
+        const hydroInfeasible =
+          !canAffordApprox(me, HYDRO_GOLD_THRESHOLD) ||
+          world.threats.crown.structureLevels[UnitType.SAMLauncher] >= 4;
+        const crownDominates =
+          coalition >= 0.45 && world.totals.myShare < world.totals.crownShare;
+        const desperate =
+          aboutToDie && canAffordApprox(me, MIRV_GOLD_THRESHOLD);
+        if (desperate) {
+          return {
+            valid: true,
+            priority: 98,
+            note: "emergency MIRV — about to die",
+          };
+        }
+        if (!canAfford || !crownDominates || !hydroInfeasible) {
+          return { valid: false };
+        }
+        return {
+          valid: true,
+          priority: 92,
+          note: `coalition ${(coalition * 100).toFixed(0)}% — MIRV last resort`,
+        };
+      },
+      onAct: async () => false, // wired in Phase 6
+    },
+    {
+      id: "RETALIATION",
+      horizonTicks: 80,
+      evaluate: () => {
+        const me = runtime.world.me;
+        if (!me) return { valid: false };
+        if (me.incomingTroops <= 0) return { valid: false };
+        const pressure = me.incomingTroops / Math.max(1, me.troops);
+        if (pressure < 0.25) return { valid: false };
+        return {
+          valid: true,
+          priority: 70 + clamp(pressure * 20, 0, 20),
+          note: `${fmtTroops(me.incomingTroops)} inbound vs ${fmtTroops(me.troops)} defending`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "CONSOLIDATE_FRONT",
+      horizonTicks: 180,
+      evaluate: () => {
+        const me = runtime.world.me;
+        if (!me) return { valid: false };
+        const pressure = me.incomingTroops / Math.max(1, me.troops);
+        if (pressure < 0.6) return { valid: false };
+        return {
+          valid: true,
+          priority: 78,
+          note: `front pressure ${(pressure * 100).toFixed(0)}%`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "NUKE_CROWN",
+      horizonTicks: 240,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const crown = world.threats.crown;
+        if (!crown) return { valid: false };
+        if (crown.isFriendly) return { valid: false };
+        if (world.totals.crownShare < 0.3) return { valid: false };
+        const silos = getMyUnitsOfType(UnitType.MissileSilo).filter(
+          (u) => !safeCall(() => u.isUnderConstruction(), false),
+        );
+        if (silos.length === 0) return { valid: false };
+        if (!canAffordApprox(me, ATOM_GOLD_THRESHOLD)) return { valid: false };
+        return {
+          valid: true,
+          priority: 84,
+          note: `crown=${crown.name} share=${(world.totals.crownShare * 100).toFixed(0)}%`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "DEFENSIVE_TURTLE",
+      horizonTicks: 200,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const myShare = world.totals.myShare;
+        const secondShare = world.totals.secondShare;
+        if (myShare < 0.3) return { valid: false };
+        if (myShare < secondShare * 1.5) return { valid: false };
+        return {
+          valid: true,
+          priority: 86,
+          note: `crown mode — share=${(myShare * 100).toFixed(0)}%`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "SAM_WALL_BUILDUP",
+      horizonTicks: 300,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const share = world.totals.myShare;
+        if (share < 0.25 || share > 0.3) return { valid: false };
+        const cityCount = me.structures[UnitType.City] || 0;
+        const samCount = me.structureLevels[UnitType.SAMLauncher] || 0;
+        const targetSams = Math.max(2, Math.floor(cityCount * 0.5));
+        if (samCount >= targetSams) return { valid: false };
+        return {
+          valid: true,
+          priority: 82,
+          note: `pre-crown SAM wall ${samCount}/${targetSams}`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "SAVE_FOR_HYDRO",
+      horizonTicks: 180,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (me.gold < 4_000_000 || me.gold >= HYDRO_GOLD_THRESHOLD) {
+          return { valid: false };
+        }
+        const crown = world.threats.crown;
+        if (!crown || crown.isFriendly) return { valid: false };
+        return { valid: true, priority: 60, note: "banking for hydro" };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "NEUTRALIZE_RISING_STAR",
+      horizonTicks: 200,
+      evaluate: () => {
+        const world = runtime.world;
+        if (world.threats.risingStars.length === 0) return { valid: false };
+        const target = world.threats.risingStars[0];
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (target.isFriendly) return { valid: false };
+        if (target.troops > me.troops * 1.2) return { valid: false };
+        return {
+          valid: true,
+          priority: 74,
+          note: `rising=${target.name} +${target.tilesPerMin.toFixed(0)} tiles/min`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "FARM_TRIBE",
+      horizonTicks: 60,
+      evaluate: () => {
+        const adj = runtime.world.threats.adjacentEnemies;
+        const target = adj.find(
+          (e) => e.tags && e.tags.has("TRIBE_FARM"),
+        );
+        if (!target) return { valid: false };
+        return {
+          valid: true,
+          priority: 72,
+          note: `tribe=${target.name} (structures for free)`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "TERRA_NULLIUS_RUSH",
+      horizonTicks: 60,
+      evaluate: () => {
+        const world = runtime.world;
+        if (world.totals.myShare >= 0.5) return { valid: false };
+        const unowned = Math.max(
+          0,
+          world.totals.usableLand -
+            world.everyone.reduce((sum, p) => sum + p.tiles, 0),
+        );
+        const unownedFrac = unowned / Math.max(1, world.totals.usableLand);
+        if (unownedFrac < 0.05) return { valid: false };
+        return {
+          valid: true,
+          priority: 55 + clamp(unownedFrac * 40, 0, 20),
+          note: `${(unownedFrac * 100).toFixed(0)}% unowned`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "NAVAL_LAND_GRAB",
+      horizonTicks: 180,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (getUnitEntityCount(me.player, UnitType.TransportShip) >=
+          getGameView().config().boatMaxNumber()) {
+          return { valid: false };
+        }
+        if (me.troops < 30000) return { valid: false };
+        const soft = world.threats.softTargets.filter((s) => !s.isAdjacent);
+        if (soft.length === 0 && world.archetype !== "ISLAND") {
+          return { valid: false };
+        }
+        return {
+          valid: true,
+          priority: world.archetype === "ISLAND" ? 65 : 45,
+          note:
+            world.archetype === "ISLAND"
+              ? "island archetype"
+              : `${soft.length} soft targets across water`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "DEFENSE_NETWORK",
+      horizonTicks: 300,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (world.threats.adjacentEnemies.length === 0) {
+          return { valid: false };
+        }
+        const cityCount = me.structures[UnitType.City] || 0;
+        const dpCount = me.structures[UnitType.DefensePost] || 0;
+        const target = Math.max(2, Math.floor(cityCount * 0.4));
+        if (dpCount >= target) return { valid: false };
+        return {
+          valid: true,
+          priority: 50,
+          note: `defense ${dpCount}/${target}`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "DIPLOMACY_ISOLATE_CROWN",
+      horizonTicks: 120,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (!world.threats.crown) return { valid: false };
+        if (world.threats.crown.isFriendly) return { valid: false };
+        if (me.smallID === world.threats.crownSmallID) return { valid: false };
+        if (world.totals.crownShare < 0.25) return { valid: false };
+        return {
+          valid: true,
+          priority: 45,
+          note: `isolate crown=${world.threats.crown.name}`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "BETRAY_ALLY",
+      horizonTicks: 60,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const allies = world.everyone.filter(
+          (p) => p.isAlly && !p.isClanmate,
+        );
+        if (allies.length === 0) return { valid: false };
+        const target = allies.find(
+          (ally) =>
+            ally.troopRatio < 0.2 &&
+            ally.troops < me.troops * 0.6,
+        );
+        if (!target) return { valid: false };
+        // Safety: no superior hostile within manhattan-30.
+        const gameView = getGameView();
+        if (!gameView) return { valid: false };
+        const borderCache = runtime.state.borderCache.tiles;
+        const hostile = world.threats.adjacentEnemies.find(
+          (e) => e.troops > me.troops * 1.2,
+        );
+        if (hostile) return { valid: false };
+        if (world.threats.mirvCapable.some((p) => !p.isFriendly)) {
+          return { valid: false };
+        }
+        return {
+          valid: true,
+          priority: 58,
+          note: `helpless ally=${target.name} troopRatio=${(target.troopRatio * 100).toFixed(0)}%`,
+          context: { target },
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "WARSHIP_DEFENSE",
+      horizonTicks: 240,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if ((me.structures[UnitType.Port] || 0) === 0) {
+          return { valid: false };
+        }
+        const gameView = getGameView();
+        if (!gameView) return { valid: false };
+        if (gameView.config().isUnitDisabled(UnitType.Warship)) {
+          return { valid: false };
+        }
+        const weHave = getMyUnitsOfType(UnitType.Warship).length;
+        if (world.archetype === "ISLAND" && weHave < 2) {
+          return {
+            valid: true,
+            priority: 48,
+            note: `island warship ${weHave}/2`,
+          };
+        }
+        // Enemy warships spotted?
+        const enemies = world.everyone.filter((p) => !p.isFriendly);
+        const enemyWarships = enemies.reduce(
+          (sum, e) =>
+            sum + safeCall(() => e.player.units(UnitType.Warship).length, 0),
+          0,
+        );
+        if (enemyWarships > 0 && weHave < 1) {
+          return {
+            valid: true,
+            priority: 52,
+            note: `enemy warships=${enemyWarships}`,
+          };
+        }
+        return { valid: false };
+      },
+      onAct: async () => false,
+    },
+    {
+      id: "IDLE",
+      horizonTicks: 10,
+      evaluate: () => ({
+        valid: true,
+        priority: 5,
+        note: "no better goal",
+      }),
+      onAct: async () => false,
+    },
+  ];
+
+  function goalSpecById(id) {
+    return GOAL_SPECS.find((spec) => spec.id === id) || null;
+  }
+
+  /**
+   * Select the primary goal for this tick. Honours user force-goal overrides
+   * (time-limited) and adds a commit bonus to the currently active goal so we
+   * don't flap between plans.
+   */
+  function selectPrimaryGoal() {
+    const nowMs = Date.now();
+    const planner = runtime.planner;
+
+    // Force-goal override window.
+    if (
+      planner.forcedGoalId &&
+      planner.forcedGoalExpiresMs > nowMs
+    ) {
+      const spec = goalSpecById(planner.forcedGoalId);
+      if (spec) {
+        const evaluation = spec.evaluate({}) || {};
+        const note = evaluation.note ? evaluation.note + " (forced)" : "(forced)";
+        planner.lastEvaluation = [
+          { id: spec.id, priority: 100, valid: true, note },
+        ];
+        return {
+          spec,
+          evaluation: {
+            valid: true,
+            priority: 100,
+            note,
+          },
+          forced: true,
+        };
+      }
+    } else if (planner.forcedGoalId) {
+      planner.forcedGoalId = null;
+    }
+
+    const evaluations = [];
+    for (const spec of GOAL_SPECS) {
+      const evaluation = spec.evaluate({}) || {};
+      if (!evaluation.valid) {
+        evaluations.push({
+          id: spec.id,
+          priority: 0,
+          valid: false,
+          note: evaluation.note || "",
+        });
+        continue;
+      }
+      let priority = (evaluation.priority || 0) + modeBias(spec.id);
+      if (planner.activeGoalId === spec.id) priority += 15;
+      evaluations.push({
+        id: spec.id,
+        priority,
+        valid: true,
+        note: evaluation.note || "",
+        context: evaluation.context || null,
+      });
+    }
+    planner.lastEvaluation = evaluations
+      .slice()
+      .sort((a, b) => b.priority - a.priority);
+
+    const winner = planner.lastEvaluation.find((e) => e.valid);
+    if (!winner) return null;
+    return {
+      spec: goalSpecById(winner.id),
+      evaluation: winner,
+      forced: false,
+    };
+  }
+
+  /**
+   * Stabilise the selection in planner.activeGoal*. Logs a transition line the
+   * first time we switch goals.
+   */
+  function adoptGoal(selection) {
+    const planner = runtime.planner;
+    const tick = runtime.world.tick;
+    if (!selection) {
+      planner.activeGoalId = null;
+      planner.activeGoal = null;
+      return;
+    }
+    if (planner.activeGoalId !== selection.spec.id) {
+      const previous = planner.activeGoalId || "-";
+      planner.activeGoalId = selection.spec.id;
+      planner.activeGoal = selection.spec;
+      planner.activeGoalCreatedTick = tick;
+      planner.activeGoalExpiresTick = tick + selection.spec.horizonTicks;
+      planner.lastSwitchTick = tick;
+      reasonLog(
+        selection.spec.id,
+        "select",
+        "plan switch from " + previous,
+        selection.evaluation.note,
+      );
+    } else {
+      planner.activeGoalExpiresTick = Math.max(
+        planner.activeGoalExpiresTick,
+        tick + 20,
+      );
+    }
+  }
+
   async function runModulesForTick() {
     discoverRuntimeReferences();
     const gameView = getGameView();
@@ -2653,6 +3218,8 @@
     updateWorldModel(me, borderTiles);
     computeThreats(me, borderTiles);
     updateSnapshot(me, borderTiles);
+    const selection = selectPrimaryGoal();
+    adoptGoal(selection);
 
     const didDiplomacy = await maybeDiplomacy(me);
     if (didDiplomacy) {
