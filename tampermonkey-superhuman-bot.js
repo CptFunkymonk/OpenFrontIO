@@ -2056,6 +2056,103 @@
     ).slice(0, limit);
   }
 
+  /**
+   * Archetype-biased build order. ISLAND favors navy/economy, CHOKE_HEAVY
+   * favors defense, NUKE_RACE favors offensive infrastructure, CONTINENTAL
+   * keeps the historical balanced order.
+   */
+  function buildOrderForArchetype(archetype) {
+    switch (archetype) {
+      case "ISLAND":
+        return [
+          UnitType.Port,
+          UnitType.Factory,
+          UnitType.City,
+          UnitType.SAMLauncher,
+          UnitType.DefensePost,
+          UnitType.MissileSilo,
+        ];
+      case "CHOKE_HEAVY":
+      case "ARENA":
+        return [
+          UnitType.DefensePost,
+          UnitType.City,
+          UnitType.Factory,
+          UnitType.Port,
+          UnitType.SAMLauncher,
+          UnitType.MissileSilo,
+        ];
+      case "NUKE_RACE":
+        return [
+          UnitType.City,
+          UnitType.Factory,
+          UnitType.MissileSilo,
+          UnitType.SAMLauncher,
+          UnitType.Port,
+          UnitType.DefensePost,
+        ];
+      case "CONVENTIONAL":
+        return [
+          UnitType.City,
+          UnitType.Factory,
+          UnitType.DefensePost,
+          UnitType.Port,
+          UnitType.SAMLauncher,
+          UnitType.MissileSilo,
+        ];
+      default:
+        return BuildPriority;
+    }
+  }
+
+  /**
+   * Sort candidate tiles for a Factory/City build to prefer placements that
+   * extend or bridge the rail network. Cheap proxy for
+   * `NationStructureBehavior.computeConnectivityScore`: we favor tiles that
+   * are within `trainStationMaxRange` of any existing City/Factory/Port tile.
+   */
+  function connectivityBiasedTiles(me, candidateTiles) {
+    const gameView = getGameView();
+    if (!gameView) return candidateTiles;
+    const maxRange = safeCall(
+      () => gameView.config().trainStationMaxRange(),
+      100,
+    );
+    const minRange = safeCall(
+      () => gameView.config().trainStationMinRange(),
+      15,
+    );
+    const minSq = minRange * minRange;
+    const maxSq = maxRange * maxRange;
+    const stationTiles = [];
+    for (const type of [UnitType.City, UnitType.Factory, UnitType.Port]) {
+      for (const unit of safeCall(() => me.units(type), [])) {
+        if (!safeCall(() => unit.isActive(), false)) continue;
+        stationTiles.push(unit.tile());
+      }
+    }
+    if (stationTiles.length === 0) return candidateTiles;
+    return candidateTiles
+      .map((tile) => {
+        let best = Infinity;
+        for (const st of stationTiles) {
+          const d2 = gameView.euclideanDistSquared(tile, st);
+          if (d2 < best) best = d2;
+        }
+        let score = 0;
+        if (best < minSq) {
+          score = -20; // too close; avoid dense clumps
+        } else if (best <= maxSq) {
+          score = 40; // within rail range — trains will run
+        } else {
+          score = 0;
+        }
+        return { tile, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.tile);
+  }
+
   async function maybeEconomy(me, enemies) {
     const gameView = getGameView();
     const tick = gameView.ticks();
@@ -2068,9 +2165,15 @@
     }
 
     const candidateTiles = getOwnedCandidateTiles(me, 20);
-    for (const type of BuildPriority) {
+    const order = buildOrderForArchetype(runtime.world.archetype);
+    for (const type of order) {
       if (!shouldBuildType(type, me, enemies)) continue;
-      const built = await tryBuildStructure(type, candidateTiles);
+      // Factory/City placement benefits from rail connectivity awareness.
+      const tiles =
+        type === UnitType.Factory || type === UnitType.City
+          ? connectivityBiasedTiles(me, candidateTiles)
+          : candidateTiles;
+      const built = await tryBuildStructure(type, tiles);
       if (built) {
         runtime.state.cooldowns.economy = tick;
         return true;
