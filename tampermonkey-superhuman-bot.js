@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.3.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -13,7 +13,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.1.0";
+  const BOT_VERSION = "2.3.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -4756,9 +4756,15 @@
         context: evaluation.context || null,
       });
     }
+    // Deterministic tiebreaker: equal-priority goals sort alphabetically by
+    // id so the planner's output is reproducible tick-to-tick. Without this
+    // Array.prototype.sort can shuffle ties on different JS engines.
     planner.lastEvaluation = evaluations
       .slice()
-      .sort((a, b) => b.priority - a.priority);
+      .sort((a, b) => {
+        if (b.priority !== a.priority) return b.priority - a.priority;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
 
     const winner = planner.lastEvaluation.find((e) => e.valid);
     if (!winner) return null;
@@ -6190,7 +6196,38 @@
       runPlannerSuite: () => runPlannerTestSuite(),
       debugFlags: runtime.debugFlags,
     };
-    runtime.test = { runSuite: runPlannerTestSuite };
+    runtime.test = {
+      runSuite: runPlannerTestSuite,
+      /**
+       * Inject a hand-built world into the runtime for testing. Returns a
+       * restorer that the caller should invoke when done.
+       */
+      set: (state) => {
+        const prior = runtime.world;
+        runtime.world = Object.assign(runtime.world, state || {});
+        return () => {
+          runtime.world = prior;
+        };
+      },
+      /**
+       * Given a world (or the current live one), return the list of
+       * (smallID → tags[]) so the caller can assert on the categorizer
+       * without running the full planner.
+       */
+      categorize: () => {
+        const out = [];
+        for (const entry of runtime.world.everyone) {
+          out.push({
+            smallID: entry.smallID,
+            name: entry.name,
+            tags: Array.from(entry.tags || []),
+            threatScore: entry.threatScore || 0,
+            opportunityScore: entry.opportunityScore || 0,
+          });
+        }
+        return out;
+      },
+    };
     installWebSocketHook();
     installWorkerHook();
     bootstrapOverlay();
