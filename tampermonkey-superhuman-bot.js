@@ -1935,6 +1935,11 @@
   }
 
   function shouldBuildType(type, me, enemies) {
+    // Respect SAVE_FOR_* gates: block expensive non-defensive spends until
+    // nuke gold is banked.
+    if (typeof economyBanned === "function" && economyBanned(type)) {
+      return false;
+    }
     const count = getUnitLevelCount(me, type);
     const cities = getUnitLevelCount(me, UnitType.City);
     const hasCoast = runtime.state.borderCache.tiles.some((tile) =>
@@ -2548,6 +2553,338 @@
         );
         return true;
       }
+    }
+    return false;
+  }
+
+  /**
+   * 60-second retaliation window: we lock onto the largest current attacker and
+   * commit a solid chunk of troops to fire back. If they're across water, we
+   * launch a boat. Low overhead — planner already decided this is the right
+   * moment.
+   */
+  async function runGoal_Retaliation(me, borderTiles) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.combat < 6) return false;
+
+    const meEntry = runtime.world.me;
+    if (!meEntry || meEntry.incomingAttacks.length === 0) return false;
+
+    // Largest attacker by troop count.
+    let largest = null;
+    for (const attack of meEntry.incomingAttacks) {
+      const troops = safeCall(() => attack.troops(), 0);
+      if (!largest || troops > largest.troops) {
+        largest = { troops, id: safeCall(() => attack.attackerID, null) };
+      }
+    }
+    if (!largest || largest.id === null) return false;
+
+    const attacker = safeCall(
+      () => gameView.playerBySmallID(largest.id),
+      null,
+    );
+    if (!attacker || !safeCall(() => attacker.isPlayer(), false)) return false;
+    const attackerEntry = runtime.world.bySmallID.get(largest.id);
+    if (!attackerEntry) return false;
+
+    const maxTroops = gameView.config().maxTroops(me);
+    const reserveRatio = Math.max(0.1, computeReserveRatio(me, maxTroops) - 0.1);
+    const troops = calculateAttackTroops(me, attacker, reserveRatio, maxTroops);
+    if (troops <= 0) return false;
+
+    // Adjacent -> land attack. Otherwise try a boat.
+    if (attackerEntry.isAdjacent || runtime.state.borderCache.tiles.some((t) => {
+      return gameView.neighbors(t).some(
+        (n) => gameView.ownerID(n) === largest.id,
+      );
+    })) {
+      if (sendAttack(attackerEntry.id, troops)) {
+        runtime.state.cooldowns.combat = tick;
+        reasonLog(
+          "RETALIATION",
+          "land attack",
+          attackerEntry.name + " sent " + fmtTroops(largest.troops) + " at us",
+          "break their expansion",
+        );
+        return true;
+      }
+    } else {
+      // Boat retaliation if they aren't bordering us.
+      const target = gatherStructureTiles(attacker)[0];
+      if (!target) return false;
+      const spawnTile = await queryTransportShipSpawn(target);
+      if (spawnTile === false) return false;
+      if (sendBoat(target, troops)) {
+        runtime.state.cooldowns.combat = tick;
+        runtime.state.cooldowns.naval = tick;
+        reasonLog(
+          "RETALIATION",
+          "boat attack",
+          attackerEntry.name + " not adjacent — transport",
+          "punish across water",
+        );
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Pre-emptively strike a rising star before they become the crown. Chooses
+   * the lowest-troop rising star that is either adjacent (land attack) or has
+   * a valid transport route.
+   */
+  async function runGoal_NeutralizeRisingStar(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.combat < 30) return false;
+    const rising = runtime.world.threats.risingStars;
+    if (!rising || rising.length === 0) return false;
+
+    const maxTroops = gameView.config().maxTroops(me);
+    const reserveRatio = computeReserveRatio(me, maxTroops);
+    const target = rising
+      .slice()
+      .sort((a, b) => a.troops - b.troops)
+      .find((e) => !e.isFriendly);
+    if (!target) return false;
+
+    const required = Math.max(
+      Math.ceil(target.troops * 1.3),
+      Math.floor(maxTroops * 0.25),
+    );
+    const available = Math.floor(me.troops() - maxTroops * reserveRatio);
+    if (available < required) return false;
+
+    if (target.isAdjacent) {
+      if (sendAttack(target.id, required)) {
+        runtime.state.cooldowns.combat = tick;
+        reasonLog(
+          "NEUTRALIZE_RISING_STAR",
+          "land attack",
+          target.name + " +" + target.tilesPerMin.toFixed(0) + " tiles/min",
+          "blunt their snowball before they crown",
+        );
+        return true;
+      }
+      return false;
+    }
+
+    const landingTile = gatherStructureTiles(target.player)[0];
+    if (!landingTile) return false;
+    const spawn = await queryTransportShipSpawn(landingTile);
+    if (spawn === false) return false;
+    if (sendBoat(landingTile, Math.min(required, Math.floor(me.troops() * 0.35)))) {
+      runtime.state.cooldowns.combat = tick;
+      runtime.state.cooldowns.naval = tick;
+      reasonLog(
+        "NEUTRALIZE_RISING_STAR",
+        "boat attack",
+        target.name + " across water",
+        "pre-empt crown rival",
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * ConsolidateFront — heavy DefensePost cadence on the side of our border
+   * that's under attack. Called when incoming troop pressure exceeds 60% of
+   * our reserve. Picks border tiles adjacent to the top-threat hostile.
+   */
+  async function runGoal_ConsolidateFront(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.economy < 14) return false;
+    const borderTiles = runtime.state.borderCache.tiles;
+    if (borderTiles.length === 0) return false;
+
+    // Build a bias: tiles adjacent to our top adjacent enemy get tried first.
+    const adjacent = runtime.world.threats.adjacentEnemies[0];
+    const sortedBorder = borderTiles.slice().sort((a, b) => {
+      if (!adjacent) return 0;
+      const aa = gameView.neighbors(a).some(
+        (t) => gameView.ownerID(t) === adjacent.smallID,
+      );
+      const bb = gameView.neighbors(b).some(
+        (t) => gameView.ownerID(t) === adjacent.smallID,
+      );
+      if (aa && !bb) return -1;
+      if (bb && !aa) return 1;
+      return 0;
+    });
+
+    for (const tile of sortedBorder.slice(0, 24)) {
+      const buildables = await queryPlayerBuildables(tile, [
+        UnitType.DefensePost,
+      ]);
+      const buildable = buildables.find((b) => b.type === UnitType.DefensePost);
+      if (!buildable || buildable.canBuild === false) continue;
+      if (sendBuild(UnitType.DefensePost, tile)) {
+        runtime.state.cooldowns.economy = tick;
+        reasonLog(
+          "CONSOLIDATE_FRONT",
+          "build DefensePost",
+          adjacent
+            ? "pressured by " + adjacent.name
+            : "inbound attack",
+          "harden pressured border",
+        );
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Aggressive naval land-grab. In ISLAND archetype we sniff out uncontested
+   * small islands via BFS; otherwise we invade the weakest soft target across
+   * water. Never exceeds `boatMaxNumber` boats in flight.
+   */
+  async function runGoal_NavalLandGrab(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.naval < 30) return false;
+
+    if (
+      getUnitEntityCount(me, UnitType.TransportShip) >=
+      gameView.config().boatMaxNumber()
+    ) {
+      return false;
+    }
+    const maxTroops = gameView.config().maxTroops(me);
+    const reserveRatio = computeReserveRatio(me, maxTroops);
+    const available = Math.floor(me.troops() - maxTroops * reserveRatio);
+    if (available < 8000) return false;
+
+    // Island archetype: prefer uncontested land.
+    if (runtime.world.archetype === "ISLAND") {
+      const target = findUncontestedIslandSeed(gameView);
+      if (target) {
+        const spawn = await queryTransportShipSpawn(target);
+        if (spawn !== false) {
+          const troops = clamp(Math.floor(available * 0.25), 6000, 20000);
+          if (sendBoat(target, troops)) {
+            runtime.state.cooldowns.naval = tick;
+            reasonLog(
+              "NAVAL_LAND_GRAB",
+              "boat to empty island",
+              "ISLAND archetype uncontested land",
+              "claim free tiles",
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    // Continental: invade the weakest structure-rich soft target.
+    const target = runtime.world.threats.softTargets.find(
+      (s) => !s.isAdjacent && s.opportunityScore > 30,
+    );
+    if (!target) return false;
+    const structureTiles = gatherStructureTiles(target.player);
+    const candidates = uniqueBy(
+      structureTiles.concat(
+        sampleTilesForOwner(target.smallID, 6, {
+          requireLand: true,
+          maxSamples: 200,
+        }),
+      ),
+      (t) => t,
+    );
+    for (const candidate of candidates.slice(0, 8)) {
+      const spawn = await queryTransportShipSpawn(candidate);
+      if (spawn === false) continue;
+      const troops = clamp(Math.floor(available * 0.3), 8000, 30000);
+      if (sendBoat(candidate, troops)) {
+        runtime.state.cooldowns.naval = tick;
+        reasonLog(
+          "NAVAL_LAND_GRAB",
+          "boat invasion",
+          target.name + " (soft target across water)",
+          "steal structures and tiles",
+        );
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Find a small, uncontested land patch accessible by boat. Samples random
+   * coordinates and BFS-expands; accepts clusters of 20–300 tiles that are
+   * fully unowned. Manageable runtime cost because we bail after the first
+   * success.
+   */
+  function findUncontestedIslandSeed(gameView) {
+    const width = gameView.width();
+    const height = gameView.height();
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const x = randomInt(0, width - 1);
+      const y = randomInt(0, height - 1);
+      if (!gameView.isValidCoord(x, y)) continue;
+      const seed = gameView.ref(x, y);
+      if (!gameView.isLand(seed)) continue;
+      if (gameView.hasOwner(seed)) continue;
+      const visited = new Set([seed]);
+      const queue = [seed];
+      let size = 0;
+      let safe = true;
+      while (queue.length && size <= 320) {
+        const current = queue.shift();
+        size += 1;
+        if (gameView.hasOwner(current)) {
+          safe = false;
+          break;
+        }
+        for (const neighbor of gameView.neighbors(current)) {
+          if (visited.has(neighbor)) continue;
+          if (!gameView.isLand(neighbor)) continue;
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+      if (!safe) continue;
+      if (size >= 20 && size <= 300) {
+        return seed;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Gate expensive economy when we're banking for hydrogen or MIRV. Allows
+   * defense structures (DefensePost, SAMLauncher) always; blocks extra cities
+   * / factories / silos above their cap.
+   */
+  function economyBanned(type) {
+    const active = runtime.planner.activeGoalId;
+    if (active !== "SAVE_FOR_HYDRO" && active !== "MIRV_LAST_RESORT") {
+      return false;
+    }
+    const me = runtime.world.me;
+    if (!me) return false;
+    const cityCap = Math.max(3, Math.floor(me.tiles / 3000));
+    const factoryCap = Math.max(1, Math.floor((me.structures[UnitType.City] || 0) * 0.3));
+    if (type === UnitType.City) {
+      return (me.structures[UnitType.City] || 0) >= cityCap;
+    }
+    if (type === UnitType.Factory) {
+      return (me.structures[UnitType.Factory] || 0) >= factoryCap;
+    }
+    if (type === UnitType.Port) {
+      return (me.structures[UnitType.Port] || 0) >= Math.max(
+        1,
+        Math.floor((me.structures[UnitType.City] || 0) * 0.4),
+      );
     }
     return false;
   }
@@ -4179,30 +4516,41 @@
         handled = await runGoal_BetrayAlly(selectionContext);
         break;
       case "RETALIATION":
-        handled = await maybeCombat(me, borderTiles);
+        handled = await runGoal_Retaliation(me, borderTiles);
+        if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
       case "CONSOLIDATE_FRONT":
-        handled = await maybeEconomy(me, getEnemies());
+        handled = await runGoal_ConsolidateFront(me);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
       case "FARM_TRIBE":
-      case "NEUTRALIZE_RISING_STAR":
         handled = await maybeCombat(me, borderTiles);
+        break;
+      case "NEUTRALIZE_RISING_STAR":
+        handled = await runGoal_NeutralizeRisingStar(me);
+        if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
       case "TERRA_NULLIUS_RUSH":
         handled = await maybeExpand(me, borderTiles);
         break;
       case "NAVAL_LAND_GRAB":
-        handled = await maybeNaval(me);
+        handled = await runGoal_NavalLandGrab(me);
+        if (!handled) handled = await maybeNaval(me);
         break;
       case "DIPLOMACY_ISOLATE_CROWN":
-        handled = await maybeDiplomacy(me);
+        handled = await runGoal_Diplomacy(me);
+        if (!handled) handled = await maybeDiplomacy(me);
         break;
       case "WARSHIP_DEFENSE":
         handled = await runGoal_WarshipDefense(me);
         break;
-      case "DEFENSE_NETWORK":
       case "SAVE_FOR_HYDRO":
+        // Economy layer is gated via economyBanned(); still allow defensive
+        // builds to pass through maybeEconomy.
+        handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeDiplomacy(me);
+        break;
+      case "DEFENSE_NETWORK":
       case "IDLE":
       default:
         // Fall through to legacy pipeline; also handles pre-goal behavior.
