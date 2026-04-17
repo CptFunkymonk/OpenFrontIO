@@ -720,6 +720,69 @@
    * Score for a legal spawn center: prioritize Plains in the spawn patch, then
    * existing expansion heuristics (open land, flood, penalties). Returns null if invalid.
    */
+  /**
+   * Compute the average elevation (config.magnitude) within a small radius
+   * around a candidate spawn center. Higher ground = terrain defense bonus.
+   */
+  function elevationAverage(gameView, center, radius) {
+    let sum = 0;
+    let count = 0;
+    for (const tile of gameView.circleSearch(center, radius)) {
+      if (!gameView.isLand(tile)) continue;
+      sum += safeCall(() => gameView.magnitude(tile), 0);
+      count += 1;
+    }
+    return count > 0 ? sum / count : 0;
+  }
+
+  /** Is there any ocean-shore tile within a short radius? */
+  function coastNearby(gameView, center, radius) {
+    for (const tile of gameView.circleSearch(center, radius)) {
+      if (safeCall(() => gameView.isOceanShore(tile), false)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Cheap chokepoint probe. Narrow corridors have few land tiles inside a
+   * medium-radius ring. Used as a spawn bonus for choke-hold strategies.
+   */
+  function isChokepointLike(gameView, center, radius) {
+    const landInRing = countLandInRing(gameView, center, radius);
+    return landInRing > 0 && landInRing < Math.ceil((radius * radius) * 0.4);
+  }
+
+  /**
+   * Penalise spawns that are very close to other known players' spawn points.
+   * Applies to both pre-spawn Nations (whose spawnTile is visible) and
+   * already-placed players whose centroid approximates their presence.
+   */
+  function enemyProximityPenalty(gameView, center) {
+    let penalty = 0;
+    const mySmall = runtime.world.meSmallID;
+    for (const p of safeCall(() => gameView.playerViews(), [])) {
+      if (!p) continue;
+      const smallID = safeCall(() => p.smallID(), -1);
+      if (smallID === mySmall) continue;
+      const spawnTile = safeCall(() => p.spawnTile(), undefined);
+      if (spawnTile !== undefined && spawnTile !== null) {
+        const dist = gameView.manhattanDist(center, spawnTile);
+        if (dist < 60) penalty += (60 - dist) * 0.6;
+      } else if (safeCall(() => p.hasSpawned(), false)) {
+        // Approximate presence by a small sample of their tiles.
+        const sample = sampleTilesForOwner(smallID, 1, {
+          requireLand: true,
+          maxSamples: 120,
+        });
+        if (sample.length > 0) {
+          const dist = gameView.manhattanDist(center, sample[0]);
+          if (dist < 60) penalty += (60 - dist) * 0.4;
+        }
+      }
+    }
+    return penalty;
+  }
+
   function computeSpawnCenterScore(gameView, center) {
     if (!gameView.isLand(center) || gameView.hasOwner(center)) return null;
     if (safeCall(() => gameView.isBorder(center), false)) return null;
@@ -763,15 +826,41 @@
     let oceanPenalty = 0;
     for (const tile of gameView.circleSearch(center, 6)) {
       if (gameView.isWater(tile)) {
-        oceanPenalty += 0.5;
+        oceanPenalty += 0.3;
       }
     }
 
+    // Upgraded strategic components (Phase 4).
     const localOpen = countUnownedLandNear(center, 12);
-    const flood = floodScoreFrom(center, 220);
+    const flood = floodScoreFrom(center, 600);
+    const frontier = countUnownedLandNear(center, 40);
+    const elev = elevationAverage(gameView, center, 10);
+    const coast = coastNearby(gameView, center, 4) ? 1 : 0;
+    const choke = isChokepointLike(gameView, center, 20) ? 1 : 0;
+    const enemyPenalty = enemyProximityPenalty(gameView, center);
+
+    // Nation spawns already placed nearby — keep distance.
+    let falloutNearby = 0;
+    for (const tile of gameView.circleSearch(center, 12)) {
+      if (safeCall(() => gameView.hasFallout(tile), false)) {
+        falloutNearby = 1;
+        break;
+      }
+    }
+
     const terrainPoints =
       plains * 1000 + highland * 100 + mountain + spawnTiles.length;
-    const strategic = localOpen * 2 + flood * 3 - ownedPenalty - oceanPenalty;
+    const strategic =
+      localOpen * 2 +
+      flood * 3 +
+      frontier * 5 +
+      elev * 0.8 +
+      coast * 120 +
+      choke * 40 -
+      ownedPenalty -
+      oceanPenalty -
+      enemyPenalty * 4 -
+      falloutNearby * 300;
     return terrainPoints * 1.5 + strategic;
   }
 
@@ -1288,6 +1377,15 @@
       return false;
     }
 
+    // Stealth: always pretend we're thinking for a few seconds before any
+    // spawn intent goes out. The spawn is the single most visible moment a bot
+    // can be spotted; instant perfect picks give it away.
+    const nowMs = Date.now();
+    if (!runtime.state.spawn.thinkUntilMs) {
+      runtime.state.spawn.thinkUntilMs = nowMs + STEALTH_SPAWN_THINK_MS;
+    }
+    const stillThinking = nowMs < runtime.state.spawn.thinkUntilMs;
+
     if (gameView.config().isRandomSpawn()) {
       if (!runtime.state.spawn.candidateByCenter) {
         runtime.state.spawn.candidateByCenter = new Map();
@@ -1338,6 +1436,15 @@
             gameView.y(bestCandidate.center) +
             ")";
           runtime.state.strategy = "random-spawn-lock";
+          return false;
+        }
+
+        if (stillThinking) {
+          runtime.state.lastAction =
+            "thinking (" +
+            Math.max(0, Math.ceil((runtime.state.spawn.thinkUntilMs - nowMs) / 1000)) +
+            "s)";
+          runtime.state.strategy = "random-spawn-thinking";
           return false;
         }
 
@@ -1406,6 +1513,15 @@
       runtime.state.lastAction = "searching for legal spawn";
       runtime.state.strategy = "manual-spawn";
       decisionLog("spawn search found no legal tile");
+      return false;
+    }
+
+    if (stillThinking) {
+      runtime.state.lastAction =
+        "thinking (" +
+        Math.max(0, Math.ceil((runtime.state.spawn.thinkUntilMs - nowMs) / 1000)) +
+        "s)";
+      runtime.state.strategy = "manual-spawn-thinking";
       return false;
     }
 
