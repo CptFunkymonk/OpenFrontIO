@@ -2419,6 +2419,204 @@
     };
   }
 
+  // ---------- Phase 2: threat scoring ----------
+
+  /**
+   * Cheap proximity approximation: is this enemy bordering us right now?
+   * Uses the synchronous `sharesBorderWith` check when available; otherwise we
+   * inspect our current border-tile neighbors.
+   */
+  function isAdjacentTo(me, other, borderTiles) {
+    if (!me || !other) return false;
+    const shared = safeCall(
+      () => typeof me.sharesBorderWith === "function" && me.sharesBorderWith(other.player),
+      null,
+    );
+    if (shared !== null) return Boolean(shared);
+    const gameView = getGameView();
+    if (!gameView || !borderTiles) return false;
+    const otherSmallID = other.smallID;
+    for (const tile of borderTiles) {
+      for (const neighbor of gameView.neighbors(tile)) {
+        if (gameView.ownerID(neighbor) === otherSmallID) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Assess each living opponent. Produces a threat score, category tags, and
+   * surfaces the crown, rising stars, soft targets, and MIRV-capable players.
+   * Idempotent and synchronous so it can be called every tick cheaply.
+   */
+  function computeThreats(me, borderTiles) {
+    const world = runtime.world;
+    if (!me || world.everyone.length === 0) return;
+
+    const totals = world.totals;
+    const crownThreshold =
+      world.threats.crownSmallID === world.prevCrownSmallID
+        ? THREAT_CROWN_THRESHOLD
+        : THREAT_CROWN_THRESHOLD + THREAT_CROWN_HYSTERESIS;
+
+    // Sort candidates for the crown by current tile count (ranking already cached).
+    const topByTiles = world.rankings.byTiles
+      .map((id) => world.bySmallID.get(id))
+      .filter(Boolean);
+    let crownEntry = null;
+    if (topByTiles.length > 0) {
+      const top = topByTiles[0];
+      const share = totals.usableLand > 0 ? top.tiles / totals.usableLand : 0;
+      if (share >= crownThreshold) crownEntry = top;
+    }
+
+    const meEntry = world.me;
+    const mySmallID = world.meSmallID;
+
+    // Classify each player. A single entry can carry multiple category tags.
+    const adjacentEnemies = [];
+    const risingStars = [];
+    const softTargets = [];
+    const mirvCapable = [];
+    let inboundTroopTotal = 0;
+    let nearestDanger = null;
+    let nearestDangerScore = -Infinity;
+
+    for (const entry of world.everyone) {
+      if (entry.isMe) {
+        inboundTroopTotal = entry.incomingTroops;
+        continue;
+      }
+
+      // Build category tags.
+      const tags = new Set();
+      if (entry.isAlly) tags.add("ALLIED");
+      if (entry.isClanmate) tags.add("CLANMATE");
+      if (entry.isFriendly) tags.add("FRIENDLY");
+      if (!entry.isFriendly) tags.add("ENEMY");
+
+      if (crownEntry && entry.smallID === crownEntry.smallID) tags.add("CROWN");
+
+      // Nuke readiness lookahead.
+      const silos = safeCall(
+        () => entry.player.units(UnitType.MissileSilo),
+        [],
+      ).filter((u) => safeCall(() => u.isActive(), false) && !safeCall(() => u.isUnderConstruction(), false));
+      let nukeReadiness = 0;
+      if (silos.length > 0) nukeReadiness += 1;
+      if (entry.gold >= ATOM_GOLD_THRESHOLD) nukeReadiness += 1;
+      if (entry.gold >= HYDRO_GOLD_THRESHOLD) nukeReadiness += 1;
+      if (entry.gold >= MIRV_GOLD_THRESHOLD) nukeReadiness += 2;
+      entry.nukeReadiness = nukeReadiness;
+      if (!entry.isFriendly && nukeReadiness >= 4) {
+        tags.add("MIRV_RISK");
+        mirvCapable.push(entry);
+      }
+
+      // Soft target: visibly weak and/or afk.
+      const relativelyWeak =
+        entry.troopRatio < 0.4 ||
+        entry.isDisconnected ||
+        entry.isTraitor;
+      if (!entry.isFriendly && relativelyWeak) tags.add("SOFT_TARGET");
+
+      // Tribe (bot) with structures: a free-real-estate farm.
+      if (entry.type === PlayerType.Bot) {
+        const structuresTotal =
+          (entry.structures[UnitType.City] || 0) +
+          (entry.structures[UnitType.Factory] || 0) +
+          (entry.structures[UnitType.Port] || 0) +
+          (entry.structures[UnitType.MissileSilo] || 0) +
+          (entry.structures[UnitType.SAMLauncher] || 0) +
+          (entry.structures[UnitType.DefensePost] || 0);
+        if (structuresTotal > 0) tags.add("TRIBE_FARM");
+      }
+
+      // Rising star: fast expander not yet in the top-3 tile count.
+      const tilesRank = world.rankings.byTiles.indexOf(entry.smallID);
+      if (
+        !entry.isFriendly &&
+        entry.tilesPerMin > 40 &&
+        tilesRank >= 3 &&
+        entry.type !== PlayerType.Bot
+      ) {
+        tags.add("RISING_STAR");
+        risingStars.push(entry);
+      }
+
+      // Adjacent?
+      const adjacent = isAdjacentTo(me, entry, borderTiles);
+      entry.isAdjacent = adjacent;
+      if (adjacent && !entry.isFriendly) {
+        tags.add("ADJACENT");
+        adjacentEnemies.push(entry);
+      }
+
+      if (tags.has("SOFT_TARGET") && !entry.isFriendly) softTargets.push(entry);
+
+      // Threat score: what the planner and tactics will use to pick targets.
+      const meTroops = meEntry ? meEntry.troops : 1;
+      const troopRatioToUs = entry.troops / Math.max(meTroops, 1);
+      let strength = entry.troops;
+      strength += entry.gold * 0.04;
+      strength += 150 * (entry.structureLevels[UnitType.City] || 0);
+      strength += 80 * (entry.structureLevels[UnitType.Factory] || 0);
+      strength += 250 * (entry.structureLevels[UnitType.MissileSilo] || 0);
+      strength += 200 * (entry.structureLevels[UnitType.SAMLauncher] || 0);
+
+      let threatScore = 0;
+      if (tags.has("CROWN")) threatScore += 80;
+      if (tags.has("RISING_STAR")) threatScore += 40;
+      if (tags.has("MIRV_RISK")) threatScore += 60;
+      if (tags.has("ADJACENT")) threatScore += 25;
+      if (tags.has("ENEMY")) threatScore += 5;
+      threatScore += clamp(Math.log2(Math.max(1, troopRatioToUs)) * 20, -40, 40);
+      threatScore += clamp(entry.tilesPerMin * 0.4, -20, 50);
+      threatScore += entry.nukeReadiness * 10;
+      if (tags.has("SOFT_TARGET")) threatScore -= 30;
+      if (entry.isDisconnected) threatScore -= 25;
+      if (tags.has("CLANMATE")) threatScore -= 200; // Never target clanmates.
+
+      entry.strength = strength;
+      entry.threatScore = threatScore;
+      entry.tags = tags;
+      entry.opportunityScore =
+        (tags.has("SOFT_TARGET") ? 40 : 0) +
+        (tags.has("TRIBE_FARM") ? 35 : 0) +
+        Math.max(0, 20 - entry.troopRatio * 20) +
+        (tags.has("ADJACENT") ? 15 : 0);
+
+      if (
+        adjacent &&
+        !entry.isFriendly &&
+        threatScore > nearestDangerScore
+      ) {
+        nearestDanger = entry;
+        nearestDangerScore = threatScore;
+      }
+    }
+
+    // Stable sort by threat/opportunity scores.
+    adjacentEnemies.sort((a, b) => b.threatScore - a.threatScore);
+    risingStars.sort((a, b) => b.tilesPerMin - a.tilesPerMin);
+    softTargets.sort((a, b) => b.opportunityScore - a.opportunityScore);
+
+    // Update crown w/ hysteresis tracking.
+    runtime.world.prevCrownSmallID = runtime.world.threats.crownSmallID;
+    runtime.world.threats = {
+      crownSmallID: crownEntry ? crownEntry.smallID : null,
+      crown: crownEntry,
+      prevCrownSmallID: runtime.world.threats.crownSmallID,
+      risingStars: risingStars.slice(0, 5),
+      softTargets: softTargets.slice(0, 5),
+      nearestDanger,
+      mirvRisk: mirvCapable.length > 0,
+      mirvCapable,
+      adjacentEnemies,
+      inboundTroopTotal,
+    };
+  }
+
   async function runModulesForTick() {
     discoverRuntimeReferences();
     const gameView = getGameView();
@@ -2453,6 +2651,7 @@
 
     const borderTiles = await queryExactBorderTiles(false);
     updateWorldModel(me, borderTiles);
+    computeThreats(me, borderTiles);
     updateSnapshot(me, borderTiles);
 
     const didDiplomacy = await maybeDiplomacy(me);
