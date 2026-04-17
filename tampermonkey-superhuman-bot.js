@@ -4265,9 +4265,13 @@
         if (!me) return { valid: false };
         const pressure = me.incomingTroops / Math.max(1, me.troops);
         if (pressure < 0.6) return { valid: false };
+        // At extreme pressure (≥1.0) the front will collapse if we counter-
+        // attack instead of fortifying — bump the priority so CONSOLIDATE
+        // overtakes RETALIATION.
+        const priority = pressure >= 1 ? 94 : 78;
         return {
           valid: true,
-          priority: 78,
+          priority,
           note: `front pressure ${(pressure * 100).toFixed(0)}%`,
         };
       },
@@ -5828,6 +5832,242 @@
     }
   }
 
+  // ---------- Phase 10: scripted regression suite ----------
+
+  /**
+   * Build a minimal world-state stub that the goal evaluators can consume.
+   * We deliberately touch only the fields the evaluators read. Any future
+   * evaluator that relies on new fields must add them here (the suite will
+   * fail noisily if something is missing).
+   */
+  function buildTestWorld(overrides) {
+    const base = {
+      tick: 1500,
+      me: {
+        smallID: 1,
+        name: "Me",
+        gold: 500_000,
+        tiles: 1500,
+        troops: 40_000,
+        maxTroops: 100_000,
+        troopRatio: 0.4,
+        incomingAttacks: [],
+        outgoingAttacks: [],
+        incomingTroops: 0,
+        outgoingTroops: 0,
+        structures: {
+          [UnitType.City]: 4,
+          [UnitType.Factory]: 1,
+          [UnitType.Port]: 0,
+          [UnitType.DefensePost]: 2,
+          [UnitType.MissileSilo]: 0,
+          [UnitType.SAMLauncher]: 0,
+        },
+        structureLevels: {
+          [UnitType.City]: 4,
+          [UnitType.Factory]: 1,
+          [UnitType.Port]: 0,
+          [UnitType.DefensePost]: 2,
+          [UnitType.MissileSilo]: 0,
+          [UnitType.SAMLauncher]: 0,
+        },
+      },
+      meSmallID: 1,
+      everyone: [],
+      bySmallID: new Map(),
+      history: new Map(),
+      totals: {
+        alivePlayers: 4,
+        humanCount: 1,
+        nationCount: 2,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.18,
+        myShare: 0.15,
+        secondShare: 0.14,
+      },
+      rankings: { byTiles: [], byTroops: [], byTilesVelocity: [], byTroopsVelocity: [] },
+      allianceGraph: {
+        edges: new Map(),
+        cliques: [],
+        largestBlocShare: 0,
+        coalitionThreat: false,
+      },
+      threats: {
+        crownSmallID: null,
+        crown: null,
+        prevCrownSmallID: null,
+        risingStars: [],
+        softTargets: [],
+        nearestDanger: null,
+        mirvRisk: false,
+        mirvCapable: [],
+        adjacentEnemies: [],
+        inboundTroopTotal: 0,
+      },
+      archetype: "CONTINENTAL",
+      archetypeLocked: null,
+      classifiedAt: 100,
+    };
+    if (!overrides) return base;
+    return Object.assign(base, overrides);
+  }
+
+  function runPlannerTestSuite() {
+    const previous = runtime.world;
+    const priorGameView = runtime.hooks.gameView;
+    const priorForcedId = runtime.planner.forcedGoalId;
+    const priorForcedExpiry = runtime.planner.forcedGoalExpiresMs;
+    runtime.planner.forcedGoalId = null;
+    runtime.planner.forcedGoalExpiresMs = 0;
+    const results = [];
+
+    // Stub the game view enough to satisfy evaluators that call it.
+    const stubSilo = {
+      isActive: () => true,
+      isUnderConstruction: () => false,
+      level: () => 1,
+      missileReadinesss: () => 1,
+      id: () => 42,
+      tile: () => 0,
+    };
+    const stubUnits = new Map();
+    const stubGameView = {
+      ticks: () => 1500,
+      config: () => ({
+        maxTroops: () => 100_000,
+        boatMaxNumber: () => 3,
+        isUnitDisabled: () => false,
+      }),
+    };
+
+    function step(name, world, expectedGoalId, stubMySilos) {
+      stubUnits.clear();
+      if (stubMySilos) {
+        stubUnits.set(UnitType.MissileSilo, [stubSilo]);
+      }
+      // Stub myPlayer-unit lookups so getMyUnitsOfType returns our silos.
+      runtime.hooks.gameView = Object.assign({}, stubGameView, {
+        myPlayer: () => ({
+          isAlive: () => true,
+          units: (t) => stubUnits.get(t) || [],
+          smallID: () => 1,
+        }),
+      });
+      runtime.world = world;
+      const selection = selectPrimaryGoal();
+      const actualId = selection && selection.spec ? selection.spec.id : null;
+      const pass = actualId === expectedGoalId;
+      results.push({ name, expected: expectedGoalId, actual: actualId, pass });
+      return pass;
+    }
+
+    // Scenario 1: crown at 50%, we have a silo + atom gold -> NUKE_CROWN.
+    const scenario1 = buildTestWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.5,
+        myShare: 0.2,
+        secondShare: 0.2,
+      },
+    });
+    scenario1.me.gold = 1_200_000;
+    scenario1.me.structures[UnitType.MissileSilo] = 1;
+    scenario1.threats.crown = {
+      smallID: 2,
+      name: "Crown",
+      isFriendly: false,
+      tiles: 5000,
+      structureLevels: { [UnitType.SAMLauncher]: 0 },
+    };
+    scenario1.threats.crownSmallID = 2;
+    step("crown50-atom -> NUKE_CROWN", scenario1, "NUKE_CROWN", true);
+
+    // Scenario 2: we're the crown ourselves -> DEFENSIVE_TURTLE.
+    const scenario2 = buildTestWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.35,
+        myShare: 0.35,
+        secondShare: 0.15,
+      },
+    });
+    step("we-are-crown -> DEFENSIVE_TURTLE", scenario2, "DEFENSIVE_TURTLE");
+
+    // Scenario 3: we own 27% -> SAM_WALL_BUILDUP.
+    const scenario3 = buildTestWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.27,
+        myShare: 0.27,
+        secondShare: 0.2,
+      },
+    });
+    // SAM count still low, city count moderate => SAM_WALL_BUILDUP wins.
+    scenario3.me.structures[UnitType.City] = 8;
+    scenario3.me.structureLevels[UnitType.City] = 8;
+    step("27%-share -> SAM_WALL_BUILDUP", scenario3, "SAM_WALL_BUILDUP");
+
+    // Scenario 4: we're under heavy attack -> CONSOLIDATE_FRONT.
+    const scenario4 = buildTestWorld();
+    scenario4.me.incomingTroops = 40_000;
+    scenario4.me.troops = 30_000;
+    step("pressure>60% -> CONSOLIDATE_FRONT", scenario4, "CONSOLIDATE_FRONT");
+
+    // Scenario 5: coalition dominant + MIRV gold -> MIRV_LAST_RESORT.
+    const scenario5 = buildTestWorld({
+      totals: {
+        alivePlayers: 4,
+        humanCount: 2,
+        nationCount: 2,
+        botCount: 0,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.5,
+        myShare: 0.18,
+        secondShare: 0.15,
+      },
+    });
+    scenario5.me.gold = 30_000_000;
+    scenario5.threats.crown = {
+      smallID: 2,
+      name: "Crown",
+      isFriendly: false,
+      tiles: 5000,
+      structureLevels: { [UnitType.SAMLauncher]: 6 },
+    };
+    scenario5.threats.crownSmallID = 2;
+    scenario5.allianceGraph.largestBlocShare = 0.5;
+    scenario5.bySmallID.set(2, { tiles: 5000 });
+    step("coalition>=45% -> MIRV_LAST_RESORT", scenario5, "MIRV_LAST_RESORT");
+
+    runtime.world = previous;
+    runtime.hooks.gameView = priorGameView;
+    runtime.planner.forcedGoalId = priorForcedId;
+    runtime.planner.forcedGoalExpiresMs = priorForcedExpiry;
+    return {
+      passed: results.filter((r) => r.pass).length,
+      failed: results.filter((r) => !r.pass).length,
+      results,
+    };
+  }
+
   function init() {
     window.__superhumanBotRuntime = runtime;
     window.__superhumanBotRefreshOverlay = refreshOverlay;
@@ -5846,7 +6086,9 @@
         if (!entry) return "not found";
         return entry;
       },
+      runPlannerSuite: () => runPlannerTestSuite(),
     };
+    runtime.test = { runSuite: runPlannerTestSuite };
     installWebSocketHook();
     installWorkerHook();
     bootstrapOverlay();
