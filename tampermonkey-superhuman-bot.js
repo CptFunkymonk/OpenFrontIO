@@ -2617,6 +2617,129 @@
     };
   }
 
+  // ---------- Phase 5: map archetype ----------
+
+  /**
+   * Manual archetype overrides for maps the runtime classifier consistently
+   * misreads. Keys match the game's GameMapType string values. We intentionally
+   * do NOT store per-tile data here; just the archetype preference + notes.
+   */
+  const MAP_OVERRIDES = {
+    "The Box": { archetype: "ARENA" },
+    "Sierpinski": { archetype: "ARENA" },
+    "Didier": { archetype: "ARENA" },
+    "Didier France": { archetype: "ARENA" },
+    "MilkyWay": { archetype: "ARENA" },
+    "Pluto": { archetype: "CONTINENTAL" },
+    "Mars": { archetype: "CONTINENTAL" },
+    "Baikal Nuke Wars": { archetype: "NUKE_RACE" },
+  };
+
+  /**
+   * Figure out the map archetype from observable features. Runs once when we
+   * first own enough tiles to have a stable centroid, then stays locked for
+   * the match (unless the user manually overrides via the overlay).
+   */
+  function classifyMapIfNeeded(me) {
+    const world = runtime.world;
+    if (world.archetypeLocked) {
+      world.archetype = world.archetypeLocked;
+      return;
+    }
+    if (world.archetype !== "unknown" && world.classifiedAt >= 0) {
+      return;
+    }
+    const gameView = getGameView();
+    if (!gameView || !me) return;
+    const myTiles = safeCall(() => me.numTilesOwned(), 0);
+    if (myTiles < 200) return;
+
+    const gameConfig = safeCall(() => gameView.config().gameConfig(), null) || {};
+    const gameMap = safeCall(() => gameConfig.gameMap, null) || "";
+    const override = MAP_OVERRIDES[gameMap];
+    if (override) {
+      world.archetype = override.archetype;
+      world.classifiedAt = world.tick;
+      botLog(`Archetype (override ${gameMap}): ${world.archetype}`);
+      return;
+    }
+
+    const nukesDisabled =
+      safeCall(() => gameView.config().isUnitDisabled(UnitType.AtomBomb), false) &&
+      safeCall(() => gameView.config().isUnitDisabled(UnitType.HydrogenBomb), false) &&
+      safeCall(() => gameView.config().isUnitDisabled(UnitType.MIRV), false);
+
+    const startingGold = Number(
+      safeCall(() => gameConfig.startingGold, 0) || 0,
+    );
+    const highStartingGold = startingGold >= 500_000;
+
+    const width = safeCall(() => gameView.width(), 0);
+    const height = safeCall(() => gameView.height(), 0);
+    const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
+    const landFraction = totalLand / Math.max(1, width * height);
+
+    // Flood-fill our contiguous island starting from any of our tiles.
+    let ourIslandSize = 0;
+    const seedTiles = runtime.state.borderCache.tiles.slice(0, 1);
+    if (seedTiles.length > 0) {
+      const seed = seedTiles[0];
+      const visited = new Set();
+      const queue = [seed];
+      visited.add(seed);
+      while (queue.length && visited.size < 80000) {
+        const current = queue.shift();
+        if (!gameView.isLand(current)) continue;
+        ourIslandSize += 1;
+        for (const neighbor of gameView.neighbors(current)) {
+          if (visited.has(neighbor)) continue;
+          if (!gameView.isLand(neighbor)) continue;
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+    }
+    const ourIslandFraction = ourIslandSize / totalLand;
+
+    // Estimate choke density by sampling small rings around our tiles.
+    let narrowRings = 0;
+    let rings = 0;
+    for (const borderTile of runtime.state.borderCache.tiles.slice(0, 32)) {
+      const landInRing = countLandInRing(gameView, borderTile, 12);
+      if (landInRing > 0 && landInRing < 40) narrowRings += 1;
+      rings += 1;
+    }
+    const chokeDensity = rings > 0 ? narrowRings / rings : 0;
+
+    let archetype;
+    if (nukesDisabled) {
+      archetype = "CONVENTIONAL";
+    } else if (highStartingGold) {
+      archetype = "NUKE_RACE";
+    } else if (ourIslandFraction < 0.18 && landFraction < 0.55) {
+      archetype = "ISLAND";
+    } else if (chokeDensity >= 0.4) {
+      archetype = "CHOKE_HEAVY";
+    } else {
+      archetype = "CONTINENTAL";
+    }
+
+    world.archetype = archetype;
+    world.classifiedAt = world.tick;
+    botLog(
+      `Archetype (${gameMap || "unknown map"}): ${archetype} ` +
+      `(islandFrac=${ourIslandFraction.toFixed(2)} chokeDensity=${chokeDensity.toFixed(2)})`,
+    );
+  }
+
+  function countLandInRing(gameView, tile, radius) {
+    let count = 0;
+    for (const neighbor of gameView.circleSearch(tile, radius)) {
+      if (gameView.isLand(neighbor)) count += 1;
+    }
+    return count;
+  }
+
   // ---------- Phase 3: goal planner ----------
 
   /**
@@ -3217,6 +3340,7 @@
     const borderTiles = await queryExactBorderTiles(false);
     updateWorldModel(me, borderTiles);
     computeThreats(me, borderTiles);
+    classifyMapIfNeeded(me);
     updateSnapshot(me, borderTiles);
     const selection = selectPrimaryGoal();
     adoptGoal(selection);
