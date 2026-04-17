@@ -36,6 +36,8 @@
   // Stealth pacing (human-grade top-player, not wall-clock optimal).
   const STEALTH_MIN_INTENT_GAP_MS = 120;
   const STEALTH_MAX_MAJOR_PER_2S = 3;
+  const STEALTH_MAX_ATTACKS_PER_SEC = 2;
+  const STEALTH_MAX_BUILDS_PER_SEC = 3;
   const STEALTH_REACTION_MIN_MS = 300;
   const STEALTH_REACTION_MAX_MS = 900;
   const STEALTH_SPAWN_THINK_MS = 8000;
@@ -227,6 +229,8 @@
     stealth: {
       lastIntentAtMs: 0,
       lastMajorIntentMs: [],
+      lastAttackMs: [], // rolling window of attack-intent timestamps
+      lastBuildMs: [],  // rolling window of build-intent timestamps
       perPlayerActions: new Map(), // smallID -> [{ kind, atMs }]
       combos: new Map(), // smallID -> { lastKind, lastAtMs }
     },
@@ -672,6 +676,25 @@
         return { ok: false, reason: "major-burst" };
       }
 
+      // Per-kind sub-limits so we can't e.g. queue 3 builds + 3 attacks in a
+      // single 2s window. Matches Phase 9 spec.
+      const kind = intentActionKind(intent);
+      if (kind === "attack") {
+        runtime.stealth.lastAttackMs = runtime.stealth.lastAttackMs.filter(
+          (ts) => nowMs - ts <= 1000,
+        );
+        if (runtime.stealth.lastAttackMs.length >= STEALTH_MAX_ATTACKS_PER_SEC) {
+          return { ok: false, reason: "attack-burst" };
+        }
+      } else if (kind === "build") {
+        runtime.stealth.lastBuildMs = runtime.stealth.lastBuildMs.filter(
+          (ts) => nowMs - ts <= 1000,
+        );
+        if (runtime.stealth.lastBuildMs.length >= STEALTH_MAX_BUILDS_PER_SEC) {
+          return { ok: false, reason: "build-burst" };
+        }
+      }
+
       const targetSmallID = intentTargetSmallID(intent);
       if (targetSmallID !== null) {
         const combo = runtime.stealth.combos.get(targetSmallID);
@@ -705,9 +728,11 @@
     runtime.stealth.lastIntentAtMs = nowMs;
     if (!isMajorIntent(intent)) return;
     runtime.stealth.lastMajorIntentMs.push(nowMs);
+    const kind = intentActionKind(intent);
+    if (kind === "attack") runtime.stealth.lastAttackMs.push(nowMs);
+    if (kind === "build") runtime.stealth.lastBuildMs.push(nowMs);
     const targetSmallID = intentTargetSmallID(intent);
     if (targetSmallID === null) return;
-    const kind = intentActionKind(intent);
     const actions =
       runtime.stealth.perPlayerActions.get(targetSmallID) || [];
     actions.push({ kind, atMs: nowMs });
@@ -5041,6 +5066,8 @@
       runtime.stealth.perPlayerActions.clear();
       runtime.stealth.combos.clear();
       runtime.stealth.lastMajorIntentMs = [];
+      runtime.stealth.lastAttackMs = [];
+      runtime.stealth.lastBuildMs = [];
       runtime._lastDecisionByKey = null;
       runtime._intelLoggedAt = -999;
       runtime._timingLoggedAt = -999;
