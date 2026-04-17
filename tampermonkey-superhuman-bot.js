@@ -2361,6 +2361,56 @@
     return true;
   }
 
+  /**
+   * Build a warship to patrol our coast and counter enemy warships / pirates.
+   * Chooses a patrol tile near our port cluster so the warship spawns at a
+   * legal friendly port.
+   */
+  async function runGoal_WarshipDefense(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    if (gameView.config().isUnitDisabled(UnitType.Warship)) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.warship < 60) return false;
+
+    // Patrol tiles = centroid-ish spots near our ports.
+    const myPorts = getMyUnitsOfType(UnitType.Port).filter(
+      (u) => !safeCall(() => u.isUnderConstruction(), false),
+    );
+    if (myPorts.length === 0) return false;
+
+    const candidateTiles = [];
+    for (const port of myPorts) {
+      const portTile = port.tile();
+      // Sample a few oceanic neighbors within manhattan-8 of the port.
+      for (const candidate of gameView.circleSearch(portTile, 12)) {
+        if (safeCall(() => gameView.isOcean(candidate), false)) {
+          candidateTiles.push(candidate);
+        }
+      }
+    }
+    const unique = uniqueBy(shuffleArray(candidateTiles), (t) => t).slice(0, 16);
+
+    for (const tile of unique) {
+      const buildables = await queryPlayerBuildables(tile, [UnitType.Warship]);
+      const buildable = buildables.find((b) => b.type === UnitType.Warship);
+      if (!buildable || buildable.canBuild === false) continue;
+      if (sendBuild(UnitType.Warship, tile)) {
+        runtime.state.cooldowns.warship = tick;
+        reasonLog(
+          "WARSHIP_DEFENSE",
+          "build Warship",
+          runtime.world.archetype === "ISLAND"
+            ? "island archetype — pirates loom"
+            : "enemy warships spotted",
+          "patrol coast, protect trade, deter boats",
+        );
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function maybeDiplomacy(me) {
     const gameView = getGameView();
     const tick = gameView.ticks();
@@ -3845,9 +3895,11 @@
       case "DIPLOMACY_ISOLATE_CROWN":
         handled = await maybeDiplomacy(me);
         break;
+      case "WARSHIP_DEFENSE":
+        handled = await runGoal_WarshipDefense(me);
+        break;
       case "DEFENSE_NETWORK":
       case "SAVE_FOR_HYDRO":
-      case "WARSHIP_DEFENSE":
       case "IDLE":
       default:
         // Fall through to legacy pipeline; also handles pre-goal behavior.
