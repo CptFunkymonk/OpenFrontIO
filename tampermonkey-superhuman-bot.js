@@ -4466,6 +4466,31 @@
       onAct: async () => false,
     },
     {
+      id: "CHOKEPOINT_LOCK",
+      horizonTicks: 240,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (world.archetype !== "CHOKE_HEAVY") return { valid: false };
+        // Only relevant while we don't yet hold a hard border; once we're the
+        // crown we switch to DEFENSIVE_TURTLE anyway.
+        if (world.totals.myShare >= 0.35) return { valid: false };
+        const dpCount = me.structures[UnitType.DefensePost] || 0;
+        const dpTarget = Math.max(
+          3,
+          Math.floor((me.structures[UnitType.City] || 1) * 0.75),
+        );
+        if (dpCount >= dpTarget) return { valid: false };
+        return {
+          valid: true,
+          priority: 68,
+          note: `choke lock ${dpCount}/${dpTarget} DPs`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
       id: "DEFENSE_NETWORK",
       horizonTicks: 300,
       evaluate: () => {
@@ -4779,6 +4804,7 @@
         if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
       case "CONSOLIDATE_FRONT":
+      case "CHOKEPOINT_LOCK":
         handled = await runGoal_ConsolidateFront(me);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
