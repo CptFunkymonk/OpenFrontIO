@@ -2421,10 +2421,38 @@
           profile.alliances.length >= 2
             ? 12
             : 0;
+        // Phase 6.8: bonus for SAMs that a hydrogen blast radius reaches
+        // *while the SAM itself cannot reach the blast center*. Port of the
+        // Impossible-difficulty bonus from `NationNukeBehavior.nukeTileScore`.
+        let outrangeBonus = 0;
+        if (nukeType === UnitType.HydrogenBomb) {
+          const hydroOuter = nukeMagnitude(UnitType.HydrogenBomb).outer;
+          const nearbySams = safeCall(
+            () => gameView.nearbyUnits(candidate, hydroOuter, UnitType.SAMLauncher),
+            [],
+          );
+          for (const sam of nearbySams) {
+            const owner = sam.unit.owner();
+            if (safeCall(() => owner.isMe(), false)) continue;
+            if (safeCall(() => me.isFriendly(owner), false)) continue;
+            const samLevel = safeCall(() => sam.unit.level(), 1);
+            if (samLevel >= 5) continue;
+            const samRange = safeCall(
+              () => gameView.config().samRange(samLevel),
+              70,
+            );
+            const d = Math.sqrt(sam.distSquared);
+            if (d > samRange) {
+              // Hydro reaches SAM but SAM can't reach candidate. Free kill.
+              outrangeBonus += 5000 * samLevel;
+            }
+          }
+        }
         const score =
           localStructureScore +
           crownPressure +
-          alliancePressure -
+          alliancePressure +
+          outrangeBonus -
           samRisk -
           Math.floor(gameView.manhattanDist(spawnTile, candidate) / 6);
 
@@ -2840,6 +2868,53 @@
         );
         return true;
       }
+    }
+    return false;
+  }
+
+  /**
+   * Port of `NationExecution.calculateBotAttackTroops`. Attacks bots with
+   * exactly `target.troops * 4`, capped at our deployable budget; if the
+   * budget is under `target.troops * 2` we skip the attack (not worth it).
+   */
+  function calcTribeAttackTroops(targetTroops, availableBudget) {
+    if (availableBudget <= 0) return 0;
+    const ideal = targetTroops * 4;
+    if (ideal <= availableBudget) return Math.floor(ideal);
+    if (availableBudget < targetTroops * 2) return 0;
+    return Math.floor(availableBudget);
+  }
+
+  /**
+   * FARM_TRIBE tactical: pick the nearest adjacent tribe (PlayerType.Bot) and
+   * hit it with the 4× formula. Bots delete their own structures, so we want
+   * to grab the cluster before they delete the buildings.
+   */
+  async function runGoal_FarmTribe(me, borderTiles) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.combat < 10) return false;
+
+    const adj = runtime.world.threats.adjacentEnemies || [];
+    const tribe = adj.find((e) => e.tags && e.tags.has("TRIBE_FARM"));
+    if (!tribe) return false;
+
+    const maxTroops = gameView.config().maxTroops(me);
+    const reserveRatio = Math.max(0.15, computeReserveRatio(me, maxTroops) - 0.1);
+    const budget = Math.floor(me.troops() - maxTroops * reserveRatio);
+    const troops = calcTribeAttackTroops(tribe.troops, budget);
+    if (troops <= 0) return false;
+
+    if (sendAttack(tribe.id, troops)) {
+      runtime.state.cooldowns.combat = tick;
+      reasonLog(
+        "FARM_TRIBE",
+        "land attack",
+        "tribe=" + tribe.name + " ~" + fmtTroops(tribe.troops) + " defending",
+        "seize structures before they delete",
+      );
+      return true;
     }
     return false;
   }
@@ -4940,7 +5015,8 @@
         if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
       case "FARM_TRIBE":
-        handled = await maybeCombat(me, borderTiles);
+        handled = await runGoal_FarmTribe(me, borderTiles);
+        if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
       case "NEUTRALIZE_RISING_STAR":
         handled = await runGoal_NeutralizeRisingStar(me);
