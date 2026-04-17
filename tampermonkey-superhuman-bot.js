@@ -2552,7 +2552,169 @@
     return false;
   }
 
+  const ALLIANCE_CAP = 2;
+
+  /**
+   * Strategic diplomacy.
+   *   1. Always try to pseudo-ally with detected clanmates.
+   *   2. Under the ALLIANCE_CAP, look for an alliance that would dampen the
+   *      crown's rise (partner must be adjacent to or bordering the crown and
+   *      not themselves be the crown).
+   *   3. Embargo the crown if hostile.
+   *   4. Break alliances with disconnected / traitor allies.
+   *   5. Fall through to the legacy `maybeDiplomacy` for edge cases.
+   */
+  async function runGoal_Diplomacy(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.diplomacy < 50) return false;
+
+    const world = runtime.world;
+    const myEntry = world.me;
+    if (!myEntry) return false;
+
+    // 1. Auto alliance request to clanmates.
+    const clanmates = world.everyone.filter(
+      (e) => e.isClanmate && !e.isAlly,
+    );
+    for (const clanmate of clanmates) {
+      const struct = gatherStructureTiles(clanmate.player)[0];
+      const sampleTile =
+        struct ||
+        sampleTilesForOwner(clanmate.smallID, 1, {
+          requireLand: true,
+          maxSamples: 120,
+        })[0];
+      if (!sampleTile) continue;
+      const actions = await queryPlayerActions(sampleTile, null);
+      if (
+        actions &&
+        actions.interaction &&
+        actions.interaction.canSendAllianceRequest
+      ) {
+        if (sendAllianceRequest(clanmate.id)) {
+          runtime.state.cooldowns.diplomacy = tick;
+          reasonLog(
+            "DIPLOMACY_ISOLATE_CROWN",
+            "alliance request",
+            "clanmate [" + (clanmate.clanTag || "?") + "] " + clanmate.name,
+            "lock in auto-ally",
+          );
+          return true;
+        }
+      }
+    }
+
+    // 2. Partner-with-best-anti-crown-position up to ALLIANCE_CAP.
+    const currentAllies = world.everyone.filter(
+      (e) => e.isAlly || e.isClanmate,
+    );
+    const crown = world.threats.crown;
+    const crownShare = world.totals.crownShare;
+    if (
+      crown &&
+      !crown.isFriendly &&
+      crownShare >= 0.25 &&
+      currentAllies.length < ALLIANCE_CAP
+    ) {
+      const candidates = world.everyone
+        .filter((e) => !e.isMe && !e.isAlly && !e.isClanmate && !e.isFriendly)
+        .filter((e) => e.smallID !== crown.smallID)
+        .filter((e) => e.type !== PlayerType.Bot)
+        // Partners must be adjacent to the crown — they can actually pressure.
+        .filter((e) =>
+          isAdjacentTo(crown.player, e, Array.from(
+            safeCall(() => new Set(gatherStructureTiles(crown.player)), new Set()),
+          )) ||
+          e.isAdjacent,
+        )
+        .sort((a, b) => b.strength - a.strength);
+      for (const candidate of candidates.slice(0, 5)) {
+        const tile = gatherStructureTiles(candidate.player)[0];
+        if (!tile) continue;
+        const actions = await queryPlayerActions(tile, null);
+        if (
+          !actions ||
+          !actions.interaction ||
+          !actions.interaction.canSendAllianceRequest
+        ) {
+          continue;
+        }
+        if (sendAllianceRequest(candidate.id)) {
+          runtime.state.cooldowns.diplomacy = tick;
+          reasonLog(
+            "DIPLOMACY_ISOLATE_CROWN",
+            "alliance request",
+            "ally=" + candidate.name + " borders crown",
+            "recruit partner vs crown",
+          );
+          return true;
+        }
+      }
+    }
+
+    // 3. Embargo the crown if we haven't already.
+    if (crown && !crown.isFriendly && crownShare >= 0.25) {
+      const crownSample =
+        gatherStructureTiles(crown.player)[0] ||
+        sampleTilesForOwner(crown.smallID, 1, {
+          requireLand: true,
+          maxSamples: 120,
+        })[0];
+      if (crownSample) {
+        const actions = await queryPlayerActions(crownSample, null);
+        if (
+          actions &&
+          actions.interaction &&
+          actions.interaction.canEmbargo
+        ) {
+          if (sendEmbargo(crown.id, "start")) {
+            runtime.state.cooldowns.diplomacy = tick;
+            reasonLog(
+              "DIPLOMACY_ISOLATE_CROWN",
+              "embargo",
+              "crown=" + crown.name + " " + (crownShare * 100).toFixed(0) + "%",
+              "deny trade revenue",
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    // 4. Break alliances with disconnected / traitor allies.
+    for (const ally of currentAllies) {
+      if (ally.isClanmate) continue; // never break with clan.
+      if (!ally.isDisconnected && !ally.isTraitor) continue;
+      const tile = gatherStructureTiles(ally.player)[0];
+      if (!tile) continue;
+      const actions = await queryPlayerActions(tile, null);
+      if (
+        actions &&
+        actions.interaction &&
+        actions.interaction.canBreakAlliance
+      ) {
+        if (sendBreakAlliance(ally.id)) {
+          runtime.state.cooldowns.diplomacy = tick;
+          reasonLog(
+            "DIPLOMACY_ISOLATE_CROWN",
+            "break alliance",
+            ally.name + (ally.isTraitor ? " is traitor" : " disconnected"),
+            "free up alliance slot",
+          );
+          return true;
+        }
+      }
+    }
+
+    // 5. Nothing to do at the strategic level.
+    return false;
+  }
+
   async function maybeDiplomacy(me) {
+    // New goal-aware diplomacy gets first crack.
+    if (await runGoal_Diplomacy(me)) return true;
     const gameView = getGameView();
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.diplomacy < 70) return false;
