@@ -1294,6 +1294,141 @@
     return false;
   }
 
+  /**
+   * Parabolic trajectory sampler matching the core DistanceBasedBezierCurve used
+   * by nukes. We reimplement the essentials rather than depend on the worker:
+   * quadratic bezier with a control-point height pushed "up" (toward y=0) and
+   * sampled at ~2-pixel spacing. Good enough for SAM interception prediction.
+   */
+  function sampleNukeTrajectory(gameView, sourceTile, targetTile, directionUp) {
+    const mapHeight = gameView.height();
+    const sx = gameView.x(sourceTile);
+    const sy = gameView.y(sourceTile);
+    const tx = gameView.x(targetTile);
+    const ty = gameView.y(targetTile);
+    const dx = tx - sx;
+    const dy = ty - sy;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    const PARABOLA_MIN_HEIGHT = 50;
+    const maxHeight = Math.max(distance / 3, PARABOLA_MIN_HEIGHT);
+    const mult = directionUp === false ? 1 : -1;
+    const clamp01Y = (v) => clamp(v, 0, mapHeight - 1);
+    const p0 = { x: sx, y: sy };
+    const p1 = { x: sx + dx / 4, y: clamp01Y(sy + dy / 4 + mult * maxHeight) };
+    const p2 = { x: sx + (dx * 3) / 4, y: clamp01Y(sy + (dy * 3) / 4 + mult * maxHeight) };
+    const p3 = { x: tx, y: ty };
+
+    // Sample ~every 0.02 in t; this spans enough points for a 200-tile flight.
+    const points = [];
+    for (let t = 0; t <= 1.0001; t += 0.02) {
+      const mt = 1 - t;
+      const x =
+        mt * mt * mt * p0.x +
+        3 * mt * mt * t * p1.x +
+        3 * mt * t * t * p2.x +
+        t * t * t * p3.x;
+      const y =
+        mt * mt * mt * p0.y +
+        3 * mt * mt * t * p1.y +
+        3 * mt * t * t * p2.y +
+        t * t * t * p3.y;
+      const ix = Math.floor(x);
+      const iy = Math.floor(y);
+      if (!gameView.isValidCoord(ix, iy)) continue;
+      points.push(gameView.ref(ix, iy));
+    }
+    return points;
+  }
+
+  /**
+   * Port of NationNukeBehavior.isTrajectoryInterceptableBySam — accurately
+   * simulates the parabolic arc of a nuke and checks every sampled position
+   * against enemy SAM coverage. Respects the mid-air untargetable window and
+   * supports excludedSamIds for SAM-overwhelm planning.
+   */
+  function trajectoryInterceptedBySAM(sourceTile, targetTile, excludedSamIds) {
+    const gameView = getGameView();
+    const me = getMyLivingPlayer();
+    if (!gameView || !me || sourceTile === false || !sourceTile) return false;
+    const directionUp = getRocketDirectionUp();
+    const trajectory = sampleNukeTrajectory(
+      gameView,
+      sourceTile,
+      targetTile,
+      directionUp,
+    );
+    if (trajectory.length === 0) return false;
+
+    const targetableRange = safeCall(
+      () => gameView.config().defaultNukeTargetableRange(),
+      150,
+    );
+    const targetRangeSquared = targetableRange * targetableRange;
+
+    // Compute mid-air untargetable window (nukes are untargetable when both
+    // > targetRange from source and > targetRange from target).
+    let untargetableStart = -1;
+    let untargetableEnd = -1;
+    for (let i = 0; i < trajectory.length; i++) {
+      const tile = trajectory[i];
+      if (untargetableStart === -1) {
+        if (
+          gameView.euclideanDistSquared(tile, sourceTile) > targetRangeSquared
+        ) {
+          if (
+            gameView.euclideanDistSquared(tile, targetTile) < targetRangeSquared
+          ) {
+            break; // overlapping spawn & target ranges
+          }
+          untargetableStart = i;
+        }
+      } else if (
+        gameView.euclideanDistSquared(tile, targetTile) < targetRangeSquared
+      ) {
+        untargetableEnd = i;
+        break;
+      }
+    }
+
+    const samRangeMax = gameView.config().maxSamRange();
+    const mySmallID = runtime.world.meSmallID;
+    for (let i = 0; i < trajectory.length; i++) {
+      if (
+        untargetableStart !== -1 &&
+        untargetableEnd !== -1 &&
+        i === untargetableStart
+      ) {
+        i = untargetableEnd - 1;
+        continue;
+      }
+      const tile = trajectory[i];
+      const nearbySams = gameView.nearbyUnits(
+        tile,
+        samRangeMax,
+        UnitType.SAMLauncher,
+      );
+      for (const sam of nearbySams) {
+        const ownerSmallID = safeCall(
+          () => sam.unit.owner().smallID(),
+          null,
+        );
+        if (ownerSmallID === mySmallID) continue;
+        const owner = sam.unit.owner();
+        if (safeCall(() => me.isFriendly(owner), false)) continue;
+        if (excludedSamIds && excludedSamIds.has(safeCall(() => sam.unit.id(), -1))) {
+          continue;
+        }
+        const samRange = gameView.config().samRange(
+          safeCall(() => sam.unit.level(), 1),
+        );
+        if (sam.distSquared <= samRange * samRange) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function nukeMagnitude(unitType) {
     if (unitType === UnitType.AtomBomb) {
       return { inner: 12, outer: 30 };
@@ -1963,8 +2098,11 @@
           nukeMagnitude(nukeType).outer,
         );
         const spawnTile = buildable.canBuild;
-        const samRisk = lineIntersectsEnemySam(spawnTile, candidate, false)
-          ? 50
+        // Use the parabolic trajectory sampler — matches the core simulation
+        // (NationNukeBehavior.isTrajectoryInterceptableBySam) so we won't
+        // launch through SAM coverage that a straight-line check missed.
+        const samRisk = trajectoryInterceptedBySAM(spawnTile, candidate, null)
+          ? 90
           : 0;
         const crownPressure =
           enemy.numTilesOwned() > me.numTilesOwned() * 1.35 ? 25 : 0;
@@ -2020,6 +2158,205 @@
         gameView.x(bestPlan.candidate) +
         "," +
         gameView.y(bestPlan.candidate),
+    );
+    return true;
+  }
+
+  // ---------- Phase 6.9-6.10: MIRV + SAM-overwhelm tactics ----------
+
+  /**
+   * Build and launch a MIRV at the crown / coalition leader. Validated as the
+   * "last alternative" by the MIRV_LAST_RESORT goal evaluator; this routine
+   * picks the blast center, confirms alliance-safety, and fires.
+   */
+  async function runGoal_MirvLastResort(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.nuke < 40) return false;
+    if (gameView.config().isUnitDisabled(UnitType.MIRV)) return false;
+    if (runtime.world.me.gold < MIRV_GOLD_THRESHOLD) return false;
+    const crown = runtime.world.threats.crown;
+    if (!crown) return false;
+
+    // Target = coalition tile centroid (tile most covered by coalition
+    // structures). Start from crown structure tiles.
+    const structureTiles = gatherStructureTiles(crown.player);
+    const sampleTiles = uniqueBy(
+      structureTiles.concat(
+        sampleTilesForOwner(crown.smallID, 8, {
+          requireLand: true,
+          maxSamples: 160,
+        }),
+      ),
+      (tile) => tile,
+    );
+
+    let bestTile = null;
+    let bestScore = -Infinity;
+    for (const candidate of sampleTiles.slice(0, 12)) {
+      if (wouldBreakAllianceOnNuke(candidate, UnitType.MIRV)) continue;
+      const buildables = await queryPlayerBuildables(candidate, [UnitType.MIRV]);
+      const buildable = buildables.find((b) => b.type === UnitType.MIRV);
+      if (!buildable || buildable.canBuild === false) continue;
+      const score =
+        countEnemyStructuresNear(crown.player, candidate, 100) +
+        (runtime.world.totals.crownShare * 200);
+      if (score > bestScore) {
+        bestScore = score;
+        bestTile = candidate;
+      }
+    }
+    if (!bestTile) return false;
+
+    const ok = sendBuild(UnitType.MIRV, bestTile, getRocketDirectionUp());
+    if (!ok) return false;
+    runtime.state.cooldowns.nuke = tick;
+    reasonLog(
+      "MIRV_LAST_RESORT",
+      "build MIRV",
+      `crown=${crown.name} share=${(runtime.world.totals.crownShare * 100).toFixed(0)}%`,
+      "saturate blast radius, reset map dynamics",
+    );
+    return true;
+  }
+
+  /**
+   * Defensive turtle: donate nothing, build DefensePosts on pressured borders,
+   * upgrade SAMs/silos. We don't attack unless directly retaliating.
+   */
+  async function runGoal_DefensiveTurtle(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+
+    // Priority: upgrade existing SAMs + silos first (no construction delay).
+    if (tick - runtime.state.cooldowns.economy >= 10) {
+      for (const type of [UnitType.SAMLauncher, UnitType.MissileSilo, UnitType.City]) {
+        if (await tryUpgradeStructure(me, type)) {
+          runtime.state.cooldowns.economy = tick;
+          reasonLog(
+            "DEFENSIVE_TURTLE",
+            "upgrade " + type,
+            "lock in crown lead",
+            "denser defense and nuke deterrent",
+          );
+          return true;
+        }
+      }
+    }
+
+    // Build DefensePosts at pressured borders.
+    const me2 = runtime.world.me;
+    const cityCount = me2 ? me2.structures[UnitType.City] : 0;
+    const dpCount = me2 ? me2.structures[UnitType.DefensePost] : 0;
+    const dpTarget = Math.max(3, Math.floor(cityCount * 0.5));
+    if (
+      dpCount < dpTarget &&
+      tick - runtime.state.cooldowns.economy >= 25
+    ) {
+      const candidates = getOwnedCandidateTiles(me, 16);
+      for (const tile of candidates) {
+        const buildables = await queryPlayerBuildables(tile, [
+          UnitType.DefensePost,
+        ]);
+        const buildable = buildables.find(
+          (b) => b.type === UnitType.DefensePost,
+        );
+        if (!buildable || buildable.canBuild === false) continue;
+        if (sendBuild(UnitType.DefensePost, tile)) {
+          runtime.state.cooldowns.economy = tick;
+          reasonLog(
+            "DEFENSIVE_TURTLE",
+            "build DefensePost",
+            `dpCount=${dpCount}/${dpTarget}`,
+            "harden pressured border",
+          );
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Pre-crown SAM wall buildup. Blocks further city growth and forces SAM
+   * construction until every major structure cluster has ≥ 1 covering SAM.
+   */
+  async function runGoal_SamWallBuildup(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.economy < 18) return false;
+
+    const candidates = getOwnedCandidateTiles(me, 20);
+    for (const tile of candidates) {
+      const buildables = await queryPlayerBuildables(tile, [
+        UnitType.SAMLauncher,
+      ]);
+      const buildable = buildables.find((b) => b.type === UnitType.SAMLauncher);
+      if (!buildable) continue;
+      if (buildable.canUpgrade !== false) {
+        if (sendUpgrade(buildable.canUpgrade, UnitType.SAMLauncher)) {
+          runtime.state.cooldowns.economy = tick;
+          reasonLog(
+            "SAM_WALL_BUILDUP",
+            "upgrade SAM",
+            "pre-crown nuke defense",
+            "raise SAM level",
+          );
+          return true;
+        }
+      }
+      if (buildable.canBuild !== false) {
+        if (sendBuild(UnitType.SAMLauncher, tile)) {
+          runtime.state.cooldowns.economy = tick;
+          reasonLog(
+            "SAM_WALL_BUILDUP",
+            "build SAM",
+            "pre-crown nuke defense",
+            "extend coverage",
+          );
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Betray a helpless ally when safety conditions hold. Gated twice: the goal
+   * spec already validates the strategic situation; we re-check nearby threats
+   * here in case the world changed between evaluation and action.
+   */
+  async function runGoal_BetrayAlly(selectionContext) {
+    const target = selectionContext && selectionContext.target;
+    if (!target) return false;
+    const me = runtime.world.me;
+    if (!me) return false;
+    const tick = runtime.world.tick;
+    if (tick - runtime.state.cooldowns.betray < 60) return false;
+
+    // Safety re-check.
+    const hostile = runtime.world.threats.adjacentEnemies.find(
+      (e) => e.troops > me.troops * 1.2,
+    );
+    if (hostile) return false;
+    if (runtime.world.threats.mirvCapable.some((p) => !p.isFriendly)) {
+      return false;
+    }
+
+    sendBreakAlliance(target.id);
+    const troops = Math.floor(me.troops * 0.6);
+    if (troops > 0) sendAttack(target.id, troops);
+    runtime.state.cooldowns.betray = tick;
+    runtime.state.cooldowns.combat = tick;
+    reasonLog(
+      "BETRAY_ALLY",
+      "break + attack ally",
+      `ally=${target.name} troopRatio=${(target.troopRatio * 100).toFixed(0)}%`,
+      "grab territory before recovery",
     );
     return true;
   }
@@ -3461,6 +3798,68 @@
     const selection = selectPrimaryGoal();
     adoptGoal(selection);
 
+    // Goal-aware dispatch. Active goal gets first crack; if it didn't act we
+    // fall through to the legacy maybeX chain (diplomacy → nuke → combat →
+    // expand → economy → naval) so we always make *some* move when possible.
+    const activeGoalId = runtime.planner.activeGoalId;
+    const selectionContext = selection && selection.evaluation && selection.evaluation.context;
+
+    let handled = false;
+    switch (activeGoalId) {
+      case "MIRV_LAST_RESORT":
+        handled = await runGoal_MirvLastResort(me);
+        if (!handled) handled = await maybeNuke(me);
+        break;
+      case "NUKE_CROWN":
+        handled = await maybeNuke(me);
+        break;
+      case "DEFENSIVE_TURTLE":
+        handled = await runGoal_DefensiveTurtle(me);
+        if (!handled) handled = await maybeDiplomacy(me);
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        break;
+      case "SAM_WALL_BUILDUP":
+        handled = await runGoal_SamWallBuildup(me);
+        if (!handled) handled = await maybeDiplomacy(me);
+        break;
+      case "BETRAY_ALLY":
+        handled = await runGoal_BetrayAlly(selectionContext);
+        break;
+      case "RETALIATION":
+        handled = await maybeCombat(me, borderTiles);
+        break;
+      case "CONSOLIDATE_FRONT":
+        handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeCombat(me, borderTiles);
+        break;
+      case "FARM_TRIBE":
+      case "NEUTRALIZE_RISING_STAR":
+        handled = await maybeCombat(me, borderTiles);
+        break;
+      case "TERRA_NULLIUS_RUSH":
+        handled = await maybeExpand(me, borderTiles);
+        break;
+      case "NAVAL_LAND_GRAB":
+        handled = await maybeNaval(me);
+        break;
+      case "DIPLOMACY_ISOLATE_CROWN":
+        handled = await maybeDiplomacy(me);
+        break;
+      case "DEFENSE_NETWORK":
+      case "SAVE_FOR_HYDRO":
+      case "WARSHIP_DEFENSE":
+      case "IDLE":
+      default:
+        // Fall through to legacy pipeline; also handles pre-goal behavior.
+        break;
+    }
+    if (handled) {
+      refreshOverlay();
+      return;
+    }
+
+    // Legacy fallback pipeline — these functions still enforce their own
+    // cooldowns so they won't step on each other or the goal layer.
     const didDiplomacy = await maybeDiplomacy(me);
     if (didDiplomacy) {
       refreshOverlay();
