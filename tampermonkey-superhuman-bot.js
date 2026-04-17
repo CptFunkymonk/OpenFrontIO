@@ -6259,8 +6259,13 @@
 
     function step(name, world, expectedGoalId, stubMySilos) {
       stubUnits.clear();
-      if (stubMySilos) {
+      if (stubMySilos === true) {
         stubUnits.set(UnitType.MissileSilo, [stubSilo]);
+      } else if (typeof stubMySilos === "number" && stubMySilos > 0) {
+        stubUnits.set(
+          UnitType.MissileSilo,
+          Array.from({ length: stubMySilos }, () => stubSilo),
+        );
       }
       // Stub myPlayer-unit lookups so getMyUnitsOfType returns our silos.
       runtime.hooks.gameView = Object.assign({}, stubGameView, {
@@ -6345,6 +6350,50 @@
     scenario4.me.troops = 30_000;
     step("pressure>60% -> CONSOLIDATE_FRONT", scenario4, "CONSOLIDATE_FRONT");
 
+    // Scenario 5a: SAM_OVERWHELM selection — crown has SAMs, we have silos +
+    // atom gold, not quite enough for nuke-crown to win outright. Stubbing
+    // crown.player.units(SAM) and player.units so SAM_OVERWHELM's evaluator
+    // sees both sides.
+    const scenario5a = buildTestWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.28,
+        myShare: 0.2,
+        secondShare: 0.2,
+      },
+    });
+    scenario5a.me.gold = 2_000_000;
+    scenario5a.me.structures[UnitType.MissileSilo] = 2;
+    scenario5a.threats.crown = {
+      smallID: 2,
+      name: "Crown",
+      isFriendly: false,
+      tiles: 2800,
+      structureLevels: { [UnitType.SAMLauncher]: 2 },
+      player: {
+        units: (t) =>
+          t === UnitType.SAMLauncher
+            ? [
+                { isActive: () => true, level: () => 2, id: () => 101, tile: () => 0 },
+                { isActive: () => true, level: () => 1, id: () => 102, tile: () => 0 },
+              ]
+            : [],
+      },
+    };
+    scenario5a.threats.crownSmallID = 2;
+    // Need 2 ready silos to pass the gate.
+    step(
+      "SAM_OVERWHELM triggers with silos+gold+enemy SAMs",
+      scenario5a,
+      "SAM_OVERWHELM",
+      2,
+    );
+
     // Scenario 5: coalition dominant + MIRV gold -> MIRV_LAST_RESORT.
     const scenario5 = buildTestWorld({
       totals: {
@@ -6371,6 +6420,90 @@
     scenario5.allianceGraph.largestBlocShare = 0.5;
     scenario5.bySmallID.set(2, { tiles: 5000 });
     step("coalition>=45% -> MIRV_LAST_RESORT", scenario5, "MIRV_LAST_RESORT");
+
+    // Scenario 6: parabolic SAM check should mark fewer trajectories as
+    // intercepted than the linear approximation when the SAM sits on the
+    // straight line between silo and target but NOT under the parabolic
+    // arc's apex. We craft a tiny synthetic gameView where a single SAM
+    // lives at the midpoint.
+    const samSmallID = 11;
+    const samUnit = {
+      owner: () => ({
+        isMe: () => false,
+        smallID: () => samSmallID,
+      }),
+      id: () => 999,
+      level: () => 1,
+      tile: () => 500 * 50 + 25, // set later by pixels
+    };
+    const mapWidth = 200;
+    const mapHeight = 200;
+    const toRef = (x, y) => y * mapWidth + x;
+    const mockGameView = {
+      width: () => mapWidth,
+      height: () => mapHeight,
+      ticks: () => 1500,
+      x: (r) => r % mapWidth,
+      y: (r) => Math.floor(r / mapWidth),
+      ref: (x, y) => toRef(x, y),
+      isValidCoord: (x, y) => x >= 0 && y >= 0 && x < mapWidth && y < mapHeight,
+      euclideanDistSquared: (a, b) => {
+        const ax = a % mapWidth;
+        const ay = Math.floor(a / mapWidth);
+        const bx = b % mapWidth;
+        const by = Math.floor(b / mapWidth);
+        const dx = ax - bx;
+        const dy = ay - by;
+        return dx * dx + dy * dy;
+      },
+      nearbyUnits: (tile, range, type) => {
+        if (type !== UnitType.SAMLauncher) return [];
+        const d2 = mockGameView.euclideanDistSquared(tile, samUnit.tile());
+        if (d2 > range * range) return [];
+        return [{ unit: samUnit, distSquared: d2 }];
+      },
+      config: () => ({
+        defaultNukeTargetableRange: () => 30,
+        maxSamRange: () => 60,
+        samRange: (lvl) => 50 + lvl * 5,
+      }),
+    };
+    // Place silo at (20,100), target at (180,100), SAM at the line midpoint (100,100).
+    const siloTile = toRef(20, 100);
+    const targetTile = toRef(180, 100);
+    samUnit.tile = () => toRef(100, 100);
+
+    // Temporarily swap the world + gameView stubs so isMe()-via-smallID works.
+    const stashedMeSmallID = runtime.world.meSmallID;
+    const stashedWorld = runtime.world;
+    runtime.world = buildTestWorld();
+    runtime.world.meSmallID = 1;
+    runtime.hooks.gameView = Object.assign({}, mockGameView, {
+      myPlayer: () => ({
+        isAlive: () => true,
+        units: () => [],
+        smallID: () => 1,
+        isFriendly: () => false,
+      }),
+    });
+    // ensure getMyLivingPlayer finds a "me" so trajectoryInterceptedBySAM
+    // doesn't short-circuit.
+    const rocketUp = getRocketDirectionUp();
+    let _ = rocketUp; // reference to silence linter-ish helpers
+    const linearHit = lineIntersectsEnemySam(siloTile, targetTile, false);
+    const parabolicHit = trajectoryInterceptedBySAM(siloTile, targetTile, null);
+    // Expect linear flags the midpoint SAM as blocking, parabolic does not
+    // (the arc's apex climbs away from y=100 so the SAM at y=100 is out of
+    // range at the time the trajectory passes over it).
+    results.push({
+      name: "parabolic SAM check (linear=blocked, parabolic=clear)",
+      expected: "linear=true,parabolic=false",
+      actual: "linear=" + linearHit + ",parabolic=" + parabolicHit,
+      pass: linearHit === true && parabolicHit === false,
+    });
+
+    runtime.world = stashedWorld;
+    runtime.world.meSmallID = stashedMeSmallID;
 
     runtime.world = previous;
     runtime.hooks.gameView = priorGameView;
