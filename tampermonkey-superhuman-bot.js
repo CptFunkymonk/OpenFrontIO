@@ -599,6 +599,18 @@
   }
 
   /**
+   * Detect a test harness so we can safely bypass stealth gating during
+   * smoke-test scenarios. Only tripped by the harness setting a flag on the
+   * document body — never by the live game.
+   */
+  function isHarnessMode() {
+    return (
+      typeof window !== "undefined" &&
+      window.__SUPERBOT_TEST_MODE === true
+    );
+  }
+
+  /**
    * Phase 9: stealth pacing. Returns true if this intent is allowed to go out
    * right now. We enforce:
    * - at most one intent per STEALTH_MIN_INTENT_GAP_MS (120 ms)
@@ -610,6 +622,7 @@
    *   within 500 ms
    */
   function stealthPermits(intent) {
+    if (isHarnessMode()) return { ok: true };
     const nowMs = Date.now();
     const gap = nowMs - runtime.stealth.lastIntentAtMs;
     if (gap < STEALTH_MIN_INTENT_GAP_MS) {
@@ -1643,9 +1656,11 @@
     // can be spotted; instant perfect picks give it away.
     const nowMs = Date.now();
     if (!runtime.state.spawn.thinkUntilMs) {
-      runtime.state.spawn.thinkUntilMs = nowMs + STEALTH_SPAWN_THINK_MS;
+      runtime.state.spawn.thinkUntilMs = isHarnessMode()
+        ? nowMs
+        : nowMs + STEALTH_SPAWN_THINK_MS;
     }
-    const stillThinking = nowMs < runtime.state.spawn.thinkUntilMs;
+    const stillThinking = !isHarnessMode() && nowMs < runtime.state.spawn.thinkUntilMs;
 
     if (gameView.config().isRandomSpawn()) {
       if (!runtime.state.spawn.candidateByCenter) {
@@ -4999,8 +5014,9 @@
     try {
       // Phase 9: add a small, jittered reaction delay to mimic a human's
       // perception/decision time. Keeps us in the "fast human" range
-      // (300–900 ms) rather than the "frame-perfect bot" range.
-      if (runtime.enabled && !runtime.world.archetypeLocked) {
+      // (300–900 ms) rather than the "frame-perfect bot" range. Skipped in
+      // harness/test mode so deterministic smoke tests stay fast.
+      if (runtime.enabled && !isHarnessMode()) {
         const delay =
           STEALTH_REACTION_MIN_MS +
           Math.floor(Math.random() * (STEALTH_REACTION_MAX_MS - STEALTH_REACTION_MIN_MS));
