@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.3.0
+// @version      2.4.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -13,7 +13,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.3.0";
+  const BOT_VERSION = "2.4.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -143,6 +143,9 @@
         diplomacy: -999,
         warship: -999,
         betray: -999,
+        terrainRush: -999,
+        allianceBreak: -999,
+        allianceAccept: -999,
       },
       borderCache: {
         tick: -999,
@@ -155,6 +158,17 @@
       intentsSent: 0,
       intentsConfirmed: 0,
       pendingNukeTrajectory: null,
+      // Diplomacy memory so we don't spam alliance breaks.
+      // recentAllianceBreakTicks: rolling window of ticks at which we broke
+      // an alliance. Used to enforce a cooldown on future breaks.
+      recentAllianceBreakTicks: [],
+      // allyHelplessSince: smallID -> tick we first observed the ally as
+      // "helpless". Must be helpless continuously for HELPLESS_CONFIRM_TICKS
+      // before we consider breaking.
+      allyHelplessSince: new Map(),
+      // Pending alliance-accept attempts, smallID -> tick when we fired the
+      // back-request. Prevents spamming the same partner every tick.
+      recentAllianceAccepts: new Map(),
     },
     overlay: {
       root: null,
@@ -205,6 +219,7 @@
         prevCrownSmallID: null,
         risingStars: [],
         softTargets: [],
+        collapsingTargets: [],
         nearestDanger: null,
         mirvRisk: false,
         mirvCapable: [],
@@ -2859,7 +2874,8 @@
       return false;
     }
 
-    sendBreakAlliance(target.id);
+    if (!sendBreakAlliance(target.id)) return false;
+    recordAllianceBreak();
     const troops = Math.floor(me.troops * 0.6);
     if (troops > 0) sendAttack(target.id, troops);
     runtime.state.cooldowns.betray = tick;
@@ -2934,6 +2950,112 @@
     if (ideal <= availableBudget) return Math.floor(ideal);
     if (availableBudget < targetTroops * 2) return 0;
     return Math.floor(availableBudget);
+  }
+
+  /**
+   * TERRAIN_RUSH tactical. When a neighbouring player/tribe/nation is
+   * visibly collapsing (fast tile loss + multiple attackers) we must rush
+   * to grab as much of their territory as possible before other players
+   * carve it up. We intentionally use a low reserve ratio so we can match
+   * the pace of the rush — a half-committed attack loses the land race.
+   */
+  async function runGoal_TerrainRush(me, borderTiles) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.terrainRush < 12) return false;
+    const collapsing = runtime.world.threats.collapsingTargets || [];
+    if (collapsing.length === 0) return false;
+
+    const maxTroops = gameView.config().maxTroops(me);
+    // Rush reserve is aggressive — we'd rather win tiles now and rebuild
+    // troops than sit and lose the race. Reduce reserve by 18 pts vs the
+    // standard calc; floor at 8% so we still keep some defensive buffer.
+    const reserveRatio = Math.max(
+      0.08,
+      computeReserveRatio(me, maxTroops) - 0.18,
+    );
+
+    // Prefer adjacent collapsing targets; only consider non-adjacent ones
+    // if none of the adjacent candidates can be attacked right now.
+    const adjacentTargets = collapsing.filter((e) => e.isAdjacent);
+    const candidates =
+      adjacentTargets.length > 0 ? adjacentTargets : collapsing.slice();
+    for (const target of candidates) {
+      // Use the tribe-style 4× calc for bot tribes (defender strength is
+      // tiny and 4× guarantees a clean sweep), otherwise fall back to the
+      // standard attack math so we still commit aggressively without
+      // overspending against a collapsing player.
+      const budget = Math.floor(me.troops() - maxTroops * reserveRatio);
+      let troops;
+      if (target.type === PlayerType.Bot) {
+        troops = calcTribeAttackTroops(target.troops, budget);
+      } else {
+        const standard = calculateAttackTroops(
+          me,
+          target.player,
+          reserveRatio,
+          maxTroops,
+        );
+        // For collapsing humans/nations we rush with at least ceil(1.4×
+        // defender) when affordable — they are shedding troops quickly so
+        // their real defence is weaker than `target.troops` implies.
+        const minRush = Math.max(
+          standard,
+          Math.min(budget, Math.ceil(target.troops * 1.4)),
+        );
+        troops = Math.max(0, minRush);
+      }
+      if (troops <= 0) continue;
+
+      if (target.isAdjacent) {
+        if (sendAttack(target.id, troops)) {
+          runtime.state.cooldowns.terrainRush = tick;
+          runtime.state.cooldowns.combat = tick;
+          runtime.state.lastAction =
+            "rush-grabbing from " + target.name;
+          runtime.state.strategy = "terrain-rush";
+          reasonLog(
+            "TERRAIN_RUSH",
+            "land attack",
+            target.name +
+              " collapsing: " +
+              (target.distinctAttackerCount || 0) +
+              " attackers, " +
+              target.tilesPerMin.toFixed(0) +
+              " tiles/min",
+            "grab tiles before neighbours do",
+          );
+          return true;
+        }
+        continue;
+      }
+
+      // Non-adjacent — try a boat so we still claim some of their coast.
+      const landingTile = gatherStructureTiles(target.player)[0];
+      if (!landingTile) continue;
+      const spawn = await queryTransportShipSpawn(landingTile);
+      if (spawn === false) continue;
+      const boatTroops = Math.min(
+        troops,
+        Math.floor(me.troops() * 0.35),
+      );
+      if (boatTroops <= 0) continue;
+      if (sendBoat(landingTile, boatTroops)) {
+        runtime.state.cooldowns.terrainRush = tick;
+        runtime.state.cooldowns.naval = tick;
+        runtime.state.cooldowns.combat = tick;
+        runtime.state.strategy = "terrain-rush";
+        reasonLog(
+          "TERRAIN_RUSH",
+          "boat attack",
+          target.name + " across water, collapsing",
+          "plant boots on coast to claim tiles",
+        );
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -3317,15 +3439,231 @@
 
   const ALLIANCE_CAP = 2;
 
+  // Alliance-break guardrails. Breaking an alliance marks us as a traitor,
+  // which inflicts a 50% defense debuff for 30 seconds and sours every nearby
+  // player's relation. Breaking alliances too readily is a direct cause of
+  // games snowballing into a "everyone attacks us" loss state. These
+  // constants intentionally err on the side of keeping alliances alive.
+  //
+  // HELPLESS_CONFIRM_TICKS: how long an ally must continuously look helpless
+  // before we even consider breaking.
+  // ALLIANCE_BREAK_COOLDOWN_TICKS: minimum ticks between any two alliance
+  // breaks we initiate, to avoid a cascading traitor death spiral.
+  // TRAITOR_DURATION_TICKS: mirrors DefaultConfig.traitorDuration() (30s).
+  // HELPLESS_TROOP_RATIO / HELPLESS_TROOP_ADVANTAGE: how weak an ally must be
+  // before we consider them "helpless".
+  // MAX_ALLIANCE_BREAKS_PER_WINDOW / ALLIANCE_BREAK_WINDOW_TICKS: rolling cap
+  // so we never chain-break more than N alliances in a short window.
+  const HELPLESS_CONFIRM_TICKS = 300; // 30s of sustained weakness
+  const ALLIANCE_BREAK_COOLDOWN_TICKS = 600; // 60s between breaks
+  const TRAITOR_DURATION_TICKS = 30 * TICKS_PER_SECOND;
+  const HELPLESS_TROOP_RATIO = 0.12;
+  const HELPLESS_TROOP_ADVANTAGE = 0.35;
+  const MAX_ALLIANCE_BREAKS_PER_WINDOW = 1;
+  const ALLIANCE_BREAK_WINDOW_TICKS = 1200; // 2 minutes
+  const ALLIANCE_ACCEPT_COOLDOWN_TICKS = 200;
+
+  /**
+   * Have we broken more alliances than we should allow in the current
+   * rolling window? Keeps the traitor state from stacking catastrophically.
+   */
+  function allianceBreakBudgetExceeded() {
+    const tick = runtime.world.tick;
+    const windowStart = tick - ALLIANCE_BREAK_WINDOW_TICKS;
+    const recent = (runtime.state.recentAllianceBreakTicks || []).filter(
+      (t) => t >= windowStart,
+    );
+    runtime.state.recentAllianceBreakTicks = recent;
+    return recent.length >= MAX_ALLIANCE_BREAKS_PER_WINDOW;
+  }
+
+  /**
+   * Mark an alliance break in the rolling-window log and cooldown tracker.
+   * Call this whenever we successfully dispatch a `breakAlliance` intent.
+   */
+  function recordAllianceBreak() {
+    const tick = runtime.world.tick;
+    const list = runtime.state.recentAllianceBreakTicks || [];
+    list.push(tick);
+    const windowStart = tick - ALLIANCE_BREAK_WINDOW_TICKS;
+    runtime.state.recentAllianceBreakTicks = list.filter(
+      (t) => t >= windowStart,
+    );
+    runtime.state.cooldowns.allianceBreak = tick;
+  }
+
+  /**
+   * Ally is "helpless" per our betray heuristic: low troop ratio AND notably
+   * weaker than us in raw troops. We require sustained helplessness via
+   * `allyHelplessSince` before returning true.
+   */
+  function isAllyConfirmedHelpless(ally, myEntry) {
+    if (!ally || !myEntry) return false;
+    const tick = runtime.world.tick;
+    const helplessNow =
+      ally.troopRatio < HELPLESS_TROOP_RATIO &&
+      ally.troops < myEntry.troops * HELPLESS_TROOP_ADVANTAGE;
+    const map = runtime.state.allyHelplessSince;
+    if (!helplessNow) {
+      if (map.has(ally.smallID)) map.delete(ally.smallID);
+      return false;
+    }
+    if (!map.has(ally.smallID)) {
+      map.set(ally.smallID, tick);
+      return false;
+    }
+    const since = map.get(ally.smallID);
+    return tick - since >= HELPLESS_CONFIRM_TICKS;
+  }
+
+  /**
+   * Would be dangerous to break this alliance right now? True if we're under
+   * real threat — traitor debuff would be punishing.
+   */
+  function isUnsafeToBreakAlliance(myEntry) {
+    if (!myEntry) return true;
+    const world = runtime.world;
+    const adjacentHostile = world.threats.adjacentEnemies.some(
+      (e) => e.troops > myEntry.troops * 0.8,
+    );
+    const mirvNearby = world.threats.mirvCapable.some((p) => !p.isFriendly);
+    const incomingPressure = myEntry.incomingTroops > myEntry.troops * 0.25;
+    const alreadyTraitor =
+      safeCall(() => myEntry.player.isTraitor(), false) === true;
+    const breakCooldown =
+      world.tick - runtime.state.cooldowns.allianceBreak <
+      ALLIANCE_BREAK_COOLDOWN_TICKS;
+    return (
+      adjacentHostile ||
+      mirvNearby ||
+      incomingPressure ||
+      alreadyTraitor ||
+      breakCooldown ||
+      allianceBreakBudgetExceeded()
+    );
+  }
+
+  /**
+   * Should we accept this incoming alliance request? We accept when the
+   * requestor is a plausible partner:
+   *   - not a clanmate (we proactively ally those anyway)
+   *   - not the hostile crown
+   *   - not actively attacking us
+   *   - not below the alliance cap for us
+   *   - either friendly / similar-strength / stronger / bordering the crown
+   *   - we haven't recently responded to them
+   *
+   * Accepting is modeled as sending an alliance request back: the server
+   * auto-accepts when both sides have outstanding requests (see
+   * `AllianceRequestExecution.init`).
+   */
+  function shouldAcceptIncomingAlliance(requestor, myEntry) {
+    if (!requestor || !myEntry) return false;
+    if (requestor.isAlly) return false;
+    if (requestor.isMe) return false;
+    if (requestor.type === PlayerType.Bot) return false;
+    const world = runtime.world;
+    const crown = world.threats.crown;
+    if (crown && !crown.isFriendly && requestor.smallID === crown.smallID) {
+      return false;
+    }
+    // Refuse anyone currently attacking us — they are exploiting alliance
+    // mechanics, not offering a genuine partnership.
+    if (
+      Array.isArray(requestor.outgoingAttacks) &&
+      requestor.outgoingAttacks.some(
+        (a) => safeCall(() => a.targetID, null) === world.meSmallID,
+      )
+    ) {
+      return false;
+    }
+    // If we are already at the alliance cap, only accept if the new partner
+    // is clearly stronger than one of our current allies (so they offer a
+    // strict upgrade in coalition strength).
+    const currentAllies = world.everyone.filter(
+      (e) => e.isAlly && !e.isClanmate,
+    );
+    if (currentAllies.length >= ALLIANCE_CAP) {
+      const weakestAllyStrength = currentAllies.reduce(
+        (min, ally) => Math.min(min, ally.strength || 0),
+        Infinity,
+      );
+      if (!((requestor.strength || 0) > weakestAllyStrength * 1.2)) {
+        return false;
+      }
+    }
+    // Core acceptance heuristic: the partner must offer real value.
+    //  - comparableStrength: they're close to or stronger than us, so the
+    //    alliance is a meaningful deterrent / mutual defense pact.
+    //  - blocksCrown: there is a hostile crown we need help against AND the
+    //    partner is not already allied with the crown; the alliance helps
+    //    us dilute the crown's coalition.
+    //  - adjacentAlly: an adjacent non-hostile partner is strategically
+    //    valuable as a buffer, even if smaller than us.
+    const comparableStrength =
+      requestor.troops >= myEntry.troops * 0.6 ||
+      requestor.tiles >= myEntry.tiles * 0.6;
+    const partnerAlliedWithCrown =
+      !!crown &&
+      world.allianceGraph &&
+      (world.allianceGraph.edges.get(requestor.smallID) || new Set()).has(
+        crown.smallID,
+      );
+    const blocksCrown =
+      !!crown &&
+      !crown.isFriendly &&
+      requestor.smallID !== crown.smallID &&
+      !partnerAlliedWithCrown;
+    const adjacentAlly =
+      !!requestor.isAdjacent &&
+      requestor.troops >= myEntry.troops * 0.3;
+    const neutralOrFriendly =
+      safeCall(
+        () => myEntry.player.relation(requestor.player) >= 0,
+        true,
+      ) === true;
+    return (
+      (comparableStrength || blocksCrown || adjacentAlly) &&
+      neutralOrFriendly &&
+      !requestor.isTraitor
+    );
+  }
+
+  /**
+   * Scan every player and yield the ones that have an outgoing alliance
+   * request targeted at us. Uses PlayerView.isRequestingAllianceWith which
+   * reads the `outgoingAllianceRequests` list on the requestor's snapshot.
+   */
+  function getIncomingAllianceRequestors() {
+    const world = runtime.world;
+    const me = world.me;
+    if (!me) return [];
+    const requestors = [];
+    for (const entry of world.everyone) {
+      if (entry.isMe) continue;
+      if (entry.isAlly) continue;
+      const isRequesting = safeCall(
+        () =>
+          entry.player.isRequestingAllianceWith &&
+          entry.player.isRequestingAllianceWith(me.player),
+        false,
+      );
+      if (isRequesting) requestors.push(entry);
+    }
+    return requestors;
+  }
+
   /**
    * Strategic diplomacy.
    *   1. Always try to pseudo-ally with detected clanmates.
-   *   2. Under the ALLIANCE_CAP, look for an alliance that would dampen the
+   *   2. Accept beneficial incoming alliance requests.
+   *   3. Under the ALLIANCE_CAP, look for an alliance that would dampen the
    *      crown's rise (partner must be adjacent to or bordering the crown and
    *      not themselves be the crown).
-   *   3. Embargo the crown if hostile.
-   *   4. Break alliances with disconnected / traitor allies.
-   *   5. Fall through to the legacy `maybeDiplomacy` for edge cases.
+   *   4. Embargo the crown if hostile.
+   *   5. Break alliances with disconnected / long-term-helpless allies, but
+   *      only when it is genuinely safe to absorb the traitor penalty.
+   *   6. Fall through to the legacy `maybeDiplomacy` for edge cases.
    */
   async function runGoal_Diplomacy(me) {
     const gameView = getGameView();
@@ -3369,7 +3707,46 @@
       }
     }
 
-    // 2. Partner-with-best-anti-crown-position up to ALLIANCE_CAP.
+    // 2. Accept beneficial incoming alliance requests. We answer by sending
+    //    an alliance request back; the server auto-accepts when both sides
+    //    have outstanding requests (AllianceRequestExecution.init).
+    const incomingRequestors = getIncomingAllianceRequestors();
+    for (const requestor of incomingRequestors) {
+      const lastAttemptTick =
+        runtime.state.recentAllianceAccepts.get(requestor.smallID) ?? -Infinity;
+      if (tick - lastAttemptTick < ALLIANCE_ACCEPT_COOLDOWN_TICKS) continue;
+      if (!shouldAcceptIncomingAlliance(requestor, myEntry)) continue;
+      const tile =
+        gatherStructureTiles(requestor.player)[0] ||
+        sampleTilesForOwner(requestor.smallID, 1, {
+          requireLand: true,
+          maxSamples: 120,
+        })[0];
+      if (!tile) continue;
+      const actions = await queryPlayerActions(tile, null);
+      if (
+        !actions ||
+        !actions.interaction ||
+        !actions.interaction.canSendAllianceRequest
+      ) {
+        continue;
+      }
+      if (sendAllianceRequest(requestor.id)) {
+        runtime.state.cooldowns.diplomacy = tick;
+        runtime.state.cooldowns.allianceAccept = tick;
+        runtime.state.recentAllianceAccepts.set(requestor.smallID, tick);
+        reasonLog(
+          "DIPLOMACY_ISOLATE_CROWN",
+          "accept alliance",
+          "incoming request from " + requestor.name +
+            " (troops=" + fmtTroops(requestor.troops) + ")",
+          "lock in mutual ally",
+        );
+        return true;
+      }
+    }
+
+    // 3. Partner-with-best-anti-crown-position up to ALLIANCE_CAP.
     const currentAllies = world.everyone.filter(
       (e) => e.isAlly || e.isClanmate,
     );
@@ -3446,27 +3823,28 @@
       }
     }
 
-    // 4. Break alliances with disconnected / traitor / helpless allies.
-    // `helpless` mirrors NationAllianceBehavior.maybeBetray: ally troops
-    // < 20% maxTroops AND we are significantly stronger. We only break —
-    // not attack — via this diplomacy pass; actual betrayal+attack is gated
-    // by `runGoal_BetrayAlly` with its stricter safety checks.
+    // 5. Break alliances only when it's genuinely beneficial AND safe.
+    // Breaking flips us to `traitor` (50% defense debuff for 30s) and
+    // angers neighbours, so we are extremely conservative:
+    //   - Hard cap on breaks per rolling window + inter-break cooldown.
+    //   - Never break while under attack, while MIRV-capable enemies are
+    //     alive, or while we're already traitor.
+    //   - Disconnected allies: break only once it's been clearly wasting
+    //     an alliance slot (they only consume a slot, no opportunity cost).
+    //   - Traitor allies: don't break them — they're already traitors, so
+    //     letting them drop off naturally (or getting nuked) is cheaper.
+    //   - Helpless allies: require *sustained* helplessness and a safe
+    //     context before pulling the trigger.
+    const safeToBreak = !isUnsafeToBreakAlliance(myEntry);
     for (const ally of currentAllies) {
       if (ally.isClanmate) continue;
-      const helpless =
-        ally.troopRatio < 0.2 &&
-        myEntry &&
-        ally.troops < myEntry.troops * 0.5;
-      // Skip helpless-breakage if a superior hostile is nearby (traitor
-      // debuff would be exploited) or any MIRV-capable enemy is alive.
-      const unsafeContext =
-        runtime.world.threats.adjacentEnemies.some(
-          (e) => e.troops > (myEntry ? myEntry.troops : 0) * 1.2,
-        ) ||
-        runtime.world.threats.mirvCapable.some((p) => !p.isFriendly);
-      if (!ally.isDisconnected && !ally.isTraitor && !(helpless && !unsafeContext)) {
-        continue;
+      let reason = null;
+      if (ally.isDisconnected && safeToBreak) {
+        reason = "disconnected";
+      } else if (isAllyConfirmedHelpless(ally, myEntry) && safeToBreak) {
+        reason = "sustained helpless";
       }
+      if (!reason) continue;
       const tile = gatherStructureTiles(ally.player)[0];
       if (!tile) continue;
       const actions = await queryPlayerActions(tile, null);
@@ -3477,23 +3855,19 @@
       ) {
         if (sendBreakAlliance(ally.id)) {
           runtime.state.cooldowns.diplomacy = tick;
+          recordAllianceBreak();
           reasonLog(
             "DIPLOMACY_ISOLATE_CROWN",
             "break alliance",
-            ally.name +
-              (ally.isTraitor
-                ? " is traitor"
-                : ally.isDisconnected
-                  ? " disconnected"
-                  : " helpless"),
-            "free up alliance slot",
+            ally.name + " — " + reason,
+            "free up alliance slot (safe context)",
           );
           return true;
         }
       }
     }
 
-    // 5. Nothing to do at the strategic level.
+    // 6. Nothing to do at the strategic level.
     return false;
   }
 
@@ -3580,28 +3954,31 @@
       }
     }
 
-    for (const ally of allies) {
-      const targetTile = gatherStructureTiles(ally)[0];
-      if (targetTile === undefined) continue;
-      const actions = await queryPlayerActions(targetTile, null);
-      if (
-        !actions ||
-        !actions.interaction ||
-        !actions.interaction.canBreakAlliance
-      ) {
-        continue;
-      }
-
-      if (
-        safeCall(() => ally.isDisconnected(), false) ||
-        safeCall(() => ally.isTraitor(), false)
-      ) {
+    // Legacy break-alliance fallback is retained only for disconnected
+    // allies, and only when it's safe. The goal-aware diplomacy pass above
+    // already handles the nuanced "helpless ally" case.
+    const myEntry = runtime.world.me;
+    const safeToBreak = !isUnsafeToBreakAlliance(myEntry);
+    if (safeToBreak) {
+      for (const ally of allies) {
+        if (!safeCall(() => ally.isDisconnected(), false)) continue;
+        const targetTile = gatherStructureTiles(ally)[0];
+        if (targetTile === undefined) continue;
+        const actions = await queryPlayerActions(targetTile, null);
+        if (
+          !actions ||
+          !actions.interaction ||
+          !actions.interaction.canBreakAlliance
+        ) {
+          continue;
+        }
         if (sendBreakAlliance(ally.id())) {
           runtime.state.cooldowns.diplomacy = tick;
+          recordAllianceBreak();
           runtime.state.lastAction =
             "breaking alliance with " + ally.displayName();
           runtime.state.strategy = "diplomacy";
-          botLog("Break alliance -> " + ally.displayName());
+          botLog("Break alliance -> " + ally.displayName() + " (disconnected)");
           return true;
         }
       }
@@ -3746,10 +4123,25 @@
    * Called each tick so the ring buffer doesn't grow unbounded across respawns.
    */
   function pruneStaleHistory(livingSmallIDs) {
-    if (runtime.world.history.size === 0) return;
-    for (const smallID of Array.from(runtime.world.history.keys())) {
-      if (!livingSmallIDs.has(smallID)) {
-        runtime.world.history.delete(smallID);
+    if (runtime.world.history.size > 0) {
+      for (const smallID of Array.from(runtime.world.history.keys())) {
+        if (!livingSmallIDs.has(smallID)) {
+          runtime.world.history.delete(smallID);
+        }
+      }
+    }
+    // Also prune diplomacy memory so we don't hold onto stale state for
+    // players that have since died or respawned with a different smallID.
+    const helplessMap = runtime.state.allyHelplessSince;
+    if (helplessMap && helplessMap.size > 0) {
+      for (const smallID of Array.from(helplessMap.keys())) {
+        if (!livingSmallIDs.has(smallID)) helplessMap.delete(smallID);
+      }
+    }
+    const acceptsMap = runtime.state.recentAllianceAccepts;
+    if (acceptsMap && acceptsMap.size > 0) {
+      for (const smallID of Array.from(acceptsMap.keys())) {
+        if (!livingSmallIDs.has(smallID)) acceptsMap.delete(smallID);
       }
     }
   }
@@ -4069,6 +4461,7 @@
     const risingStars = [];
     const softTargets = [];
     const mirvCapable = [];
+    const collapsingTargets = [];
     let inboundTroopTotal = 0;
     let nearestDanger = null;
     let nearestDangerScore = -Infinity;
@@ -4110,6 +4503,53 @@
         entry.isDisconnected ||
         entry.isTraitor;
       if (!entry.isFriendly && relativelyWeak) tags.add("SOFT_TARGET");
+
+      // Collapsing / terrain-rush target.
+      //
+      // Signals that a player/tribe/nation is getting swarmed and is about
+      // to be carved up — we want to recognize this early so we can join
+      // the rush before neighbours eat everything. We classify an entry as
+      // collapsing when it satisfies a combination of:
+      //   - losing tiles fast (negative tilesPerMin),
+      //   - multiple distinct attackers hitting it,
+      //   - weak relative to its maxTroops (can't defend),
+      //   - or already dwindling below a small share of the map.
+      // Tribes are eligible too so we can opportunistically farm them.
+      const distinctAttackers = new Set();
+      for (const atk of entry.incomingAttacks || []) {
+        const attackerId = safeCall(() => atk.attackerID, null);
+        if (attackerId !== null && attackerId !== 0) {
+          distinctAttackers.add(attackerId);
+        }
+      }
+      const attackerCount = distinctAttackers.size;
+      const tileDrop = entry.tilesPerMin < -30;
+      const heavyTileDrop = entry.tilesPerMin < -80;
+      const swarmed = attackerCount >= 2;
+      const heavySwarm = attackerCount >= 3;
+      const lowShare =
+        totals.usableLand > 0 &&
+        entry.tiles > 0 &&
+        entry.tiles / totals.usableLand < 0.08;
+      const heavilyPressured =
+        entry.maxTroops > 0 &&
+        entry.troopRatio < 0.25 &&
+        entry.incomingTroops > entry.troops * 1.2;
+      const collapsing =
+        !entry.isFriendly &&
+        !entry.isMe &&
+        entry.tiles > 0 &&
+        ((tileDrop && swarmed) ||
+          heavyTileDrop ||
+          heavySwarm ||
+          (lowShare && heavilyPressured) ||
+          (heavilyPressured && swarmed));
+      entry.collapsing = collapsing;
+      entry.distinctAttackerCount = attackerCount;
+      if (collapsing) {
+        tags.add("COLLAPSING");
+        collapsingTargets.push(entry);
+      }
 
       // Tribe (bot) with structures: a free-real-estate farm.
       if (entry.type === PlayerType.Bot) {
@@ -4171,11 +4611,18 @@
       entry.strength = strength;
       entry.threatScore = threatScore;
       entry.tags = tags;
+      // Collapsing targets bump opportunity score hard — if someone is
+      // getting swarmed, every neighbour rushes for tiles and we must too.
+      const collapseBoost = tags.has("COLLAPSING")
+        ? 50 + Math.min(20, entry.distinctAttackerCount * 5) +
+          Math.min(20, Math.max(0, -entry.tilesPerMin / 10))
+        : 0;
       entry.opportunityScore =
         (tags.has("SOFT_TARGET") ? 40 : 0) +
         (tags.has("TRIBE_FARM") ? 35 : 0) +
         Math.max(0, 20 - entry.troopRatio * 20) +
-        (tags.has("ADJACENT") ? 15 : 0);
+        (tags.has("ADJACENT") ? 15 : 0) +
+        collapseBoost;
 
       if (
         adjacent &&
@@ -4191,6 +4638,13 @@
     adjacentEnemies.sort((a, b) => b.threatScore - a.threatScore);
     risingStars.sort((a, b) => b.tilesPerMin - a.tilesPerMin);
     softTargets.sort((a, b) => b.opportunityScore - a.opportunityScore);
+    // Collapsing targets: prefer the one we can reach fastest (adjacent
+    // beats non-adjacent), then largest remaining tile count so we grab
+    // the biggest prize before it vanishes.
+    collapsingTargets.sort((a, b) => {
+      if (a.isAdjacent !== b.isAdjacent) return a.isAdjacent ? -1 : 1;
+      return b.tiles - a.tiles;
+    });
 
     // Update crown w/ hysteresis tracking (see Phase 2 acceptance criterion).
     runtime.world.prevCrownSmallID = runtime.world.threats.crownSmallID;
@@ -4200,6 +4654,7 @@
       prevCrownSmallID: runtime.world.threats.crownSmallID,
       risingStars: risingStars.slice(0, 5),
       softTargets: softTargets.slice(0, 5),
+      collapsingTargets: collapsingTargets.slice(0, 5),
       nearestDanger,
       mirvRisk: mirvCapable.length > 0,
       mirvCapable,
@@ -4350,6 +4805,18 @@
       .slice(0, 3)
       .map((s) => s.name)
       .join(",");
+    const collapsing = (runtime.world.threats.collapsingTargets || [])
+      .slice(0, 3)
+      .map(
+        (s) =>
+          s.name +
+          "(" +
+          (s.distinctAttackerCount || 0) +
+          "×," +
+          s.tilesPerMin.toFixed(0) +
+          "/m)",
+      )
+      .join(",");
     const crownStr = crown
       ? crown.name + " " + (runtime.world.totals.crownShare * 100).toFixed(0) + "%"
       : "-";
@@ -4362,6 +4829,8 @@
         (rising || "-") +
         "] soft=[" +
         (soft || "-") +
+        "] collapsing=[" +
+        (collapsing || "-") +
         "]",
     );
   }
@@ -4421,6 +4890,7 @@
       switch (goalId) {
         case "NEUTRALIZE_RISING_STAR":
         case "FARM_TRIBE":
+        case "TERRAIN_RUSH":
         case "NUKE_CROWN":
         case "NAVAL_LAND_GRAB":
           return 12;
@@ -4678,6 +5148,61 @@
       onAct: async () => false,
     },
     {
+      // TERRAIN_RUSH — a neighbouring player/tribe/nation is collapsing
+      // (fast tile loss, multiple attackers). Rush to claim tiles before
+      // everyone else carves them up. Priority scales with how badly the
+      // target is melting so we preempt even strong alternatives.
+      id: "TERRAIN_RUSH",
+      horizonTicks: 90,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const collapsing = world.threats.collapsingTargets || [];
+        if (collapsing.length === 0) return { valid: false };
+        // Must be reachable: adjacent, or we have the naval capacity to
+        // ship troops over. For the adjacency-less case we still allow it
+        // but at lower priority.
+        const adjacentTarget = collapsing.find((e) => e.isAdjacent);
+        const anyReachable =
+          !!adjacentTarget ||
+          collapsing.some(
+            (e) => (me.structures[UnitType.Port] || 0) > 0,
+          );
+        if (!anyReachable) return { valid: false };
+        // Troop gate — we need some attack budget to make the rush worth it.
+        if (me.troopRatio < 0.15 && me.troops < 8000) {
+          return { valid: false };
+        }
+        const chosen = adjacentTarget || collapsing[0];
+        // Dynamic priority: more attackers + faster tile drop = higher
+        // priority. Adjacent beats non-adjacent by a healthy margin.
+        const base = adjacentTarget ? 82 : 60;
+        const swarmBonus = Math.min(
+          10,
+          (chosen.distinctAttackerCount || 0) * 2,
+        );
+        const speedBonus = Math.min(
+          12,
+          Math.max(0, -chosen.tilesPerMin / 15),
+        );
+        return {
+          valid: true,
+          priority: base + swarmBonus + speedBonus,
+          note:
+            "collapsing=" +
+            chosen.name +
+            " attackers=" +
+            (chosen.distinctAttackerCount || 0) +
+            " drop=" +
+            chosen.tilesPerMin.toFixed(0) +
+            "/m" +
+            (adjacentTarget ? "" : " (water)"),
+        };
+      },
+      onAct: async () => false,
+    },
+    {
       id: "TERRA_NULLIUS_RUSH",
       horizonTicks: 60,
       evaluate: () => {
@@ -4798,20 +5323,24 @@
         const world = runtime.world;
         const me = world.me;
         if (!me) return { valid: false };
+        // Respect the alliance-break budget — don't add another traitor
+        // debuff if we already broke something recently.
+        if (allianceBreakBudgetExceeded()) return { valid: false };
+        if (isUnsafeToBreakAlliance(me)) return { valid: false };
         const allies = world.everyone.filter(
           (p) => p.isAlly && !p.isClanmate,
         );
         if (allies.length === 0) return { valid: false };
+        // Only betray allies that are confirmed helpless over time, NOT on a
+        // single transient low-troop snapshot. This matches the tightened
+        // diplomacy heuristic (HELPLESS_CONFIRM_TICKS).
         const target = allies.find(
           (ally) =>
-            ally.troopRatio < 0.2 &&
-            ally.troops < me.troops * 0.6,
+            isAllyConfirmedHelpless(ally, me) &&
+            ally.troops < me.troops * HELPLESS_TROOP_ADVANTAGE,
         );
         if (!target) return { valid: false };
-        // Safety: no superior hostile within manhattan-30.
-        const gameView = getGameView();
-        if (!gameView) return { valid: false };
-        const borderCache = runtime.state.borderCache.tiles;
+        // Safety: no superior hostile nearby.
         const hostile = world.threats.adjacentEnemies.find(
           (e) => e.troops > me.troops * 1.2,
         );
@@ -5104,6 +5633,11 @@
         handled = await runGoal_FarmTribe(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
+      case "TERRAIN_RUSH":
+        handled = await runGoal_TerrainRush(me, borderTiles);
+        if (!handled) handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeExpand(me, borderTiles);
+        break;
       case "NEUTRALIZE_RISING_STAR":
         handled = await runGoal_NeutralizeRisingStar(me);
         if (!handled) handled = await maybeCombat(me, borderTiles);
@@ -5145,6 +5679,7 @@
         "NEUTRALIZE_RISING_STAR",
         "FARM_TRIBE",
         "TERRA_NULLIUS_RUSH",
+        "TERRAIN_RUSH",
         "DIPLOMACY_ISOLATE_CROWN",
       ]);
       if (ECONOMY_SECONDARY_GOALS.has(activeGoalId)) {
@@ -5379,6 +5914,7 @@
     { id: "DEFENSIVE_TURTLE", label: "Turtle" },
     { id: "CONSOLIDATE_FRONT", label: "Hold Front" },
     { id: "TERRA_NULLIUS_RUSH", label: "Rush Empty" },
+    { id: "TERRAIN_RUSH", label: "Terrain Rush" },
     { id: "NAVAL_LAND_GRAB", label: "Naval" },
   ];
 
@@ -5982,6 +6518,22 @@
         },
         { label: "Rising", value: rising },
         {
+          label: "Collapsing",
+          value:
+            (world.threats.collapsingTargets || [])
+              .slice(0, 2)
+              .map(
+                (s) =>
+                  s.name +
+                  " (" +
+                  (s.distinctAttackerCount || 0) +
+                  "×, " +
+                  s.tilesPerMin.toFixed(0) +
+                  "/m)",
+              )
+              .join(", ") || "-",
+        },
+        {
           label: "Danger",
           value: danger
             ? danger.name + " thr=" + danger.threatScore.toFixed(0)
@@ -6215,6 +6767,7 @@
         prevCrownSmallID: null,
         risingStars: [],
         softTargets: [],
+        collapsingTargets: [],
         nearestDanger: null,
         mirvRisk: false,
         mirvCapable: [],
@@ -6420,6 +6973,167 @@
     scenario5.allianceGraph.largestBlocShare = 0.5;
     scenario5.bySmallID.set(2, { tiles: 5000 });
     step("coalition>=45% -> MIRV_LAST_RESORT", scenario5, "MIRV_LAST_RESORT");
+
+    // Scenario 7: TERRAIN_RUSH — neighbour collapsing, adjacent to us.
+    // Multiple attackers + tile-loss velocity should trigger the goal.
+    const scenario7 = buildTestWorld();
+    const rushTarget = {
+      smallID: 3,
+      name: "Doomed",
+      tiles: 600,
+      troops: 5000,
+      maxTroops: 50_000,
+      troopRatio: 0.1,
+      isAdjacent: true,
+      isFriendly: false,
+      isMe: false,
+      type: PlayerType.Human,
+      tilesPerMin: -120,
+      distinctAttackerCount: 3,
+      incomingTroops: 40_000,
+      incomingAttacks: [],
+      outgoingAttacks: [],
+      structures: {},
+      structureLevels: {},
+      tags: new Set(["COLLAPSING", "ENEMY", "ADJACENT"]),
+    };
+    scenario7.threats.collapsingTargets = [rushTarget];
+    step(
+      "neighbour collapsing + adjacent -> TERRAIN_RUSH",
+      scenario7,
+      "TERRAIN_RUSH",
+    );
+
+    // Scenario 8: TERRAIN_RUSH should NOT trigger when there is nothing
+    // collapsing (defensive regression — we don't want it to always win).
+    const scenario8 = buildTestWorld();
+    // Nothing collapsing — planner should fall back to SAM_WALL_BUILDUP
+    // (default economy state at myShare~0.15, crown~0.18 lands on IDLE
+    // since we're below the 25% threshold).
+    // Just assert it doesn't pick TERRAIN_RUSH.
+    const prevResultsLen = results.length;
+    step(
+      "no collapsing target -> not TERRAIN_RUSH",
+      scenario8,
+      // Accept whichever goal wins as long as it isn't TERRAIN_RUSH.
+      // We set expected=null and validate below by editing the last
+      // result entry's `pass` flag.
+      null,
+    );
+    // Patch up the expectation: pass = actualId !== "TERRAIN_RUSH".
+    const lastResult = results[results.length - 1];
+    lastResult.expected = "!TERRAIN_RUSH";
+    lastResult.pass = lastResult.actual !== "TERRAIN_RUSH";
+
+    // Scenario 9: accept incoming alliance request from a strong neutral
+    // partner. `shouldAcceptIncomingAlliance` is a pure helper so we can
+    // unit-test it directly — we don't need the full planner here.
+    const scenario9 = buildTestWorld();
+    const partner = {
+      smallID: 4,
+      name: "Friend",
+      type: PlayerType.Human,
+      isAdjacent: true,
+      isAlly: false,
+      isMe: false,
+      isClanmate: false,
+      isTraitor: false,
+      isFriendly: false,
+      troops: 60_000,
+      tiles: 1800,
+      strength: 90_000,
+      outgoingAttacks: [],
+      player: {
+        relation: () => 1,
+        isTraitor: () => false,
+      },
+    };
+    scenario9.everyone = [scenario9.me, partner];
+    scenario9.bySmallID = new Map([
+      [1, scenario9.me],
+      [4, partner],
+    ]);
+    runtime.world = scenario9;
+    const accept = shouldAcceptIncomingAlliance(partner, scenario9.me);
+    results.push({
+      name: "accept incoming alliance from strong neutral partner",
+      expected: "true",
+      actual: String(accept),
+      pass: accept === true,
+    });
+
+    // Scenario 10: reject incoming alliance from weak partner with no
+    // strategic value (too weak, not bordering crown, not strong ally slot).
+    const scenario10 = buildTestWorld();
+    const weakRequestor = {
+      smallID: 5,
+      name: "Weakling",
+      type: PlayerType.Human,
+      isAdjacent: false,
+      isAlly: false,
+      isMe: false,
+      isClanmate: false,
+      isTraitor: false,
+      isFriendly: false,
+      troops: 2_000,
+      tiles: 100,
+      strength: 2_500,
+      outgoingAttacks: [],
+      player: {
+        relation: () => 0,
+        isTraitor: () => false,
+      },
+    };
+    scenario10.everyone = [scenario10.me, weakRequestor];
+    scenario10.bySmallID = new Map([
+      [1, scenario10.me],
+      [5, weakRequestor],
+    ]);
+    runtime.world = scenario10;
+    const rejectWeak = shouldAcceptIncomingAlliance(weakRequestor, scenario10.me);
+    results.push({
+      name: "reject incoming alliance from weak non-strategic partner",
+      expected: "false",
+      actual: String(rejectWeak),
+      pass: rejectWeak === false,
+    });
+
+    // Scenario 11: alliance-break budget throttles rapid successive breaks.
+    const scenario11 = buildTestWorld();
+    runtime.world = scenario11;
+    const preBudget = allianceBreakBudgetExceeded();
+    recordAllianceBreak();
+    const postBudget = allianceBreakBudgetExceeded();
+    results.push({
+      name:
+        "alliance-break budget: idle=false, after 1 break (cap=1) =true",
+      expected: "false,true",
+      actual: preBudget + "," + postBudget,
+      pass: preBudget === false && postBudget === true,
+    });
+    // Reset the mutated state so we don't leak into later tests.
+    runtime.state.recentAllianceBreakTicks = [];
+    runtime.state.cooldowns.allianceBreak = -999;
+
+    // Scenario 12: unsafe-to-break when under heavy attack.
+    const scenario12 = buildTestWorld();
+    scenario12.threats.adjacentEnemies = [
+      {
+        smallID: 99,
+        name: "Bully",
+        troops: scenario12.me.troops * 2,
+        isFriendly: false,
+      },
+    ];
+    runtime.world = scenario12;
+    const unsafe = isUnsafeToBreakAlliance(scenario12.me);
+    results.push({
+      name: "isUnsafeToBreakAlliance -> true when superior hostile adjacent",
+      expected: "true",
+      actual: String(unsafe),
+      pass: unsafe === true,
+    });
+    runtime.world = previous;
 
     // Scenario 6: parabolic SAM check should mark fewer trajectories as
     // intercepted than the linear approximation when the SAM sits on the
