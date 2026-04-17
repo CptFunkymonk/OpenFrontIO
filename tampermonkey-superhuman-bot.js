@@ -2044,27 +2044,53 @@
         false,
       );
 
+    // Phase 6.12: count caps scale per archetype while keeping the
+    // baseline cities >= floor(tiles/3500).
+    const archetype = runtime.world.archetype || "CONTINENTAL";
+    const factoryCoef =
+      archetype === "ISLAND"
+        ? (hasCoast ? 0.55 : 0.9)
+        : archetype === "NUKE_RACE"
+          ? (hasCoast ? 0.45 : 0.85)
+          : archetype === "CHOKE_HEAVY" || archetype === "ARENA"
+            ? (hasCoast ? 0.3 : 0.6)
+            : (hasCoast ? 0.4 : 0.75);
+    const portCoef =
+      archetype === "ISLAND" ? 0.9 : archetype === "CHOKE_HEAVY" ? 0.4 : 0.6;
+    const dpCoef =
+      archetype === "CHOKE_HEAVY" || archetype === "ARENA"
+        ? 0.75
+        : archetype === "ISLAND"
+          ? 0.35
+          : 0.5;
+    const samCoef =
+      archetype === "NUKE_RACE"
+        ? 0.35
+        : archetype === "CHOKE_HEAVY"
+          ? 0.2
+          : 0.25;
+    const siloCoef = archetype === "NUKE_RACE" ? 0.3 : 0.22;
+    const siloCap = archetype === "NUKE_RACE" ? 4 : 3;
+
     switch (type) {
       case UnitType.City:
         return count < Math.max(2, Math.floor(me.numTilesOwned() / 3500));
       case UnitType.Factory:
-        return (
-          count < Math.max(1, Math.floor(cities * (hasCoast ? 0.4 : 0.75)))
-        );
+        return count < Math.max(1, Math.floor(cities * factoryCoef));
       case UnitType.Port:
-        return hasCoast && count < Math.max(1, Math.floor(cities * 0.6));
+        return hasCoast && count < Math.max(1, Math.floor(cities * portCoef));
       case UnitType.DefensePost:
         return (
-          enemies.length > 0 && count < Math.max(2, Math.floor(cities * 0.5))
+          enemies.length > 0 && count < Math.max(2, Math.floor(cities * dpCoef))
         );
       case UnitType.MissileSilo:
         return (
           nukesEnabled &&
           cities >= 2 &&
-          count < Math.min(3, Math.max(1, Math.floor(cities * 0.22)))
+          count < Math.min(siloCap, Math.max(1, Math.floor(cities * siloCoef)))
         );
       case UnitType.SAMLauncher:
-        return cities >= 2 && count < Math.max(1, Math.floor(cities * 0.25));
+        return cities >= 2 && count < Math.max(1, Math.floor(cities * samCoef));
       default:
         return false;
     }
@@ -3420,10 +3446,27 @@
       }
     }
 
-    // 4. Break alliances with disconnected / traitor allies.
+    // 4. Break alliances with disconnected / traitor / helpless allies.
+    // `helpless` mirrors NationAllianceBehavior.maybeBetray: ally troops
+    // < 20% maxTroops AND we are significantly stronger. We only break —
+    // not attack — via this diplomacy pass; actual betrayal+attack is gated
+    // by `runGoal_BetrayAlly` with its stricter safety checks.
     for (const ally of currentAllies) {
-      if (ally.isClanmate) continue; // never break with clan.
-      if (!ally.isDisconnected && !ally.isTraitor) continue;
+      if (ally.isClanmate) continue;
+      const helpless =
+        ally.troopRatio < 0.2 &&
+        myEntry &&
+        ally.troops < myEntry.troops * 0.5;
+      // Skip helpless-breakage if a superior hostile is nearby (traitor
+      // debuff would be exploited) or any MIRV-capable enemy is alive.
+      const unsafeContext =
+        runtime.world.threats.adjacentEnemies.some(
+          (e) => e.troops > (myEntry ? myEntry.troops : 0) * 1.2,
+        ) ||
+        runtime.world.threats.mirvCapable.some((p) => !p.isFriendly);
+      if (!ally.isDisconnected && !ally.isTraitor && !(helpless && !unsafeContext)) {
+        continue;
+      }
       const tile = gatherStructureTiles(ally.player)[0];
       if (!tile) continue;
       const actions = await queryPlayerActions(tile, null);
@@ -3437,7 +3480,12 @@
           reasonLog(
             "DIPLOMACY_ISOLATE_CROWN",
             "break alliance",
-            ally.name + (ally.isTraitor ? " is traitor" : " disconnected"),
+            ally.name +
+              (ally.isTraitor
+                ? " is traitor"
+                : ally.isDisconnected
+                  ? " disconnected"
+                  : " helpless"),
             "free up alliance slot",
           );
           return true;
