@@ -1150,6 +1150,34 @@
     );
   }
 
+  /**
+   * Validate that a boat from `spawnTile` to `dst` is within our current
+   * boat-distance budget. Used by every goal that can send boats — without
+   * this, long cross-map early-game invasions tank our economy.
+   */
+  function isBoatWithinRange(gameView, me, spawnTile, dst) {
+    if (spawnTile === false || spawnTile === null || spawnTile === undefined) {
+      return false;
+    }
+    const limit = getBoatDistanceLimit(gameView, me);
+    if (!Number.isFinite(limit)) return true;
+    const dist = safeCall(() => gameView.manhattanDist(spawnTile, dst), Infinity);
+    return dist <= limit;
+  }
+
+  /**
+   * Early-game gate — forbid any naval invasions while we're still bootstrapping
+   * (tiny map share and short match time). Long boats during this window
+   * starve land expansion and cost us the early game. Callers should skip any
+   * naval intent when this returns true.
+   */
+  function isTooEarlyForNaval(gameView, me) {
+    const activeTicks = getActiveMatchTicks(gameView);
+    const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
+    const mapShare = me.numTilesOwned() / totalLand;
+    return activeTicks < 1800 && mapShare < 0.05;
+  }
+
   function getBoatDistanceLimit(gameView, me) {
     const activeTicks = getActiveMatchTicks(gameView);
     const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
@@ -1169,9 +1197,12 @@
       return 120;
     }
     if (mapShare >= 0.1 || activeTicks >= 7200) {
-      return 80;
+      return 72;
     }
-    return 48;
+    if (mapShare >= 0.06 || activeTicks >= 4200) {
+      return 40;
+    }
+    return 24;
   }
 
   function countUnownedLandNear(tile, radius) {
@@ -2183,6 +2214,42 @@
   }
 
   /**
+   * True iff `tile` sits within `radius` of (or directly borders) a Human
+   * player's territory. Used to gate DefensePost placement so we only harden
+   * borders that face actual player threats — not Nations or tribes (Bots),
+   * which don't meaningfully attack us in a way that DefensePosts counter.
+   */
+  function isTileNearHumanBorder(me, tile, radius = 3) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const mySmallID = me.smallID();
+
+    const seen = new Set();
+    for (const neighbor of gameView.circleSearch(tile, radius)) {
+      const ownerID = gameView.ownerID(neighbor);
+      if (!ownerID || ownerID === 0 || ownerID === mySmallID) continue;
+      if (seen.has(ownerID)) continue;
+      seen.add(ownerID);
+      const owner = safeCall(() => gameView.playerBySmallID(ownerID), null);
+      if (!owner || !safeCall(() => owner.isPlayer(), false)) continue;
+      if (safeCall(() => owner.type(), null) !== PlayerType.Human) continue;
+      if (safeCall(() => me.isFriendly(owner), false)) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Filter a candidate-tile list down to tiles that sit near a Human-player
+   * border. If nothing qualifies we return an empty list — the caller should
+   * skip the build rather than plopping a DefensePost against a tribe/nation.
+   */
+  function filterHumanBorderTiles(me, tiles) {
+    if (!tiles || tiles.length === 0) return [];
+    return tiles.filter((tile) => isTileNearHumanBorder(me, tile));
+  }
+
+  /**
    * Archetype-biased build order. ISLAND favors navy/economy, CHOKE_HEAVY
    * favors defense, NUKE_RACE favors offensive infrastructure, CONTINENTAL
    * keeps the historical balanced order.
@@ -2294,11 +2361,22 @@
     const order = buildOrderForArchetype(runtime.world.archetype);
     for (const type of order) {
       if (!shouldBuildType(type, me, enemies)) continue;
-      // Factory/City placement benefits from rail connectivity awareness.
-      const tiles =
-        type === UnitType.Factory || type === UnitType.City
-          ? connectivityBiasedTiles(me, candidateTiles)
-          : candidateTiles;
+      let tiles;
+      if (type === UnitType.Factory || type === UnitType.City) {
+        // Factory/City placement benefits from rail connectivity awareness.
+        tiles = connectivityBiasedTiles(me, candidateTiles);
+      } else if (type === UnitType.DefensePost) {
+        // Only place DefensePosts on borders with actual Human players —
+        // they do nothing useful against Nations/Bots in the early game
+        // and just waste gold that should fund expansion.
+        tiles = filterHumanBorderTiles(me, candidateTiles);
+        if (tiles.length === 0) {
+          decisionLog("economy: skip DefensePost (no human border)");
+          continue;
+        }
+      } else {
+        tiles = candidateTiles;
+      }
       const built = await tryBuildStructure(type, tiles);
       if (built) {
         runtime.state.cooldowns.economy = tick;
@@ -2327,6 +2405,11 @@
     const gameView = getGameView();
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.naval < 36) return false;
+
+    if (isTooEarlyForNaval(gameView, me)) {
+      decisionLog("naval: early game, focusing on land expansion");
+      return false;
+    }
 
     const currentBoats = getUnitEntityCount(me, UnitType.TransportShip);
     if (currentBoats >= gameView.config().boatMaxNumber()) {
@@ -2773,7 +2856,9 @@
       }
     }
 
-    // Build DefensePosts at pressured borders.
+    // Build DefensePosts at pressured borders — but only borders that
+    // actually face a Human player. Defending a tribe/nation border with a
+    // DefensePost is wasted gold.
     const me2 = runtime.world.me;
     const cityCount = me2 ? me2.structures[UnitType.City] : 0;
     const dpCount = me2 ? me2.structures[UnitType.DefensePost] : 0;
@@ -2782,7 +2867,13 @@
       dpCount < dpTarget &&
       tick - runtime.state.cooldowns.economy >= 25
     ) {
-      const candidates = getOwnedCandidateTiles(me, 16);
+      const candidates = filterHumanBorderTiles(
+        me,
+        getOwnedCandidateTiles(me, 16),
+      );
+      if (candidates.length === 0) {
+        decisionLog("defensive-turtle: skip DefensePost (no human border)");
+      }
       for (const tile of candidates) {
         const buildables = await queryPlayerBuildables(tile, [
           UnitType.DefensePost,
@@ -3032,10 +3123,12 @@
       }
 
       // Non-adjacent — try a boat so we still claim some of their coast.
+      if (isTooEarlyForNaval(gameView, me)) continue;
       const landingTile = gatherStructureTiles(target.player)[0];
       if (!landingTile) continue;
       const spawn = await queryTransportShipSpawn(landingTile);
       if (spawn === false) continue;
+      if (!isBoatWithinRange(gameView, me, spawn, landingTile)) continue;
       const boatTroops = Math.min(
         troops,
         Math.floor(me.troops() * 0.35),
@@ -3147,11 +3240,15 @@
         return true;
       }
     } else {
-      // Boat retaliation if they aren't bordering us.
+      // Boat retaliation if they aren't bordering us. Skip in early game and
+      // beyond our current boat-distance budget so we don't waste troops on
+      // long-range ships while we still need to expand on land.
+      if (isTooEarlyForNaval(gameView, me)) return false;
       const target = gatherStructureTiles(attacker)[0];
       if (!target) return false;
       const spawnTile = await queryTransportShipSpawn(target);
       if (spawnTile === false) return false;
+      if (!isBoatWithinRange(gameView, me, spawnTile, target)) return false;
       if (sendBoat(target, troops)) {
         runtime.state.cooldowns.combat = tick;
         runtime.state.cooldowns.naval = tick;
@@ -3209,10 +3306,12 @@
       return false;
     }
 
+    if (isTooEarlyForNaval(gameView, me)) return false;
     const landingTile = gatherStructureTiles(target.player)[0];
     if (!landingTile) return false;
     const spawn = await queryTransportShipSpawn(landingTile);
     if (spawn === false) return false;
+    if (!isBoatWithinRange(gameView, me, spawn, landingTile)) return false;
     if (sendBoat(landingTile, Math.min(required, Math.floor(me.troops() * 0.35)))) {
       runtime.state.cooldowns.combat = tick;
       runtime.state.cooldowns.naval = tick;
@@ -3240,14 +3339,22 @@
     const borderTiles = runtime.state.borderCache.tiles;
     if (borderTiles.length === 0) return false;
 
-    // Build a bias: tiles adjacent to our top adjacent enemy get tried first.
-    const adjacent = runtime.world.threats.adjacentEnemies[0];
+    // Build a bias: tiles adjacent to our top adjacent **Human** enemy get
+    // tried first. We explicitly skip Nations/Bots — DefensePosts are for
+    // deterring real players, not tribes/AI that won't sustainably pressure
+    // our border anyway.
+    const adjacent = runtime.world.threats.adjacentEnemies.find(
+      (e) => e && e.type === PlayerType.Human,
+    );
+    if (!adjacent) {
+      decisionLog("consolidate-front: skip DefensePost (no human on border)");
+      return false;
+    }
     // 1-deep interior candidates — step one neighbor inward from a border
     // tile that touches the threat. Mirrors
     // `NationStructureBehavior.defensePostValue` which prefers a band one
     // inside the border.
     const borderAdjacent = borderTiles.filter((t) => {
-      if (!adjacent) return true;
       return gameView.neighbors(t).some(
         (n) => gameView.ownerID(n) === adjacent.smallID,
       );
@@ -3279,9 +3386,7 @@
         reasonLog(
           "CONSOLIDATE_FRONT",
           "build DefensePost",
-          adjacent
-            ? "pressured by " + adjacent.name
-            : "inbound attack",
+          "pressured by " + adjacent.name,
           "harden pressured border",
         );
         return true;
@@ -3301,6 +3406,8 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.naval < 30) return false;
 
+    if (isTooEarlyForNaval(gameView, me)) return false;
+
     if (
       getUnitEntityCount(me, UnitType.TransportShip) >=
       gameView.config().boatMaxNumber()
@@ -3317,7 +3424,7 @@
       const target = findUncontestedIslandSeed(gameView);
       if (target) {
         const spawn = await queryTransportShipSpawn(target);
-        if (spawn !== false) {
+        if (spawn !== false && isBoatWithinRange(gameView, me, spawn, target)) {
           const troops = clamp(Math.floor(available * 0.25), 6000, 20000);
           if (sendBoat(target, troops)) {
             runtime.state.cooldowns.naval = tick;
@@ -3351,6 +3458,7 @@
     for (const candidate of candidates.slice(0, 8)) {
       const spawn = await queryTransportShipSpawn(candidate);
       if (spawn === false) continue;
+      if (!isBoatWithinRange(gameView, me, spawn, candidate)) continue;
       const troops = clamp(Math.floor(available * 0.3), 8000, 30000);
       if (sendBoat(candidate, troops)) {
         runtime.state.cooldowns.naval = tick;
@@ -7281,6 +7389,19 @@
           });
         }
         return out;
+      },
+      /**
+       * Expose internal helpers so the regression test file can exercise the
+       * early-game / human-border guards directly without spinning up the full
+       * planner loop.
+       */
+      internals: {
+        getBoatDistanceLimit,
+        isTooEarlyForNaval,
+        isBoatWithinRange,
+        isTileNearHumanBorder,
+        filterHumanBorderTiles,
+        PlayerType,
       },
     };
     installWebSocketHook();
