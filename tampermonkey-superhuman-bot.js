@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.5.0
+// @version      2.5.1
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -13,7 +13,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.5.0";
+  const BOT_VERSION = "2.5.1";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -308,10 +308,18 @@
   }
 
   /**
-   * Record a structured "why we did that" entry. Keep the message short and
-   * the trigger/outcome fields readable at a glance in the overlay.
+   * Record a structured "why we did that" entry.
+   *
+   *   reasonLog(goalId, summary, detail?)
+   *
+   * - `summary` is the single plain-English sentence the user should see in
+   *   the overlay ("Hitting tribe for free structures"). Keep it to <=80
+   *   chars, no jargon, no variable-name-style tokens.
+   * - `detail` (optional) is a small data string for power users that shows
+   *   below the summary in a dim font ("~12k defending", "48 tile segment").
+   *   Leave it empty when the summary already says it all.
    */
-  function reasonLog(goalId, action, trigger, outcome) {
+  function reasonLog(goalId, summary, detail) {
     const tick =
       runtime.hooks.gameView &&
       typeof runtime.hooks.gameView.ticks === "function"
@@ -320,18 +328,16 @@
     const entry = {
       tick,
       goalId: goalId || "-",
-      action: action || "-",
-      trigger: trigger || "",
-      outcome: outcome || "",
+      summary: summary || "-",
+      detail: detail || "",
     };
     runtime.reasons.push(entry);
     if (runtime.reasons.length > MAX_REASON_ENTRIES) {
       runtime.reasons.shift();
     }
     decisionLog(
-      "[" + entry.goalId + "] " + entry.action +
-      (entry.trigger ? " | because " + entry.trigger : "") +
-      (entry.outcome ? ", expect " + entry.outcome : "")
+      "[" + entry.goalId + "] " + entry.summary +
+      (entry.detail ? " (" + entry.detail + ")" : ""),
     );
   }
 
@@ -1992,9 +1998,8 @@
     runtime.state.strategy = "expansion";
     reasonLog(
       "TERRA_NULLIUS_RUSH",
-      "land grab",
-      `best segment: size=${best.size} fallout=${best.falloutCount} crowded=${best.crowdedEnemyBorders}`,
-      `claim ~${best.size} tiles`,
+      "Grabbing unclaimed land to grow income and pop cap.",
+      `~${best.size} tiles, ${best.falloutCount} irradiated, ${best.crowdedEnemyBorders} rival borders`,
     );
     botLog("Expand -> " + fmtTroops(troops) + " troops");
     return true;
@@ -2750,9 +2755,8 @@
     runtime.state.cooldowns.nuke = tick;
     reasonLog(
       "MIRV_LAST_RESORT",
-      "build MIRV",
-      `crown=${crown.name} share=${(runtime.world.totals.crownShare * 100).toFixed(0)}%`,
-      "saturate blast radius, reset map dynamics",
+      `Launching a MIRV at ${crown.name} to break the runaway leader.`,
+      `they own ${(runtime.world.totals.crownShare * 100).toFixed(0)}% of the map`,
     );
     return true;
   }
@@ -2861,16 +2865,8 @@
       runtime.state.cooldowns.nuke = tick;
       reasonLog(
         "SAM_OVERWHELM",
-        "atom salvo",
-        fired +
-          " bombs vs " +
-          coveringSams.length +
-          " SAMs (levels sum=" +
-          totalCapacity +
-          ", window=" +
-          arrivalBudget +
-          "t)",
-        "burn the SAM wall before hydro follow-up",
+        "Firing an atom salvo to overwhelm their SAM wall before a bigger nuke.",
+        `${fired} bombs vs ${coveringSams.length} SAMs (capacity ${totalCapacity})`,
       );
       return true;
     }
@@ -2893,9 +2889,7 @@
           runtime.state.cooldowns.economy = tick;
           reasonLog(
             "DEFENSIVE_TURTLE",
-            "upgrade " + type,
-            "lock in crown lead",
-            "denser defense and nuke deterrent",
+            `Upgrading ${type} to lock in our lead.`,
           );
           return true;
         }
@@ -2932,9 +2926,8 @@
           runtime.state.cooldowns.economy = tick;
           reasonLog(
             "DEFENSIVE_TURTLE",
-            "build DefensePost",
-            `dpCount=${dpCount}/${dpTarget}`,
-            "harden pressured border",
+            "Hardening our border against a human neighbour.",
+            `${dpCount + 1}/${dpTarget} defense posts`,
           );
           return true;
         }
@@ -2966,9 +2959,7 @@
           runtime.state.cooldowns.economy = tick;
           reasonLog(
             "SAM_WALL_BUILDUP",
-            "upgrade SAM",
-            "pre-crown nuke defense",
-            "raise SAM level",
+            "Upgrading a SAM so we can survive incoming nukes.",
           );
           return true;
         }
@@ -2978,9 +2969,7 @@
           runtime.state.cooldowns.economy = tick;
           reasonLog(
             "SAM_WALL_BUILDUP",
-            "build SAM",
-            "pre-crown nuke defense",
-            "extend coverage",
+            "Building a new SAM to cover our structures before we hit crown size.",
           );
           return true;
         }
@@ -3019,9 +3008,8 @@
     runtime.state.cooldowns.combat = tick;
     reasonLog(
       "BETRAY_ALLY",
-      "break + attack ally",
-      `ally=${target.name} troopRatio=${(target.troopRatio * 100).toFixed(0)}%`,
-      "grab territory before recovery",
+      `Breaking with ${target.name} — they're too weak to defend, so we take their land.`,
+      `ally troops at ${(target.troopRatio * 100).toFixed(0)}% of cap`,
     );
     return true;
   }
@@ -3064,11 +3052,10 @@
         runtime.state.cooldowns.warship = tick;
         reasonLog(
           "WARSHIP_DEFENSE",
-          "build Warship",
+          "Building a warship to patrol our coast and intercept enemy boats.",
           runtime.world.archetype === "ISLAND"
-            ? "island archetype — pirates loom"
+            ? "island map — pirates hit hard here"
             : "enemy warships spotted",
-          "patrol coast, protect trade, deter boats",
         );
         return true;
       }
@@ -3154,14 +3141,8 @@
           runtime.state.strategy = "terrain-rush";
           reasonLog(
             "TERRAIN_RUSH",
-            "land attack",
-            target.name +
-              " collapsing: " +
-              (target.distinctAttackerCount || 0) +
-              " attackers, " +
-              target.tilesPerMin.toFixed(0) +
-              " tiles/min",
-            "grab tiles before neighbours do",
+            `Rushing ${target.name} while they're collapsing — claim tiles before neighbours do.`,
+            `${target.distinctAttackerCount || 0} attackers, losing ${target.tilesPerMin.toFixed(0)} tiles/min`,
           );
           return true;
         }
@@ -3187,9 +3168,7 @@
         runtime.state.strategy = "terrain-rush";
         reasonLog(
           "TERRAIN_RUSH",
-          "boat attack",
-          target.name + " across water, collapsing",
-          "plant boots on coast to claim tiles",
+          `Landing a boat on ${target.name}'s coast while they're collapsing.`,
         );
         return true;
       }
@@ -3222,9 +3201,8 @@
       runtime.state.cooldowns.combat = tick;
       reasonLog(
         "FARM_TRIBE",
-        "land attack",
-        "tribe=" + tribe.name + " ~" + fmtTroops(tribe.troops) + " defending",
-        "seize structures before they delete",
+        `Attacking tribe ${tribe.name} to seize their structures before they delete them.`,
+        `~${fmtTroops(tribe.troops)} defending`,
       );
       return true;
     }
@@ -3279,9 +3257,8 @@
         runtime.state.cooldowns.combat = tick;
         reasonLog(
           "RETALIATION",
-          "land attack",
-          attackerEntry.name + " sent " + fmtTroops(largest.troops) + " at us",
-          "break their expansion",
+          `Counter-attacking ${attackerEntry.name} to break their push.`,
+          `they sent ~${fmtTroops(largest.troops)} at us`,
         );
         return true;
       }
@@ -3300,9 +3277,7 @@
         runtime.state.cooldowns.naval = tick;
         reasonLog(
           "RETALIATION",
-          "boat attack",
-          attackerEntry.name + " not adjacent — transport",
-          "punish across water",
+          `Sending a boat to punish ${attackerEntry.name} across the water.`,
         );
         return true;
       }
@@ -3343,9 +3318,8 @@
         runtime.state.cooldowns.combat = tick;
         reasonLog(
           "NEUTRALIZE_RISING_STAR",
-          "land attack",
-          target.name + " +" + target.tilesPerMin.toFixed(0) + " tiles/min",
-          "blunt their snowball before they crown",
+          `Pre-empting ${target.name} before their snowball crowns.`,
+          `gaining ${target.tilesPerMin.toFixed(0)} tiles/min`,
         );
         return true;
       }
@@ -3363,9 +3337,7 @@
       runtime.state.cooldowns.naval = tick;
       reasonLog(
         "NEUTRALIZE_RISING_STAR",
-        "boat attack",
-        target.name + " across water",
-        "pre-empt crown rival",
+        `Sending a boat to pre-empt crown rival ${target.name} across water.`,
       );
       return true;
     }
@@ -3431,9 +3403,7 @@
         runtime.state.cooldowns.economy = tick;
         reasonLog(
           "CONSOLIDATE_FRONT",
-          "build DefensePost",
-          "pressured by " + adjacent.name,
-          "harden pressured border",
+          `Hardening the front under pressure from ${adjacent.name}.`,
         );
         return true;
       }
@@ -3476,9 +3446,7 @@
             runtime.state.cooldowns.naval = tick;
             reasonLog(
               "NAVAL_LAND_GRAB",
-              "boat to empty island",
-              "ISLAND archetype uncontested land",
-              "claim free tiles",
+              "Shipping troops to an empty island to claim free tiles.",
             );
             return true;
           }
@@ -3510,9 +3478,7 @@
         runtime.state.cooldowns.naval = tick;
         reasonLog(
           "NAVAL_LAND_GRAB",
-          "boat invasion",
-          target.name + " (soft target across water)",
-          "steal structures and tiles",
+          `Invading ${target.name} by sea — they're soft and across the water.`,
         );
         return true;
       }
@@ -3852,9 +3818,8 @@
           runtime.state.cooldowns.diplomacy = tick;
           reasonLog(
             "DIPLOMACY_ISOLATE_CROWN",
-            "alliance request",
-            "clanmate [" + (clanmate.clanTag || "?") + "] " + clanmate.name,
-            "lock in auto-ally",
+            `Auto-allying with clanmate ${clanmate.name}.`,
+            clanmate.clanTag ? `clan tag [${clanmate.clanTag}]` : "",
           );
           return true;
         }
@@ -3891,10 +3856,8 @@
         runtime.state.recentAllianceAccepts.set(requestor.smallID, tick);
         reasonLog(
           "DIPLOMACY_ISOLATE_CROWN",
-          "accept alliance",
-          "incoming request from " + requestor.name +
-            " (troops=" + fmtTroops(requestor.troops) + ")",
-          "lock in mutual ally",
+          `Accepting ${requestor.name}'s alliance request.`,
+          `their troops ~${fmtTroops(requestor.troops)}`,
         );
         return true;
       }
@@ -3939,9 +3902,7 @@
           runtime.state.cooldowns.diplomacy = tick;
           reasonLog(
             "DIPLOMACY_ISOLATE_CROWN",
-            "alliance request",
-            "ally=" + candidate.name + " borders crown",
-            "recruit partner vs crown",
+            `Asking ${candidate.name} to ally — they border the crown and can pressure them.`,
           );
           return true;
         }
@@ -3967,9 +3928,8 @@
             runtime.state.cooldowns.diplomacy = tick;
             reasonLog(
               "DIPLOMACY_ISOLATE_CROWN",
-              "embargo",
-              "crown=" + crown.name + " " + (crownShare * 100).toFixed(0) + "%",
-              "deny trade revenue",
+              `Embargoing ${crown.name} to deny them trade revenue.`,
+              `they own ${(crownShare * 100).toFixed(0)}% of the map`,
             );
             return true;
           }
@@ -4012,9 +3972,7 @@
           recordAllianceBreak();
           reasonLog(
             "DIPLOMACY_ISOLATE_CROWN",
-            "break alliance",
-            ally.name + " — " + reason,
-            "free up alliance slot (safe context)",
+            `Dropping ${ally.name} — ${reason}. Freeing the alliance slot.`,
           );
           return true;
         }
@@ -5729,8 +5687,7 @@
       planner.lastSwitchTick = tick;
       reasonLog(
         selection.spec.id,
-        "select",
-        "plan switch from " + previous,
+        `Switching plan: ${previous} → ${selection.spec.id}.`,
         selection.evaluation.note,
       );
     } else {
@@ -6833,12 +6790,9 @@
             (entry) =>
               `<div class="superbot-reason">` +
               `<div><span class="head">T${entry.tick} [${escapeHtml(entry.goalId)}]</span> ` +
-              `<span class="tail">${escapeHtml(entry.action)}</span></div>` +
-              (entry.trigger
-                ? `<div class="tail">because ${escapeHtml(entry.trigger)}</div>`
-                : "") +
-              (entry.outcome
-                ? `<div class="tail">expect ${escapeHtml(entry.outcome)}</div>`
+              `<span class="tail">${escapeHtml(entry.summary)}</span></div>` +
+              (entry.detail
+                ? `<div class="tail">${escapeHtml(entry.detail)}</div>`
                 : "") +
               `</div>`,
           )
@@ -7519,6 +7473,7 @@
         filterHumanBorderTiles,
         shouldBuildType,
         buildOrderForArchetype,
+        reasonLog,
         UnitType,
         PlayerType,
         BOT_VERSION,
