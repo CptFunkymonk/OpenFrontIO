@@ -458,3 +458,142 @@ describe("tampermonkey-superhuman-bot RL Decision Logger — match end", () => {
     ).toBe(1);
   });
 });
+
+describe("tampermonkey-superhuman-bot RL Decision Logger — end-to-end smoke", () => {
+  beforeEach(() => resetRl(loadUserscript()));
+
+  it("produces every expected event kind over a simulated match lifecycle", () => {
+    const runtime = loadUserscript();
+    const {
+      rlLog,
+      buildConfigSnapshot,
+      rlLogIntentSent,
+      drainRlOutcomes,
+      maybeEmitPlannerDecision,
+      handleMatchEnd,
+      dumpRlJson,
+    } = runtime.test.internals;
+
+    // ----- match_start + config_snapshot -----
+    runtime.identity.gameID = "SMOKE-1";
+    runtime.identity.clientID = "client-smoke";
+    runtime.hooks.gameView = {
+      ticks: () => 0,
+      x: (t: number) => t % 50,
+      y: (t: number) => Math.floor(t / 50),
+    };
+    rlLog("match_start", {
+      gameID: runtime.identity.gameID,
+      clientID: runtime.identity.clientID,
+      botVersion: "2.6.0",
+    });
+    rlLog("config_snapshot", buildConfigSnapshot());
+
+    // ----- planner_decision (two goals scored) -----
+    runtime.planner.lastEvaluation = [
+      {
+        id: "TERRA_NULLIUS_RUSH",
+        priority: 72,
+        valid: true,
+        note: "12% unowned",
+      },
+      { id: "EASY_NATION_GRAB", priority: 63, valid: true, note: "weak nation" },
+      { id: "NUKE_CROWN", priority: 0, valid: false, note: "no crown" },
+    ];
+    maybeEmitPlannerDecision({
+      spec: { id: "TERRA_NULLIUS_RUSH" },
+      evaluation: { priority: 72, note: "12% unowned" },
+      forced: false,
+    });
+
+    // ----- intent_sent + intent_outcome -----
+    runtime.world.me = {
+      tiles: 100,
+      troops: 5000,
+      gold: 100,
+      troopRatio: 0.5,
+      structures: {},
+      structureLevels: {},
+    };
+    runtime.world.bySmallID = new Map();
+    runtime.hooks.gameView.ticks = () => 120;
+    rlLogIntentSent({ type: "attack", targetID: "player-2", troops: 3000 });
+    // Sim 30 ticks: we grew 30 tiles.
+    runtime.world.me = {
+      tiles: 130,
+      troops: 4800,
+      gold: 200,
+      troopRatio: 0.48,
+      structures: {},
+      structureLevels: {},
+    };
+    drainRlOutcomes(160, { isAlive: () => true });
+
+    // ----- spawn_decision -----
+    rlLog("spawn_decision", {
+      mode: "manual",
+      chosen: { tile: 2550, x: 0, y: 51 },
+      topCandidates: [{ tile: 2550, x: 0, y: 51, score: 42 }],
+      candidateCount: 10,
+    });
+
+    // ----- threat_flash -----
+    rlLog("threat_flash", { reason: "crown_change", prev: null, next: 2 });
+
+    // ----- reason -----
+    rlLog("reason", { goalId: "TERRA_NULLIUS_RUSH", summary: "grab empty" });
+
+    // ----- goal_switch (manual) -----
+    rlLog("goal_switch", {
+      prev: "IDLE",
+      next: "TERRA_NULLIUS_RUSH",
+      priority: 72,
+    });
+
+    // ----- match_end -----
+    runtime.rl.sessionStartedAtMs = Date.now() - 20_000;
+    runtime.rl.firstActiveTick = 10;
+    runtime.world.tick = 500;
+    runtime.world.rankings = { byTiles: [3, 2, 1], byTroops: [2, 3, 1] };
+    runtime.world.meSmallID = 1;
+    handleMatchEnd("died");
+
+    const dump = dumpRlJson();
+    const parsed = JSON.parse(dump);
+    const kinds = new Set(parsed.events.map((e: any) => e.kind));
+    const required = [
+      "match_start",
+      "config_snapshot",
+      "planner_decision",
+      "intent_sent",
+      "intent_outcome",
+      "spawn_decision",
+      "threat_flash",
+      "reason",
+      "goal_switch",
+      "match_end",
+    ];
+    for (const kind of required) {
+      expect(kinds.has(kind), `missing kind: ${kind}`).toBe(true);
+    }
+
+    const matchEnd = parsed.events.find((e: any) => e.kind === "match_end");
+    expect(matchEnd.data.reason).toBe("died");
+    expect(matchEnd.data.ticksAlive).toBe(490);
+    expect(Array.isArray(matchEnd.data.leverSuspicions)).toBe(true);
+    expect(matchEnd.data.leverSuspicions.length).toBeGreaterThan(0);
+
+    const outcome = parsed.events.find(
+      (e: any) => e.kind === "intent_outcome",
+    );
+    expect(Number.isFinite(outcome.data.reward)).toBe(true);
+    expect(outcome.data.delta.tiles).toBe(30);
+
+    // Config snapshot has a non-trivial lever hint list.
+    const snap = parsed.events.find((e: any) => e.kind === "config_snapshot");
+    expect(snap.data.leverHints.length).toBeGreaterThanOrEqual(3);
+
+    // Dump is reasonably compact for an LLM analyst to ingest.
+    expect(dump.length).toBeLessThan(500_000);
+  });
+});
