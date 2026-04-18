@@ -180,6 +180,13 @@
       gameView: null,
       uiState: null,
       eventBus: null,
+      // Singleplayer/replay bridge exposed by Transport.ts on
+      // `window.__openFrontLocalTransport`. When the game is running
+      // locally (e.g. Impossible AI), no WebSocket is ever opened, so we
+      // fall back to this in-process bridge to observe server messages and
+      // submit client intents. Wired by installLocalTransportBridge().
+      localBridge: null,
+      localBridgeUnsubscribe: null,
     },
     identity: {
       clientID: null,
@@ -948,6 +955,9 @@
         runtime.hooks.uiState = controlPanel.uiState;
       }
     }
+    // Re-check every discovery tick because singleplayer games install /
+    // tear down the bridge on Play/Leave.
+    installLocalTransportBridge();
   }
 
   function getAttackRatio() {
@@ -1095,12 +1105,26 @@
 
   function sendRawMessage(object) {
     const socket = runtime.hooks.socket;
-    if (!socket || socket.readyState !== NativeWebSocket.OPEN) {
-      decisionLog("send failed: socket unavailable");
-      return false;
+    if (socket && socket.readyState === NativeWebSocket.OPEN) {
+      socket.send(JSON.stringify(object));
+      return true;
     }
-    socket.send(JSON.stringify(object));
-    return true;
+    // Singleplayer fallback: the game uses an in-process LocalServer instead
+    // of a WebSocket when playing against AI locally, so there is no socket
+    // to send through. Transport.ts exposes a bridge on `window` that lets us
+    // submit the ClientMessage directly.
+    const bridge = runtime.hooks.localBridge;
+    if (bridge && typeof bridge.send === "function") {
+      try {
+        bridge.send(object);
+        return true;
+      } catch (error) {
+        decisionLog("send failed: local bridge error " + (error && error.message));
+        return false;
+      }
+    }
+    decisionLog("send failed: socket unavailable");
+    return false;
   }
 
   /**
@@ -7113,6 +7137,55 @@
     }
   }
 
+  /**
+   * Singleplayer / replay bridge installer.
+   *
+   * When the game runs locally (Impossible AI, replay), Transport.ts uses an
+   * in-process LocalServer rather than opening a WebSocket, so the hook in
+   * `installWebSocketHook()` never fires. Transport.ts publishes a bridge on
+   * `window.__openFrontLocalTransport` in that case: a `send(msg)` function
+   * (forwards ClientMessages to LocalServer) and an `addMessageListener(cb)`
+   * (delivers every server message, including the `"start"` that already
+   * fired before we subscribed).
+   *
+   * This function wires the bridge into the same `handleServerMessage` path
+   * + `sendRawMessage` path used for the multiplayer WebSocket, so the rest
+   * of the bot is oblivious to which transport it is running on.
+   */
+  function installLocalTransportBridge() {
+    if (typeof window === "undefined") return;
+    const bridge = window.__openFrontLocalTransport;
+    if (!bridge) {
+      if (runtime.hooks.localBridge) {
+        // Bridge was removed (leaveGame) — drop our subscription.
+        if (typeof runtime.hooks.localBridgeUnsubscribe === "function") {
+          try { runtime.hooks.localBridgeUnsubscribe(); } catch (_) {}
+        }
+        runtime.hooks.localBridge = null;
+        runtime.hooks.localBridgeUnsubscribe = null;
+        runtime.state.gameStarted = false;
+        runtime.state.matchPhase = "closed";
+        runtime.lastProcessedTick = -1;
+        botLog("Local transport bridge closed");
+      }
+      return;
+    }
+    if (runtime.hooks.localBridge === bridge) return;
+    // Drop previous subscription (shouldn't happen but safe-guard).
+    if (typeof runtime.hooks.localBridgeUnsubscribe === "function") {
+      try { runtime.hooks.localBridgeUnsubscribe(); } catch (_) {}
+    }
+    runtime.hooks.localBridge = bridge;
+    runtime.hooks.localBridgeUnsubscribe = bridge.addMessageListener(
+      (message) => {
+        try {
+          handleServerMessage(message);
+        } catch (_) {}
+      },
+    );
+    botLog("Local transport bridge captured (singleplayer)");
+  }
+
   function installWebSocketHook() {
     if (
       window.WebSocket === NativeWebSocket &&
@@ -7890,10 +7963,15 @@
       hooksRoot.innerHTML = renderRows([
         {
           label: "WebSocket",
-          value: runtime.hooks.socket ? "captured" : "missing",
-          className: runtime.hooks.socket
-            ? "superbot-hook-ok"
-            : "superbot-hook-miss",
+          value: runtime.hooks.socket
+            ? "captured"
+            : runtime.hooks.localBridge
+              ? "local"
+              : "missing",
+          className:
+            runtime.hooks.socket || runtime.hooks.localBridge
+              ? "superbot-hook-ok"
+              : "superbot-hook-miss",
         },
         {
           label: "Worker",
@@ -8809,6 +8887,9 @@
         isTileNearHumanBorder,
         filterHumanBorderTiles,
         shouldBuildType,
+        sendRawMessage,
+        installLocalTransportBridge,
+        handleServerMessage,
         buildOrderForArchetype,
         reasonLog,
         UnitType,
