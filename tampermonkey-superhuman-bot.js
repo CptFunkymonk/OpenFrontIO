@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.4.0
+// @version      2.5.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -13,7 +13,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.4.0";
+  const BOT_VERSION = "2.5.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -80,6 +80,11 @@
   ];
 
   const NukeTypes = [UnitType.AtomBomb, UnitType.HydrogenBomb, UnitType.MIRV];
+  // Build priority: cities and factories first (population + gold engine),
+  // then Port for naval access, then DefensePosts, then nukes/SAMs.
+  // DefensePosts intentionally come late — they don't raise pop cap and
+  // bunkering early was crippling our population growth relative to
+  // comparable players.
   const BuildPriority = [
     UnitType.City,
     UnitType.Factory,
@@ -1955,13 +1960,23 @@
     }
 
     const maxTroops = gameView.config().maxTroops(me);
-    const reserveRatio = computeReserveRatio(me, maxTroops);
-    const troops = calculateAttackTroops(
-      me,
-      null,
-      reserveRatio - 0.08,
-      maxTroops,
+    // Lean harder into expansion while we're small — unclaimed tiles are
+    // the cheapest way to grow income (which pays for cities, which raises
+    // the pop cap). `reserveExpansionBias` shrinks the reserve ratio when
+    // we're below half the map's expected share, subject to the floor in
+    // computeReserveRatio. Expanding more aggressively here directly
+    // trades current troops for future population ceiling.
+    const baseReserve = computeReserveRatio(me, maxTroops);
+    const totalLand = Math.max(
+      1,
+      safeCall(() => gameView.numLandTiles(), 1),
     );
+    const mapShare = me.numTilesOwned() / totalLand;
+    // Up to a 10-point reduction when we own <5% of the map. Tapers off
+    // linearly so established players don't over-spend on expansion.
+    const aggressionBonus = clamp(0.1 * (0.2 - mapShare) / 0.2, 0, 0.1);
+    const reserveRatio = Math.max(0.08, baseReserve - 0.08 - aggressionBonus);
+    const troops = calculateAttackTroops(me, null, reserveRatio, maxTroops);
     if (troops <= 0) {
       decisionLog("expand: insufficient troops");
       return false;
@@ -2090,8 +2105,6 @@
         false,
       );
 
-    // Phase 6.12: count caps scale per archetype while keeping the
-    // baseline cities >= floor(tiles/3500).
     const archetype = runtime.world.archetype || "CONTINENTAL";
     const factoryCoef =
       archetype === "ISLAND"
@@ -2103,12 +2116,16 @@
             : (hasCoast ? 0.4 : 0.75);
     const portCoef =
       archetype === "ISLAND" ? 0.9 : archetype === "CHOKE_HEAVY" ? 0.4 : 0.6;
+    // DefensePost coefficient — intentionally conservative everywhere except
+    // choke-heavy maps where DPs are the main way to hold the border.
+    // Previously 0.5 for the default case made the bot spend gold on
+    // bunkers before it had enough cities to raise its population ceiling.
     const dpCoef =
       archetype === "CHOKE_HEAVY" || archetype === "ARENA"
-        ? 0.75
+        ? 0.6
         : archetype === "ISLAND"
-          ? 0.35
-          : 0.5;
+          ? 0.25
+          : 0.35;
     const samCoef =
       archetype === "NUKE_RACE"
         ? 0.35
@@ -2118,16 +2135,34 @@
     const siloCoef = archetype === "NUKE_RACE" ? 0.3 : 0.22;
     const siloCap = archetype === "NUKE_RACE" ? 4 : 3;
 
+    // Aggressive city cadence — one city per ~2500 owned tiles (was 3500),
+    // minimum of 3 so we don't get stuck with 2 cities forever. Cities
+    // drive maxTroops (population cap), so bumping this directly helps us
+    // keep pace on population.
+    const cityTarget = Math.max(3, Math.floor(me.numTilesOwned() / 2500));
+    // Don't start building DefensePosts until our city count has caught
+    // up to the cadence target. Defends cities first, bunkers second.
+    const dpCityGate = Math.max(2, Math.floor(cityTarget * 0.66));
+    // Require at least one *Human* adjacent enemy for DPs to unlock.
+    // Nations / Bots (tribes) don't pressure the border in a way that
+    // DefensePosts meaningfully counter, and in our tests bunkering those
+    // borders drains gold that should be building cities.
+    const adjacentHuman = (runtime.world.threats.adjacentEnemies || []).some(
+      (e) => e && e.type === PlayerType.Human && !e.isFriendly,
+    );
+
     switch (type) {
       case UnitType.City:
-        return count < Math.max(2, Math.floor(me.numTilesOwned() / 3500));
+        return count < cityTarget;
       case UnitType.Factory:
         return count < Math.max(1, Math.floor(cities * factoryCoef));
       case UnitType.Port:
         return hasCoast && count < Math.max(1, Math.floor(cities * portCoef));
       case UnitType.DefensePost:
         return (
-          enemies.length > 0 && count < Math.max(2, Math.floor(cities * dpCoef))
+          adjacentHuman &&
+          cities >= dpCityGate &&
+          count < Math.max(1, Math.floor(cities * dpCoef))
         );
       case UnitType.MissileSilo:
         return (
@@ -2288,13 +2323,24 @@
         return [
           UnitType.City,
           UnitType.Factory,
-          UnitType.DefensePost,
           UnitType.Port,
           UnitType.SAMLauncher,
           UnitType.MissileSilo,
+          UnitType.DefensePost,
         ];
       default:
-        return BuildPriority;
+        // Historical CONTINENTAL / unclassified default: prioritise
+        // pop-cap (City → Factory → Port) over DefensePosts. Bunkers are
+        // still built, just last, so we don't sink gold into defences
+        // before we've scaled population.
+        return [
+          UnitType.City,
+          UnitType.Factory,
+          UnitType.Port,
+          UnitType.DefensePost,
+          UnitType.MissileSilo,
+          UnitType.SAMLauncher,
+        ];
     }
   }
 
@@ -4998,7 +5044,9 @@
       switch (goalId) {
         case "NEUTRALIZE_RISING_STAR":
         case "FARM_TRIBE":
+        case "EASY_NATION_GRAB":
         case "TERRAIN_RUSH":
+        case "TERRA_NULLIUS_RUSH":
         case "NUKE_CROWN":
         case "NAVAL_LAND_GRAB":
           return 12;
@@ -5256,6 +5304,48 @@
       onAct: async () => false,
     },
     {
+      // EASY_NATION_GRAB — we border a Nation or unstructured Bot and have
+      // a clear troop advantage. Nations don't form alliances and have a
+      // low defensive ceiling, so they're the best source of converted
+      // territory once terra nullius dries up. Priority sits just below
+      // FARM_TRIBE so a structured tribe still gets priority, but above
+      // DEFENSE_NETWORK so we grow instead of bunker.
+      id: "EASY_NATION_GRAB",
+      horizonTicks: 80,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (me.troops < 8000) return { valid: false };
+        const adj = world.threats.adjacentEnemies || [];
+        const candidates = adj.filter(
+          (e) =>
+            e &&
+            !e.isFriendly &&
+            (e.type === PlayerType.Nation || e.type === PlayerType.Bot) &&
+            // Either meaningfully weaker than us, or structure-rich
+            // (worth the troops). Structure-rich tribes are already
+            // caught by FARM_TRIBE; this goal is for plain Nations and
+            // structureless Bots we can roll over.
+            (e.troops < me.troops * 0.7 || (e.tiles || 0) > 30),
+        );
+        if (candidates.length === 0) return { valid: false };
+        // Prefer the weakest candidate so we land easy wins first.
+        const target = candidates.reduce(
+          (best, c) => (best === null || c.troops < best.troops ? c : best),
+          null,
+        );
+        return {
+          valid: true,
+          priority: 63,
+          note:
+            `easy=${target.name} (${target.type}) ` +
+            `troopRatio=${(target.troops / Math.max(me.troops, 1)).toFixed(2)}`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
       // TERRAIN_RUSH — a neighbouring player/tribe/nation is collapsing
       // (fast tile loss, multiple attackers). Rush to claim tiles before
       // everyone else carves them up. Priority scales with how badly the
@@ -5323,10 +5413,22 @@
         );
         const unownedFrac = unowned / Math.max(1, world.totals.usableLand);
         if (unownedFrac < 0.05) return { valid: false };
+        // Early game, unclaimed land is the highest-value target — it
+        // converts directly to income and unlocks more cities. Priority
+        // scales with how much of the map is still unclaimed AND how
+        // small we still are; once we're past ~20% share mid-game goals
+        // like SAM_WALL_BUILDUP / DEFENSE_NETWORK take over.
+        const base = 55;
+        const unownedBonus = clamp(unownedFrac * 40, 0, 20);
+        const smallPlayerBonus = world.totals.myShare < 0.1 ? 15 : 0;
+        const mediumPlayerBonus =
+          world.totals.myShare >= 0.1 && world.totals.myShare < 0.2 ? 6 : 0;
         return {
           valid: true,
-          priority: 55 + clamp(unownedFrac * 40, 0, 20),
-          note: `${(unownedFrac * 100).toFixed(0)}% unowned`,
+          priority: base + unownedBonus + smallPlayerBonus + mediumPlayerBonus,
+          note:
+            `${(unownedFrac * 100).toFixed(0)}% unowned, ` +
+            `myShare=${(world.totals.myShare * 100).toFixed(0)}%`,
         };
       },
       onAct: async () => false,
@@ -5390,16 +5492,24 @@
         const world = runtime.world;
         const me = world.me;
         if (!me) return { valid: false };
-        if (world.threats.adjacentEnemies.length === 0) {
-          return { valid: false };
-        }
+        // Only build out a DefensePost network when we actually face a
+        // Human neighbour. Nations/Bots don't justify the gold cost
+        // (they drop structures easily and don't sustain pressure).
+        const adjHuman = (world.threats.adjacentEnemies || []).some(
+          (e) => e && e.type === PlayerType.Human && !e.isFriendly,
+        );
+        if (!adjHuman) return { valid: false };
         const cityCount = me.structures[UnitType.City] || 0;
         const dpCount = me.structures[UnitType.DefensePost] || 0;
-        const target = Math.max(2, Math.floor(cityCount * 0.4));
+        // Gate on city count — we want cities ahead of DPs so our pop cap
+        // keeps growing. Require cities >= 4 before the network target
+        // becomes active.
+        if (cityCount < 4) return { valid: false };
+        const target = Math.max(2, Math.floor(cityCount * 0.35));
         if (dpCount >= target) return { valid: false };
         return {
           valid: true,
-          priority: 50,
+          priority: 42,
           note: `defense ${dpCount}/${target}`,
         };
       },
@@ -5741,6 +5851,10 @@
         handled = await runGoal_FarmTribe(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         break;
+      case "EASY_NATION_GRAB":
+        handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeExpand(me, borderTiles);
+        break;
       case "TERRAIN_RUSH":
         handled = await runGoal_TerrainRush(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
@@ -5786,6 +5900,7 @@
         "RETALIATION",
         "NEUTRALIZE_RISING_STAR",
         "FARM_TRIBE",
+        "EASY_NATION_GRAB",
         "TERRA_NULLIUS_RUSH",
         "TERRAIN_RUSH",
         "DIPLOMACY_ISOLATE_CROWN",
@@ -6023,6 +6138,7 @@
     { id: "CONSOLIDATE_FRONT", label: "Hold Front" },
     { id: "TERRA_NULLIUS_RUSH", label: "Rush Empty" },
     { id: "TERRAIN_RUSH", label: "Terrain Rush" },
+    { id: "EASY_NATION_GRAB", label: "Easy Nation" },
     { id: "NAVAL_LAND_GRAB", label: "Naval" },
   ];
 
@@ -7401,7 +7517,11 @@
         isBoatWithinRange,
         isTileNearHumanBorder,
         filterHumanBorderTiles,
+        shouldBuildType,
+        buildOrderForArchetype,
+        UnitType,
         PlayerType,
+        BOT_VERSION,
       },
     };
     installWebSocketHook();
