@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.5.1
-// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner
+// @version      2.6.0
+// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, RL decision logger
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -10,10 +10,58 @@
 // @run-at       document-start
 // ==/UserScript==
 
+/*
+ * ============================================================================
+ * RL Decision Logger (schema v1)
+ * ============================================================================
+ *
+ * Why this exists:
+ *   We keep losing matches before the mid / late game. The next iteration of
+ *   this bot needs to know *why* — which tiles we skipped, which goals kept
+ *   losing priority races, which intents the stealth gate killed, which gold
+ *   thresholds we never reached. So we drown the next agent in structured
+ *   data: every decision, every rejected alternative, every outcome.
+ *
+ *   This logger is purely observational. It does not change any gameplay
+ *   logic. Disabling it (`runtime.rl.enabled = false`) leaves behaviour
+ *   byte-identical to the pre-2.6 bot.
+ *
+ * Event kinds (see `rlLog` callsites for precise shapes):
+ *   match_start       — game bootstrap: gameID, clientID, players roster.
+ *   config_snapshot   — every named "lever" constant + full GOAL_SPECS list.
+ *   world_snapshot    — sampled self/totals/threats every 10 ticks.
+ *   stat_delta        — short-term self deltas (tiles / troops / gold).
+ *   planner_decision  — full lastEvaluation: winner + runner-ups + rejected.
+ *   goal_switch       — edge-triggered goal transition, with pre-state.
+ *   reason            — every reasonLog() mirrored into the stream.
+ *   intent_sent       — outgoing intents with actionId + preState.
+ *   intent_blocked    — stealth-gate rejections (rate-limited per reason).
+ *   intent_outcome    — 30-tick-later delta + reward for each intent_sent.
+ *   spawn_decision    — chosen spawn tile + top-10 alternatives.
+ *   threat_flash      — edge events: crown change, MIRV risk, coalition, overmatch.
+ *   match_end         — death / socket close, with ranks + peaks + leverSuspicions.
+ *
+ * How to export:
+ *   - Click "RL dump" in the overlay → clipboard + file download.
+ *   - Or from devtools:  window.__superhumanBotRL.dump()  (returns a string)
+ *                         window.__superhumanBotRL.download() (triggers file).
+ *   - Last 3 matches auto-persist to localStorage under `superbotRL:<gameID>`.
+ *
+ * Feeding it to the next agent:
+ *   Paste the JSON directly into the analyst prompt. Start with:
+ *     1. `config_snapshot.leverHints` — named knobs most likely to matter.
+ *     2. `match_end.leverSuspicions` — per-match heuristics ("died before
+ *        T=300; look at spawn scoring").
+ *     3. `planner_decision` entries — look for near-ties and long runs where
+ *        the same goal kept winning by a small margin.
+ *     4. `intent_outcome` rewards — flag actions whose reward < 0.
+ * ============================================================================
+ */
+
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.5.1";
+  const BOT_VERSION = "2.6.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -44,6 +92,21 @@
   const STEALTH_COMBO_COOLDOWN_MS = 500;
   const STEALTH_PER_PLAYER_DIVERSITY_WINDOW_MS = 3000;
   const STEALTH_PER_PLAYER_DIVERSITY_CAP = 3;
+
+  // RL Decision Logger tuning. See the top-of-file block comment for the
+  // overall rationale; each knob is a first-class lever the downstream
+  // analyst can nudge without understanding the rest of the codebase.
+  const MAX_RL_EVENTS = 20000;
+  const RL_OUTCOME_WINDOW_TICKS = 30;
+  const RL_STAT_DELTA_EVERY = 10;
+  const RL_PLANNER_PERIODIC_EVERY = 20;
+  const RL_WORLD_SNAPSHOT_EVERY = 10;
+  const RL_STEALTH_BLOCK_LOG_MS = 500;
+  const RL_ADJ_OVERMATCH_RATIO = 1.25;
+  const RL_STORAGE_KEY_PREFIX = "superbotRL:";
+  const RL_STORAGE_MAX_MATCHES = 3;
+  const RL_STORAGE_MAX_BYTES = 3_500_000;
+  const RL_SCHEMA_VERSION = 1;
 
   const UnitType = Object.freeze({
     TransportShip: "Transport",
@@ -254,6 +317,46 @@
       perPlayerActions: new Map(), // smallID -> [{ kind, atMs }]
       combos: new Map(), // smallID -> { lastKind, lastAtMs }
     },
+    // ----- RL Decision Logger (see top-of-file doc block) ---------------
+    // Purely observational: populated by rlLog() and consumed by
+    // dumpRlJson() / persistRlToStorage(). Resetting is done in
+    // handleServerMessage("start") — *never* mid-match, so the ring buffer
+    // spans the full game.
+    rl: {
+      enabled: true,
+      events: [],                         // ring buffer, capped at MAX_RL_EVENTS
+      seq: 0,                             // monotonic sequence across the match
+      sessionStartedAtMs: 0,
+      configSnapshotSent: false,
+      lastPlannerEmitTick: -999,
+      lastStatDeltaTick: -999,
+      lastWorldSnapshotTick: -999,
+      prevSelfStats: null,                // { tick, tiles, troops, gold, structures }
+      peakSelfStats: null,                // accumulated: { tiles, troops, gold, tileTick, troopTick, goldTick }
+      totalIntentsSent: 0,
+      totalIntentsBlocked: 0,
+      lastActionId: 0,
+      pendingOutcomes: [],                // [{ actionId, fireTick, preState, activeGoalId, intent }]
+      matchEnded: false,
+      lastIsAlive: false,
+      firstActiveTick: -1,
+      lastKnownCrownSmallID: null,
+      lastKnownMirvRisk: false,
+      lastKnownCoalitionThreat: false,
+      lastAdjDangerRatio: 0,
+      lastStealthBlockLogAtMs: new Map(), // reason -> ms (per-reason throttle)
+      // Auto-suspicion state: so generateLeverSuspicions() can look back at
+      // whether we ever ran certain goals, ever saw the nuke affordance,
+      // etc., without re-walking the full event list.
+      tracking: {
+        goalsEverAdopted: new Set(),
+        plannerGoalsEverValid: new Set(),
+        everAdjacentToCollapsing: false,
+        everRanTerrainRush: false,
+        everSawMirvRisk: false,
+        everSawCoalitionThreat: false,
+      },
+    },
   };
 
   const NativeWebSocket = window.WebSocket;
@@ -339,6 +442,386 @@
       "[" + entry.goalId + "] " + entry.summary +
       (entry.detail ? " (" + entry.detail + ")" : ""),
     );
+    // Mirror into the RL stream so narrative and structured events stay
+    // joined. Cheap enough to run unconditionally; rlLog short-circuits
+    // when the logger is disabled.
+    rlLog("reason", {
+      goalId: entry.goalId,
+      summary: entry.summary,
+      detail: entry.detail,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // RL Decision Logger — see top-of-file block comment for the full schema.
+  //
+  // Everything here is additive and must never throw. We prefer dropping a
+  // single event to breaking the tick loop.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Append one RL event. Cheap, constant-time. Safe to call before the
+   * GameView hook is available — `tick` just falls back to 0 / the last
+   * known world tick in that case.
+   */
+  function rlLog(kind, data) {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled) return null;
+    const gameView = runtime.hooks.gameView;
+    const tick = safeCall(
+      () =>
+        gameView && typeof gameView.ticks === "function"
+          ? gameView.ticks()
+          : runtime.world && runtime.world.tick
+            ? runtime.world.tick
+            : 0,
+      0,
+    );
+    const entry = {
+      kind: String(kind || "unknown"),
+      tick,
+      wallMs: Date.now(),
+      seq: rl.seq++,
+      data: data || {},
+    };
+    rl.events.push(entry);
+    if (rl.events.length > MAX_RL_EVENTS) {
+      rl.events.splice(0, rl.events.length - MAX_RL_EVENTS);
+    }
+    return entry;
+  }
+
+  /**
+   * Compact self snapshot. Used as `preState` for intents and as the base
+   * for stat_delta / match_end. Intentionally numeric-only and ≤ 200 bytes
+   * serialized.
+   */
+  function rlSelfSnapshot() {
+    const me = runtime.world && runtime.world.me;
+    if (!me) {
+      return {
+        tiles: 0,
+        troops: 0,
+        gold: 0,
+        troopRatio: 0,
+        structures: {},
+        structureLevels: {},
+      };
+    }
+    return {
+      tiles: me.tiles || 0,
+      troops: me.troops || 0,
+      gold: me.gold || 0,
+      troopRatio: me.troopRatio || 0,
+      structures: Object.assign({}, me.structures || {}),
+      structureLevels: Object.assign({}, me.structureLevels || {}),
+    };
+  }
+
+  /**
+   * Drop zero-valued numeric fields from a shallow object so our per-tick
+   * opponent map stays compact. We *don't* recurse — structures are kept
+   * as-is because downstream agents want to see the zeros there to
+   * distinguish "never built" from "missing key".
+   */
+  function rlCompactNumeric(src) {
+    const out = {};
+    for (const key of Object.keys(src || {})) {
+      const value = src[key];
+      if (typeof value === "number") {
+        if (value === 0) continue;
+        out[key] = value;
+      } else {
+        out[key] = value;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Summarise a single opponent for `world_snapshot`. Keep fields flat +
+   * cheap; the analyst wants a table-style view, not nested structures.
+   */
+  function rlOpponentSummary(entry) {
+    if (!entry) return null;
+    const base = {
+      smallID: entry.smallID,
+      name: entry.name,
+      type: entry.type,
+      isFriendly: Boolean(entry.isFriendly),
+      isAdjacent: Boolean(entry.isAdjacent),
+      isDisconnected: Boolean(entry.isDisconnected),
+      isTraitor: Boolean(entry.isTraitor),
+      tiles: entry.tiles || 0,
+      troops: entry.troops || 0,
+      gold: entry.gold || 0,
+      troopRatio: entry.troopRatio || 0,
+      tilesPerMin: entry.tilesPerMin || 0,
+      troopsPerMin: entry.troopsPerMin || 0,
+      nukeReadiness: entry.nukeReadiness || 0,
+      threatScore: entry.threatScore || 0,
+      opportunityScore: entry.opportunityScore || 0,
+      tags: entry.tags ? Array.from(entry.tags) : [],
+    };
+    return rlCompactNumeric(base);
+  }
+
+  /**
+   * Compute the scalar reward for an intent, given the observed deltas
+   * over RL_OUTCOME_WINDOW_TICKS. Deliberately simple + interpretable so
+   * the downstream agent can reason about weights directly. Weights are
+   * themselves levers (`rewardWeights` in config_snapshot).
+   */
+  const RL_REWARD_WEIGHTS = Object.freeze({
+    tiles: 0.25,
+    troopsPerDisplayDivisor: 0.01,
+    goldPerCoin: 0.00005,
+    city: 50,
+    factory: 50,
+    port: 20,
+    missileSilo: 30,
+    samLauncher: 15,
+    defensePost: 10,
+    diedPenalty: 100,
+  });
+
+  function rlComputeReward(delta, diedFlag) {
+    const struct = (delta && delta.structures) || {};
+    const cityΔ = struct[UnitType.City] || 0;
+    const factoryΔ = struct[UnitType.Factory] || 0;
+    const portΔ = struct[UnitType.Port] || 0;
+    const siloΔ = struct[UnitType.MissileSilo] || 0;
+    const samΔ = struct[UnitType.SAMLauncher] || 0;
+    const dpΔ = struct[UnitType.DefensePost] || 0;
+    const w = RL_REWARD_WEIGHTS;
+    const reward =
+      w.tiles * ((delta && delta.tiles) || 0) +
+      w.troopsPerDisplayDivisor * (((delta && delta.troops) || 0) / TROOP_DISPLAY_DIVISOR) +
+      w.goldPerCoin * ((delta && delta.gold) || 0) +
+      w.city * cityΔ +
+      w.factory * factoryΔ +
+      w.port * portΔ +
+      w.missileSilo * siloΔ +
+      w.samLauncher * samΔ +
+      w.defensePost * dpΔ -
+      (diedFlag ? w.diedPenalty : 0);
+    return Number(reward.toFixed(3));
+  }
+
+  /**
+   * Build the full "levers" table. Every named constant the analyst might
+   * want to nudge should appear here exactly once, keyed by its source name
+   * so the downstream agent can do a simple rename-and-push PR.
+   *
+   * `leverHints` is a static, human-authored list of the highest-leverage
+   * knobs with plain-English hints. Keep it narrow; the goal is to steer
+   * the analyst, not enumerate everything.
+   */
+  function buildConfigSnapshot() {
+    const uiState = runtime.hooks.uiState || {};
+    const goals = [];
+    if (typeof GOAL_SPECS !== "undefined" && Array.isArray(GOAL_SPECS)) {
+      for (const spec of GOAL_SPECS) {
+        goals.push({
+          id: spec.id,
+          horizonTicks: spec.horizonTicks || 0,
+        });
+      }
+    }
+    return {
+      botVersion: BOT_VERSION,
+      schemaVersion: RL_SCHEMA_VERSION,
+      constants: {
+        TROOP_DISPLAY_DIVISOR,
+        MAX_LOG_ENTRIES,
+        MAX_DECISION_ENTRIES,
+        MAX_REASON_ENTRIES,
+        LOOP_INTERVAL_MS,
+        DISCOVERY_INTERVAL_MS,
+        HISTORY_WINDOW_TICKS,
+        HISTORY_SAMPLE_EVERY,
+        HISTORY_MAX_SAMPLES,
+        THREAT_CROWN_THRESHOLD,
+        THREAT_CROWN_HYSTERESIS,
+        MIRV_GOLD_THRESHOLD,
+        HYDRO_GOLD_THRESHOLD,
+        ATOM_GOLD_THRESHOLD,
+        TICKS_PER_SECOND,
+        TICKS_PER_MINUTE,
+        STEALTH_MIN_INTENT_GAP_MS,
+        STEALTH_MAX_MAJOR_PER_2S,
+        STEALTH_MAX_ATTACKS_PER_SEC,
+        STEALTH_MAX_BUILDS_PER_SEC,
+        STEALTH_REACTION_MIN_MS,
+        STEALTH_REACTION_MAX_MS,
+        STEALTH_SPAWN_THINK_MS,
+        STEALTH_COMBO_COOLDOWN_MS,
+        STEALTH_PER_PLAYER_DIVERSITY_WINDOW_MS,
+        STEALTH_PER_PLAYER_DIVERSITY_CAP,
+        MAX_RL_EVENTS,
+        RL_OUTCOME_WINDOW_TICKS,
+        RL_STAT_DELTA_EVERY,
+        RL_PLANNER_PERIODIC_EVERY,
+        RL_WORLD_SNAPSHOT_EVERY,
+        RL_STEALTH_BLOCK_LOG_MS,
+        RL_ADJ_OVERMATCH_RATIO,
+      },
+      buildPriority: BuildPriority.slice(),
+      structureTypes: StructureTypes.slice(),
+      nukeTypes: NukeTypes.slice(),
+      rewardWeights: Object.assign({}, RL_REWARD_WEIGHTS),
+      goals,
+      uiStart: {
+        attackRatio: safeCall(() => Number(uiState.attackRatio), null),
+        rocketDirectionUp: safeCall(() => Boolean(uiState.rocketDirectionUp), null),
+        mode: runtime.mode,
+      },
+      // Human-authored hints. Update this list as we learn which knobs
+      // *actually* correlate with losses.
+      leverHints: [
+        {
+          name: "TERRA_NULLIUS_RUSH.priority",
+          kind: "goal_priority",
+          hint: "Base priority is 55; bump if we never make it above 10% map share.",
+        },
+        {
+          name: "EASY_NATION_GRAB.priority",
+          kind: "goal_priority",
+          hint: "Raise if we let weak Nations sit on our border for >60s without rolling them.",
+        },
+        {
+          name: "THREAT_CROWN_THRESHOLD",
+          kind: "threshold",
+          hint: "Lower (0.18?) to react to the crown earlier; risk of thrashing when nations yo-yo near the line.",
+        },
+        {
+          name: "ATOM_GOLD_THRESHOLD",
+          kind: "threshold",
+          hint: "If we never save this much gold, check whether BuildPriority starves silos/cities.",
+        },
+        {
+          name: "STEALTH_MAX_ATTACKS_PER_SEC",
+          kind: "pacing",
+          hint: "If intentsBlocked / intentsSent > 0.3, relaxing this recovers lost tempo.",
+        },
+        {
+          name: "BuildPriority",
+          kind: "build_order",
+          hint: "City → Factory → Port → DefensePost → MissileSilo → SAMLauncher. Re-order if DPs eat too much gold early.",
+        },
+        {
+          name: "RL_OUTCOME_WINDOW_TICKS",
+          kind: "reward_horizon",
+          hint: "30 ticks = 3s. Lengthen if attack outcomes consistently look null (clashes resolve slower than 3s).",
+        },
+        {
+          name: "STEALTH_SPAWN_THINK_MS",
+          kind: "pacing",
+          hint: "8s 'think' before spawning. Shorten if we ever spawn after opponents grabbed the best land.",
+        },
+      ],
+    };
+  }
+
+  /**
+   * Deterministic heuristic suggestions at match end. These are *starting
+   * points* for the next agent — explicitly flagged as suggestions, not
+   * ground truth. Cap at 8 for scannability.
+   */
+  function generateLeverSuspicions(summary) {
+    const out = [];
+    const ticksAlive = Math.max(0, summary.ticksAlive || 0);
+    const peak = summary.peakSelfStats || {
+      tiles: 0,
+      troops: 0,
+      gold: 0,
+    };
+    const usableLand = Math.max(
+      1,
+      (runtime.world && runtime.world.totals && runtime.world.totals.usableLand) || 1,
+    );
+    const peakShare = peak.tiles / usableLand;
+    const sent = summary.totalIntentsSent || 0;
+    const blocked = summary.totalIntentsBlocked || 0;
+    const tracking = summary.tracking || runtime.rl.tracking;
+    const goalsAdopted = tracking ? tracking.goalsEverAdopted : new Set();
+    const goalsValid = tracking ? tracking.plannerGoalsEverValid : new Set();
+
+    if (ticksAlive > 0 && ticksAlive < 300) {
+      out.push({
+        lever: "spawn scoring",
+        hint: `Died at T=${ticksAlive} (<300). Spawn pick may have been too aggressive; consider weighting distance-from-enemies higher.`,
+      });
+    }
+    if (peakShare > 0 && peakShare < 0.05) {
+      out.push({
+        lever: "TERRA_NULLIUS_RUSH.priority",
+        hint: `Peak map share was ${(peakShare * 100).toFixed(1)}%. Base priority=55 may be losing priority races; try 60–65.`,
+      });
+    }
+    if (peak.gold > 0 && peak.gold < ATOM_GOLD_THRESHOLD) {
+      out.push({
+        lever: "ATOM_GOLD_THRESHOLD or BuildPriority",
+        hint: `Peak gold was ${peak.gold} (<${ATOM_GOLD_THRESHOLD}). Never reached atom-bomb affordance; economy goals may be losing to DP spend.`,
+      });
+    }
+    if (sent > 0) {
+      const blockRate = blocked / Math.max(1, sent);
+      if (blockRate > 0.3) {
+        out.push({
+          lever: "STEALTH_MAX_ATTACKS_PER_SEC / STEALTH_MAX_BUILDS_PER_SEC",
+          hint: `${(blockRate * 100).toFixed(0)}% of intents were stealth-gated. Relax pacing to recover tempo (risk: detection).`,
+        });
+      }
+    }
+    if (
+      tracking &&
+      tracking.everAdjacentToCollapsing &&
+      !tracking.everRanTerrainRush
+    ) {
+      out.push({
+        lever: "TERRAIN_RUSH.priority",
+        hint: "We had a collapsing neighbour but never ran TERRAIN_RUSH. Priority floor may be too low vs CONSOLIDATE_FRONT.",
+      });
+    }
+    if (
+      goalsValid.size > 0 &&
+      !goalsValid.has("NUKE_CROWN") &&
+      !goalsValid.has("MIRV_LAST_RESORT")
+    ) {
+      out.push({
+        lever: "Late-game nuke gating",
+        hint: "Neither NUKE_CROWN nor MIRV_LAST_RESORT ever evaluated valid. Check silo build-out and crown share.",
+      });
+    }
+    if (
+      goalsAdopted &&
+      goalsAdopted.size <= 2 &&
+      ticksAlive > 200
+    ) {
+      out.push({
+        lever: "goal priority spread",
+        hint: `Only ${goalsAdopted.size} distinct goal(s) ever adopted. The planner may be locked into one goal by the +15 commit bonus.`,
+      });
+    }
+    if (
+      tracking &&
+      tracking.everSawCoalitionThreat &&
+      !goalsAdopted.has("DIPLOMACY_ISOLATE_CROWN")
+    ) {
+      out.push({
+        lever: "DIPLOMACY_ISOLATE_CROWN.priority",
+        hint: "Coalition threat fired but we never ran the diplomacy counter. Raise base priority (currently 45).",
+      });
+    }
+    if (summary.reason === "socket_closed" && ticksAlive > 300) {
+      out.push({
+        lever: "(meta) reconnect handling",
+        hint: "Match ended on socket close late-game. Not a behaviour lever — investigate network / tab focus.",
+      });
+    }
+    // Cap.
+    return out.slice(0, 8);
   }
 
   function safeCall(fn, fallback) {
