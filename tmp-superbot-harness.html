@@ -709,16 +709,18 @@
 
       function setNavalState() {
         state.mode = "naval";
-        state.tick = 160;
+        state.tick = 5000;
         state.myTroops = 90000;
         state.myGold = 1000;
         state.enemyTroops = 10000;
-        state.myTiles = new Set([
-          ref(5, 5),
-          ref(5, 6),
-          ref(6, 5),
-          ref(6, 6),
-        ]);
+        // Large territory so mapShare >= 0.1 (meets the mid-game threshold
+        // that allows boat invasions under the tightened early-game gate).
+        state.myTiles = new Set();
+        for (let x = 0; x <= 18; x++) {
+          for (let y = 0; y <= 17; y++) {
+            state.myTiles.add(ref(x, y));
+          }
+        }
         state.enemyTiles = new Set([
           ref(30, 30),
           ref(30, 31),
@@ -729,7 +731,7 @@
         state.borderTiles = [];
         resetCommon();
         state.transportSpawnTargets = new Set([ref(30, 30)]);
-        state.myCoastTiles = new Set([ref(6, 5), ref(6, 6)]);
+        state.myCoastTiles = new Set([ref(18, 17)]);
         state.enemyUnits = [makeUnit("City", enemyPlayer, ref(30, 30))];
       }
 
