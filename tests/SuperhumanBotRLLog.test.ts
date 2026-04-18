@@ -151,7 +151,7 @@ describe("tampermonkey-superhuman-bot RL Decision Logger — config snapshot", (
     const { buildConfigSnapshot } = runtime.test.internals;
     const snap = buildConfigSnapshot();
 
-    expect(snap.botVersion).toBe("2.6.0");
+    expect(snap.botVersion).toBe("2.6.1");
     expect(snap.schemaVersion).toBeGreaterThanOrEqual(1);
 
     // Must include every critical lever constant the downstream analyst
@@ -301,22 +301,100 @@ describe("tampermonkey-superhuman-bot RL Decision Logger — suspicions", () => 
 describe("tampermonkey-superhuman-bot RL Decision Logger — dump", () => {
   beforeEach(() => resetRl(loadUserscript()));
 
-  it("produces valid JSON with the documented top-level keys", () => {
+  it("compact dump uses short kind codes and short field keys", () => {
     const runtime = loadUserscript();
     const { dumpRlJson, rlLog } = runtime.test.internals;
     rlLog("reason", { goalId: "TEST", summary: "hello" });
     const raw = dumpRlJson();
     const parsed = JSON.parse(raw);
     expect(parsed.schemaVersion).toBeGreaterThanOrEqual(1);
-    expect(parsed.botVersion).toBe("2.6.0");
+    expect(parsed.botVersion).toBe("2.6.1");
+    expect(parsed.level).toBe("compact");
     expect(typeof parsed.generatedAtMs).toBe("number");
     expect(parsed.summary).toBeDefined();
+    expect(parsed.summary.kindCodes).toBeDefined();
+    expect(parsed.summary.kindCodes.R).toBe("reason");
     expect(Array.isArray(parsed.events)).toBe(true);
     expect(parsed.events.length).toBeGreaterThanOrEqual(1);
-    const reasonEntries = parsed.events.filter(
-      (e: any) => e.kind === "reason",
-    );
-    expect(reasonEntries[0].data.summary).toBe("hello");
+    // Compact events use `.k` (kind code), `.t` (tick), `.s` (seq), `.d`.
+    const reasonEntries = parsed.events.filter((e: any) => e.k === "R");
+    expect(reasonEntries.length).toBe(1);
+    expect(reasonEntries[0].d.s).toBe("hello");
+    expect(reasonEntries[0].d.g).toBe("TEST");
+  });
+
+  it("full dump keeps the legacy long-form shape", () => {
+    const runtime = loadUserscript();
+    const { dumpRlJson, rlLog } = runtime.test.internals;
+    rlLog("reason", { goalId: "TEST", summary: "hello" });
+    const raw = dumpRlJson({ level: "full" });
+    const parsed = JSON.parse(raw);
+    expect(parsed.level).toBe("full");
+    const e = parsed.events.find((ev: any) => ev.kind === "reason");
+    expect(e).toBeDefined();
+    expect(e.data.summary).toBe("hello");
+  });
+
+  it("strips zero-valued fields from compact events", () => {
+    const runtime = loadUserscript();
+    const { dumpRlJson, rlLog } = runtime.test.internals;
+    rlLog("stat_delta", {
+      dTick: 10,
+      dTiles: 0,
+      dTroops: 0,
+      dGold: 0,
+      dStructures: {},
+      rankByTiles: 0,
+      rankByTroops: 0,
+      activeGoalId: null,
+    });
+    const parsed = JSON.parse(dumpRlJson());
+    const sd = parsed.events.find((e: any) => e.k === "SD");
+    expect(sd).toBeDefined();
+    // dTick=10 is kept; every zero field got stripped.
+    expect(sd.d.dt).toBe(10);
+    expect("dT" in sd.d).toBe(false);
+    expect("dP" in sd.d).toBe(false);
+    expect("dG" in sd.d).toBe(false);
+    expect("g" in sd.d).toBe(false);
+  });
+
+  it("enforces the compact byte budget by dropping noisy kinds first", () => {
+    const runtime = loadUserscript();
+    const { dumpRlJson, rlLog } = runtime.test.internals;
+    // Stuff the buffer with 500 world_snapshot + 5 match_end-ish events. We
+    // expect world_snapshot events to get dropped before anything else.
+    for (let i = 0; i < 500; i++) {
+      rlLog("world_snapshot", {
+        self: { tiles: 100, troops: 5000, gold: 1000 },
+        opponents: {
+          "2": {
+            name: "Enemy" + i,
+            type: "HUMAN",
+            tiles: 200,
+            troops: 8000,
+            threatScore: 10,
+            opportunityScore: 5,
+            tags: ["ENEMY", "ADJACENT"],
+          },
+        },
+        threats: { crownSmallID: 2 },
+        totals: { myShare: 0.1, crownShare: 0.2 },
+      });
+    }
+    rlLog("match_end", {
+      reason: "died",
+      endedAtMs: Date.now(),
+      ticksAlive: 500,
+      lastGoalId: "TERRA_NULLIUS_RUSH",
+    });
+    const raw = dumpRlJson({ level: "compact", maxBytes: 20_000 });
+    expect(raw.length).toBeLessThanOrEqual(20_000);
+    const parsed = JSON.parse(raw);
+    expect(parsed.summary.droppedByKind).toBeDefined();
+    expect(parsed.summary.droppedByKind.world_snapshot).toBeGreaterThan(0);
+    // match_end never gets dropped by the prioritized dropper.
+    expect(parsed.events.some((e: any) => e.k === "ME")).toBe(true);
   });
 });
 
@@ -558,42 +636,142 @@ describe("tampermonkey-superhuman-bot RL Decision Logger — end-to-end smoke", 
     runtime.world.meSmallID = 1;
     handleMatchEnd("died");
 
+    // Default dump is compact: uses short kind codes via `.k`.
     const dump = dumpRlJson();
     const parsed = JSON.parse(dump);
-    const kinds = new Set(parsed.events.map((e: any) => e.kind));
-    const required = [
-      "match_start",
-      "config_snapshot",
-      "planner_decision",
-      "intent_sent",
-      "intent_outcome",
-      "spawn_decision",
-      "threat_flash",
-      "reason",
-      "goal_switch",
-      "match_end",
+    expect(parsed.level).toBe("compact");
+    const codes = new Set(parsed.events.map((e: any) => e.k));
+    const requiredCodes = [
+      "MS", // match_start
+      "CS", // config_snapshot
+      "PD", // planner_decision
+      "IS", // intent_sent
+      "IO", // intent_outcome
+      "SP", // spawn_decision
+      "TF", // threat_flash
+      "R", // reason
+      "GS", // goal_switch
+      "ME", // match_end
     ];
-    for (const kind of required) {
-      expect(kinds.has(kind), `missing kind: ${kind}`).toBe(true);
+    for (const code of requiredCodes) {
+      expect(codes.has(code), `missing kind code: ${code}`).toBe(true);
     }
 
-    const matchEnd = parsed.events.find((e: any) => e.kind === "match_end");
-    expect(matchEnd.data.reason).toBe("died");
-    expect(matchEnd.data.ticksAlive).toBe(490);
-    expect(Array.isArray(matchEnd.data.leverSuspicions)).toBe(true);
-    expect(matchEnd.data.leverSuspicions.length).toBeGreaterThan(0);
+    const matchEnd = parsed.events.find((e: any) => e.k === "ME");
+    expect(matchEnd.d.r).toBe("died");
+    expect(matchEnd.d.ta).toBe(490);
+    expect(Array.isArray(matchEnd.d.su)).toBe(true);
+    expect(matchEnd.d.su.length).toBeGreaterThan(0);
 
-    const outcome = parsed.events.find(
-      (e: any) => e.kind === "intent_outcome",
-    );
-    expect(Number.isFinite(outcome.data.reward)).toBe(true);
-    expect(outcome.data.delta.tiles).toBe(30);
+    const outcome = parsed.events.find((e: any) => e.k === "IO");
+    expect(Number.isFinite(outcome.d.r)).toBe(true);
+    expect(outcome.d.dT).toBe(30);
 
-    // Config snapshot has a non-trivial lever hint list.
-    const snap = parsed.events.find((e: any) => e.kind === "config_snapshot");
-    expect(snap.data.leverHints.length).toBeGreaterThanOrEqual(3);
+    // Config snapshot stays full-fidelity so leverHints survive.
+    const snap = parsed.events.find((e: any) => e.k === "CS");
+    expect(snap.d.leverHints.length).toBeGreaterThanOrEqual(3);
 
     // Dump is reasonably compact for an LLM analyst to ingest.
     expect(dump.length).toBeLessThan(500_000);
+  });
+
+  it("a synthetic 10-minute match stays under the default 500 KB budget", () => {
+    const runtime = loadUserscript();
+    const { rlLog, buildConfigSnapshot, dumpRlJson, handleMatchEnd } =
+      runtime.test.internals;
+
+    runtime.identity.gameID = "VOLUME-1";
+    runtime.hooks.gameView = {
+      ticks: () => 0,
+      x: (t: number) => t % 50,
+      y: (t: number) => Math.floor(t / 50),
+    };
+    rlLog("match_start", { gameID: "VOLUME-1" });
+    rlLog("config_snapshot", buildConfigSnapshot());
+
+    // Simulate 600s (6000 ticks) of actual-match cadence with the NEW sampling
+    // rates: world_snapshot every 30 ticks (→ 200), stat_delta every 20
+    // (→ 300), planner_decision every 60 (→ 100). Plus sprinkle some
+    // intents / blocks / threats.
+    for (let t = 0; t <= 6000; t += 30) {
+      rlLog("world_snapshot", {
+        self: { tiles: 100 + t, troops: 5000, gold: t * 10 },
+        opponents: {
+          "2": {
+            name: "Enemy",
+            type: "HUMAN",
+            tiles: 300 - t * 0.02,
+            troops: 8000,
+            threatScore: 20,
+            opportunityScore: 5,
+            tags: ["ENEMY", "ADJACENT"],
+          },
+          "3": {
+            name: "Nation",
+            type: "NATION",
+            tiles: 80,
+            troops: 2000,
+            threatScore: 5,
+            opportunityScore: 15,
+            tags: ["SOFT_TARGET"],
+          },
+        },
+        threats: { crownSmallID: 2, adjacentEnemySmallIDs: [2] },
+        totals: { myShare: 0.1 + t / 60000, crownShare: 0.2 },
+      });
+    }
+    for (let t = 0; t <= 6000; t += 20) {
+      rlLog("stat_delta", {
+        dTick: 20,
+        dTiles: 3,
+        dTroops: 50,
+        dGold: 200,
+        dStructures: {},
+      });
+    }
+    for (let t = 0; t <= 6000; t += 60) {
+      rlLog("planner_decision", {
+        winnerGoalId: "TERRA_NULLIUS_RUSH",
+        winnerPriority: 72,
+        evaluations: [
+          { id: "TERRA_NULLIUS_RUSH", priority: 72, valid: true, note: "12% unowned" },
+          { id: "EASY_NATION_GRAB", priority: 63, valid: true, note: "weak nation" },
+          { id: "NUKE_CROWN", priority: 0, valid: false, note: "no crown" },
+        ],
+      });
+    }
+    // 30 intents over the match, ~1 every 20s.
+    for (let i = 0; i < 30; i++) {
+      rlLog("intent_sent", {
+        actionId: i + 1,
+        intent: { type: "attack", targetID: "player-2", troops: 3000 },
+        activeGoalId: "TERRA_NULLIUS_RUSH",
+      });
+      rlLog("intent_outcome", {
+        actionId: i + 1,
+        intentType: "attack",
+        delta: { tiles: 3, troops: -200, gold: 100, structures: {} },
+        reward: 0.75,
+      });
+    }
+
+    runtime.rl.sessionStartedAtMs = Date.now() - 600_000;
+    runtime.rl.firstActiveTick = 10;
+    runtime.world.tick = 6000;
+    runtime.world.rankings = { byTiles: [3, 2, 1], byTroops: [2, 3, 1] };
+    runtime.world.meSmallID = 1;
+    handleMatchEnd("died");
+
+    const raw = dumpRlJson();
+    // The raw buffer is fat (~800+ events) but the compact dump must fit
+    // well under 500 KB.
+    expect(runtime.rl.events.length).toBeGreaterThan(500);
+    expect(raw.length).toBeLessThanOrEqual(500_000);
+    // Shape sanity.
+    const parsed = JSON.parse(raw);
+    expect(parsed.level).toBe("compact");
+    expect(parsed.summary.droppedByKind).toBeDefined();
+    expect(parsed.events.some((e: any) => e.k === "ME")).toBe(true);
+    expect(parsed.events.some((e: any) => e.k === "CS")).toBe(true);
   });
 });

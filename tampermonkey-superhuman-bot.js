@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.6.0
+// @version      2.6.1
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, RL decision logger
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -61,7 +61,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.6.0";
+  const BOT_VERSION = "2.6.1";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -98,14 +98,30 @@
   // analyst can nudge without understanding the rest of the codebase.
   const MAX_RL_EVENTS = 20000;
   const RL_OUTCOME_WINDOW_TICKS = 30;
-  const RL_STAT_DELTA_EVERY = 10;
-  const RL_PLANNER_PERIODIC_EVERY = 20;
-  const RL_WORLD_SNAPSHOT_EVERY = 10;
+  // Sampling cadences. These were originally set tight for a "log
+  // everything" first pass, which produced 15 MB dumps. v2.6.1 loosens
+  // them — the analyst rarely cares about every 1-second world snapshot
+  // of a 10-minute match; 3-second samples preserve the trend shape at
+  // ~3× lower cost. Bump back down only if a specific signal gets lost.
+  const RL_STAT_DELTA_EVERY = 20;
+  const RL_PLANNER_PERIODIC_EVERY = 60;
+  const RL_WORLD_SNAPSHOT_EVERY = 30;
   const RL_STEALTH_BLOCK_LOG_MS = 500;
   const RL_ADJ_OVERMATCH_RATIO = 1.25;
   const RL_STORAGE_KEY_PREFIX = "superbotRL:";
   const RL_STORAGE_MAX_MATCHES = 3;
+  // Compact export budget. The default dump target — 500 KB easily fits
+  // any LLM context paste and even small inline form fields. The backing
+  // localStorage cap is separate and still measured in MB.
+  const RL_EXPORT_MAX_BYTES = 500_000;
   const RL_STORAGE_MAX_BYTES = 3_500_000;
+  // World-snapshot roster cap per compacted event. We only keep the
+  // top-N most-relevant opponents (highest threat + opportunity score);
+  // the rest collapse into an `o` count field.
+  const RL_COMPACT_ROSTER_CAP = 6;
+  // String-field truncation used during compact serialization. Longer
+  // notes (e.g. "collapsing=X attackers=3 drop=-50/m") get elided.
+  const RL_COMPACT_STRING_CAP = 120;
   const RL_SCHEMA_VERSION = 1;
 
   const UnitType = Object.freeze({
@@ -7582,50 +7598,490 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Compact export (v2.6.1)
+  //
+  // The raw per-tick ring buffer is kept fat in-memory so the in-game overlay
+  // and devtools retain full fidelity. For export, though, 20k events at
+  // ~700 bytes each = 14 MB of JSON which nobody can paste into an LLM.
+  //
+  // The compact dumper re-encodes events into a short-keyed, zero-stripped,
+  // float-rounded, roster-truncated form and then enforces a byte budget by
+  // dropping the noisiest event kinds first (world_snapshot → stat_delta →
+  // reason → intent_outcome → intent_sent) until we fit. Every drop is
+  // accounted for in `summary.droppedByKind` so the analyst can see what's
+  // missing.
+  // ---------------------------------------------------------------------------
+
+  /** Round a float to 2 decimals; pass ints unchanged. Small byte savings. */
+  function rlRound(value) {
+    if (typeof value !== "number" || !Number.isFinite(value)) return value;
+    if (Number.isInteger(value)) return value;
+    return Math.round(value * 100) / 100;
+  }
+
+  /** Strip zero-valued / empty fields from a flat numeric object. */
+  function rlStripZeros(obj) {
+    if (!obj || typeof obj !== "object") return obj;
+    const out = {};
+    for (const key of Object.keys(obj)) {
+      const value = obj[key];
+      if (value === 0 || value === false || value === null) continue;
+      if (typeof value === "string" && value.length === 0) continue;
+      if (Array.isArray(value) && value.length === 0) continue;
+      if (
+        value &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        Object.keys(value).length === 0
+      ) {
+        continue;
+      }
+      if (typeof value === "number") out[key] = rlRound(value);
+      else if (typeof value === "string" && value.length > RL_COMPACT_STRING_CAP) {
+        out[key] = value.slice(0, RL_COMPACT_STRING_CAP) + "…";
+      } else {
+        out[key] = value;
+      }
+    }
+    return out;
+  }
+
   /**
-   * RL: serialize the entire RL event stream + summary. Safe to call at any
-   * time during a match. Schema is stable and documented at the top of this
-   * file; bump `schemaVersion` on breaking changes.
+   * Produce a compact form of a single event's `data` field, keyed by the
+   * event kind so each kind can trim the shape it knows best.
    */
-  function dumpRlJson() {
+  function rlCompactEventData(kind, data) {
+    if (!data || typeof data !== "object") return data;
+
+    switch (kind) {
+      case "world_snapshot": {
+        // Keep top-N opponents by (threatScore + opportunityScore); collapse
+        // the rest into a count so the analyst still knows N players exist.
+        const opponentsIn = data.opponents || {};
+        const ids = Object.keys(opponentsIn);
+        const ranked = ids
+          .map((id) => {
+            const o = opponentsIn[id] || {};
+            const score =
+              (o.threatScore || 0) +
+              (o.opportunityScore || 0) +
+              (o.isAdjacent ? 20 : 0);
+            return { id, score, o };
+          })
+          .sort((a, b) => b.score - a.score)
+          .slice(0, RL_COMPACT_ROSTER_CAP);
+        const opponents = {};
+        for (const entry of ranked) {
+          const stripped = rlStripZeros({
+            n: entry.o.name,
+            ty: entry.o.type,
+            fr: entry.o.isFriendly,
+            ad: entry.o.isAdjacent,
+            dc: entry.o.isDisconnected,
+            tr: entry.o.isTraitor,
+            t: entry.o.tiles,
+            p: entry.o.troops,
+            g: entry.o.gold,
+            tpm: entry.o.tilesPerMin,
+            ppm: entry.o.troopsPerMin,
+            nr: entry.o.nukeReadiness,
+            ts: entry.o.threatScore,
+            os: entry.o.opportunityScore,
+            tags: entry.o.tags,
+          });
+          opponents[entry.id] = stripped;
+        }
+        const self = data.self || {};
+        const totals = data.totals || {};
+        const threats = data.threats || {};
+        return rlStripZeros({
+          s: rlStripZeros({
+            t: self.tiles,
+            p: self.troops,
+            g: self.gold,
+            tr: self.troopRatio,
+            mt: self.maxTroops,
+            tpm: self.tilesPerMin,
+            ppm: self.troopsPerMin,
+            gpm: self.goldPerMin,
+            it: self.incomingTroops,
+            ot: self.outgoingTroops,
+            sl: self.structureLevels,
+            b: self.borderTileCount,
+          }),
+          tot: rlStripZeros({
+            ap: totals.alivePlayers,
+            hc: totals.humanCount,
+            nc: totals.nationCount,
+            bc: totals.botCount,
+            cs: totals.crownShare,
+            ms: totals.myShare,
+            ss: totals.secondShare,
+          }),
+          al: rlStripZeros({
+            b: (data.allianceGraph || {}).largestBlocShare,
+            c: (data.allianceGraph || {}).coalitionThreat,
+          }),
+          th: rlStripZeros({
+            cr: threats.crownSmallID,
+            mr: threats.mirvRisk,
+            ae: threats.adjacentEnemySmallIDs,
+            rs: threats.risingStarSmallIDs,
+            st: threats.softTargetSmallIDs,
+            ct: threats.collapsingTargetSmallIDs,
+            nd: threats.nearestDangerSmallID,
+            in: threats.inboundTroopTotal,
+          }),
+          op: opponents,
+          opN: ids.length,
+          m: data.mode,
+          a: data.archetype,
+          g: data.activeGoalId,
+        });
+      }
+      case "stat_delta":
+        return rlStripZeros({
+          dt: data.dTick,
+          dT: data.dTiles,
+          dP: data.dTroops,
+          dG: data.dGold,
+          dS: data.dStructures,
+          rT: data.rankByTiles,
+          rP: data.rankByTroops,
+          g: data.activeGoalId,
+        });
+      case "planner_decision": {
+        // Keep winner + top 8 valid evaluations; collapse the rest into a
+        // count. Drop `myStats` (world_snapshot covers it) and cap notes.
+        const evals = Array.isArray(data.evaluations) ? data.evaluations : [];
+        const valid = evals.filter((e) => e.valid);
+        const rejCount = evals.length - valid.length;
+        const top = valid
+          .slice()
+          .sort((a, b) => (b.priority || 0) - (a.priority || 0))
+          .slice(0, 8)
+          .map((e) =>
+            rlStripZeros({
+              id: e.id,
+              p: e.priority,
+              n: e.note,
+            }),
+          );
+        return rlStripZeros({
+          w: data.winnerGoalId,
+          wp: data.winnerPriority,
+          wn: data.winnerNote,
+          f: data.forced,
+          sw: data.goalSwitched,
+          ev: top,
+          evMore: Math.max(0, valid.length - top.length),
+          rejN: rejCount,
+        });
+      }
+      case "goal_switch":
+        return rlStripZeros({
+          a: data.prev,
+          b: data.next,
+          p: data.priority,
+          n: data.note,
+          f: data.forced,
+          // Drop myStats — prior world_snapshot + adjacent planner_decision
+          // already encode it, and this event is edge-triggered.
+        });
+      case "intent_sent": {
+        const intent = data.intent || {};
+        return rlStripZeros({
+          a: data.actionId,
+          g: data.activeGoalId,
+          it: intent.type,
+          u: intent.unit,
+          p: intent.troops,
+          gc: intent.gold,
+          tile: intent.tile,
+          xy: data.targetTile,
+          tid: data.targetSmallID,
+          tn: data.targetName,
+          // Drop preState — intent_outcome.delta tells the same story.
+        });
+      }
+      case "intent_blocked":
+        return rlStripZeros({
+          it: data.intentType,
+          r: data.reason,
+          g: data.activeGoalId,
+        });
+      case "intent_outcome":
+        return rlStripZeros({
+          a: data.actionId,
+          g: data.activeGoalId,
+          it: data.intentType,
+          tid: data.targetSmallID,
+          w: data.windowTicks,
+          al: data.iAmAliveAtWindow,
+          dT: data.delta && data.delta.tiles,
+          dP: data.delta && data.delta.troops,
+          dG: data.delta && data.delta.gold,
+          dS: data.delta && data.delta.structures,
+          r: data.reward,
+          // preState/postState dropped; downstream can rebuild from deltas.
+        });
+      case "spawn_decision": {
+        const top = Array.isArray(data.topCandidates)
+          ? data.topCandidates.slice(0, 5).map((c) =>
+              rlStripZeros({
+                t: c.tile,
+                x: c.x,
+                y: c.y,
+                s: c.score,
+              }),
+            )
+          : [];
+        return rlStripZeros({
+          m: data.mode,
+          c: rlStripZeros({
+            t: data.chosen && data.chosen.tile,
+            x: data.chosen && data.chosen.x,
+            y: data.chosen && data.chosen.y,
+            s: data.chosen && data.chosen.score,
+          }),
+          tc: top,
+          n: data.candidateCount,
+        });
+      }
+      case "threat_flash":
+        return rlStripZeros({
+          r: data.reason,
+          a: data.prev,
+          b: data.next,
+          cs: data.crownShare,
+          rt: data.ratio,
+          bs: data.largestBlocShare,
+          mc: data.mirvCapable,
+        });
+      case "reason":
+        return rlStripZeros({
+          g: data.goalId,
+          s:
+            typeof data.summary === "string" && data.summary.length > RL_COMPACT_STRING_CAP
+              ? data.summary.slice(0, RL_COMPACT_STRING_CAP) + "…"
+              : data.summary,
+          d:
+            typeof data.detail === "string" && data.detail.length > RL_COMPACT_STRING_CAP
+              ? data.detail.slice(0, RL_COMPACT_STRING_CAP) + "…"
+              : data.detail,
+        });
+      case "match_start":
+        // Keep players array but strip per-entry isFriendly=false noise.
+        return rlStripZeros({
+          g: data.gameID,
+          c: data.clientID,
+          v: data.botVersion,
+          m: data.mode,
+          ct: data.myClanTag,
+          ts: data.startedAtMs,
+          pl: Array.isArray(data.players)
+            ? data.players.map((p) =>
+                rlStripZeros({
+                  id: p.smallID,
+                  n: p.name,
+                  ty: p.type,
+                }),
+              )
+            : [],
+          gc: data.gameConfig,
+        });
+      case "config_snapshot":
+        // Keep this full: it's emitted once and every field here is a
+        // concrete knob the analyst may want to twist. The `leverHints`
+        // array is the highest-signal portion of the whole dump.
+        return data;
+      case "match_end":
+        return rlStripZeros({
+          r: data.reason,
+          ts: data.endedAtMs,
+          ta: data.ticksAlive,
+          g: data.lastGoalId,
+          rk: data.finalRank,
+          mg: data.didMakeMidGame,
+          lg: data.didMakeLateGame,
+          pk: data.peakSelfStats,
+          ls: data.lastStats,
+          is: data.totalIntentsSent,
+          ib: data.totalIntentsBlocked,
+          tr: data.tracking,
+          su: data.leverSuspicions,
+        });
+      default:
+        return data;
+    }
+  }
+
+  /** Kind → short code used in compact mode. */
+  const RL_KIND_CODES = Object.freeze({
+    match_start: "MS",
+    match_end: "ME",
+    config_snapshot: "CS",
+    world_snapshot: "WS",
+    stat_delta: "SD",
+    planner_decision: "PD",
+    goal_switch: "GS",
+    reason: "R",
+    intent_sent: "IS",
+    intent_blocked: "IB",
+    intent_outcome: "IO",
+    spawn_decision: "SP",
+    threat_flash: "TF",
+  });
+  const RL_KIND_CODE_TO_NAME = Object.freeze(
+    Object.fromEntries(
+      Object.entries(RL_KIND_CODES).map(([k, v]) => [v, k]),
+    ),
+  );
+
+  /**
+   * Priority order used by the byte-budget enforcer when we have to drop
+   * events. Higher index = dropped first. Everything we absolutely want
+   * to keep (identity, config, narrative summary) has a low/negative
+   * priority and is excluded from dropping entirely.
+   */
+  const RL_DROP_ORDER = [
+    "world_snapshot",
+    "stat_delta",
+    "reason",
+    "intent_outcome",
+    "intent_sent",
+    "planner_decision",
+    "spawn_decision",
+    "intent_blocked",
+    "goal_switch",
+    "threat_flash",
+  ];
+
+  /**
+   * RL: serialize the RL event stream. Two modes:
+   *
+   *   level="compact" (default): short keys, zero-stripping, float rounding,
+   *     roster-cap + evaluation-cap + pre/post-state drops, then a byte-budget
+   *     enforcer that drops the noisiest kinds until under `maxBytes`.
+   *   level="full":    the legacy fat dump (no compression) for local
+   *     debugging. Explicit opt-in — never shipped by the overlay button.
+   *
+   * Returns a JSON string. Always includes `schemaVersion`, `botVersion`,
+   * `generatedAtMs`, and a `summary` object listing any kinds that were
+   * dropped to fit.
+   */
+  function dumpRlJson(options) {
     const rl = runtime.rl;
-    try {
-      return JSON.stringify(
-        {
-          schemaVersion: RL_SCHEMA_VERSION,
-          botVersion: BOT_VERSION,
-          generatedAtMs: Date.now(),
-          gameID: runtime.identity.gameID,
-          clientID: runtime.identity.clientID,
-          mode: runtime.mode,
-          summary: {
-            sessionStartedAtMs: rl ? rl.sessionStartedAtMs : 0,
-            totalIntentsSent: rl ? rl.totalIntentsSent : 0,
-            totalIntentsBlocked: rl ? rl.totalIntentsBlocked : 0,
-            events: rl ? rl.events.length : 0,
-            matchEnded: rl ? rl.matchEnded : false,
-            peakSelfStats: rl ? rl.peakSelfStats : null,
-            firstActiveTick: rl ? rl.firstActiveTick : -1,
-            lastActionId: rl ? rl.lastActionId : 0,
-            tracking: rl
-              ? {
-                  goalsEverAdopted: Array.from(rl.tracking.goalsEverAdopted),
-                  plannerGoalsEverValid: Array.from(rl.tracking.plannerGoalsEverValid),
-                  everAdjacentToCollapsing: rl.tracking.everAdjacentToCollapsing,
-                  everRanTerrainRush: rl.tracking.everRanTerrainRush,
-                  everSawMirvRisk: rl.tracking.everSawMirvRisk,
-                  everSawCoalitionThreat: rl.tracking.everSawCoalitionThreat,
-                }
-              : null,
+    const opts = options || {};
+    const level = opts.level === "full" ? "full" : "compact";
+    const maxBytes =
+      level === "full"
+        ? Infinity
+        : Number.isFinite(opts.maxBytes)
+          ? Math.max(10_000, opts.maxBytes)
+          : RL_EXPORT_MAX_BYTES;
+
+    const baseSummary = rl
+      ? {
+          sessionStartedAtMs: rl.sessionStartedAtMs,
+          totalIntentsSent: rl.totalIntentsSent,
+          totalIntentsBlocked: rl.totalIntentsBlocked,
+          events: rl.events.length,
+          matchEnded: rl.matchEnded,
+          peakSelfStats: rl.peakSelfStats,
+          firstActiveTick: rl.firstActiveTick,
+          lastActionId: rl.lastActionId,
+          tracking: {
+            goalsEverAdopted: Array.from(rl.tracking.goalsEverAdopted),
+            plannerGoalsEverValid: Array.from(rl.tracking.plannerGoalsEverValid),
+            everAdjacentToCollapsing: rl.tracking.everAdjacentToCollapsing,
+            everRanTerrainRush: rl.tracking.everRanTerrainRush,
+            everSawMirvRisk: rl.tracking.everSawMirvRisk,
+            everSawCoalitionThreat: rl.tracking.everSawCoalitionThreat,
           },
-          events: rl ? rl.events : [],
-        },
-        (key, value) =>
-          typeof value === "bigint" ? value.toString() : value,
-      );
+        }
+      : {};
+
+    const header = {
+      schemaVersion: RL_SCHEMA_VERSION,
+      botVersion: BOT_VERSION,
+      generatedAtMs: Date.now(),
+      gameID: runtime.identity.gameID,
+      clientID: runtime.identity.clientID,
+      mode: runtime.mode,
+      level,
+      maxBytes: Number.isFinite(maxBytes) ? maxBytes : null,
+    };
+
+    try {
+      if (level === "full") {
+        return JSON.stringify(
+          Object.assign({}, header, {
+            summary: baseSummary,
+            events: rl ? rl.events : [],
+          }),
+          (key, value) =>
+            typeof value === "bigint" ? value.toString() : value,
+        );
+      }
+
+      // Compact path.
+      const rawEvents = rl ? rl.events : [];
+      const compactEvents = rawEvents.map((entry) => ({
+        k: RL_KIND_CODES[entry.kind] || entry.kind,
+        t: entry.tick,
+        s: entry.seq,
+        d: rlCompactEventData(entry.kind, entry.data || {}),
+      }));
+
+      const droppedByKind = {};
+      let payload = serializeCompact(header, baseSummary, compactEvents, droppedByKind);
+
+      // Byte-budget enforcer. Per-kind pass: drop one whole kind's worth at a
+      // time (oldest first) rather than a single event per iteration. A full
+      // match can emit thousands of world_snapshots; one-by-one dropping
+      // would require thousands of re-serializations. Per-kind batching is
+      // amortized O(kinds × events).
+      for (const kind of RL_DROP_ORDER) {
+        if (payload.length <= maxBytes) break;
+        const code = RL_KIND_CODES[kind];
+        // Drop in batches of 10% (minimum 1) until the kind is gone or we
+        // fit. This avoids re-serializing 500 times while still honoring
+        // newer events (we drop the oldest of this kind first).
+        while (payload.length > maxBytes) {
+          const indices = [];
+          for (let i = 0; i < compactEvents.length; i++) {
+            if (compactEvents[i].k === code) indices.push(i);
+          }
+          if (indices.length === 0) break;
+          const batchSize = Math.max(1, Math.floor(indices.length * 0.1));
+          const toDrop = indices.slice(0, batchSize);
+          // Splice from the end of `toDrop` so index arithmetic stays valid.
+          for (let j = toDrop.length - 1; j >= 0; j--) {
+            compactEvents.splice(toDrop[j], 1);
+          }
+          droppedByKind[kind] = (droppedByKind[kind] || 0) + toDrop.length;
+          payload = serializeCompact(header, baseSummary, compactEvents, droppedByKind);
+        }
+      }
+      return payload;
     } catch (err) {
       return JSON.stringify({ error: err.message });
     }
+  }
+
+  /** Helper: stringify the compact payload with dropped-by-kind accounting. */
+  function serializeCompact(header, baseSummary, compactEvents, droppedByKind) {
+    const summary = Object.assign({}, baseSummary, {
+      emittedEvents: compactEvents.length,
+      droppedByKind: Object.keys(droppedByKind).length ? droppedByKind : {},
+      kindCodes: RL_KIND_CODE_TO_NAME,
+    });
+    return JSON.stringify(
+      Object.assign({}, header, { summary, events: compactEvents }),
+      (key, value) => (typeof value === "bigint" ? value.toString() : value),
+    );
   }
 
   /**
@@ -7634,8 +8090,8 @@
    * Blob / URL.createObjectURL / document.body). Always also copies to the
    * clipboard via `copyToClipboard` so the user has a guaranteed fallback.
    */
-  function downloadRlJson() {
-    const payload = dumpRlJson();
+  function downloadRlJson(options) {
+    const payload = dumpRlJson(options);
     safeCall(() => copyToClipboard(payload), null);
     const hasBlob = typeof Blob !== "undefined";
     const hasUrl = typeof URL !== "undefined" && typeof URL.createObjectURL === "function";
@@ -7679,24 +8135,13 @@
     const gameID = runtime.identity.gameID || "unknown";
     const key = RL_STORAGE_KEY_PREFIX + gameID;
 
-    let payload = dumpRlJson();
-    // Shrink payload if it exceeds the cap — iteratively drop half of the
-    // events (keeping the newest half, which includes match_end).
-    let parsed = null;
-    let guard = 0;
-    while (payload.length > RL_STORAGE_MAX_BYTES && guard < 6) {
-      if (parsed === null) {
-        parsed = safeCall(() => JSON.parse(payload), null);
-        if (!parsed) break;
-      }
-      if (!Array.isArray(parsed.events) || parsed.events.length === 0) break;
-      parsed.events = parsed.events.slice(Math.floor(parsed.events.length / 2));
-      parsed.summary = parsed.summary || {};
-      parsed.summary.events = parsed.events.length;
-      parsed.summary.truncated = true;
-      payload = safeCall(() => JSON.stringify(parsed), payload);
-      guard += 1;
-    }
+    // Use the compact dumper with the storage-specific (larger) byte cap.
+    // The compact form already drops noisiest-first until it fits, so the
+    // secondary halving loop we had pre-2.6.1 is no longer needed.
+    const payload = dumpRlJson({
+      level: "compact",
+      maxBytes: RL_STORAGE_MAX_BYTES,
+    });
 
     // Trim oldest matches until under the count cap.
     const keys = [];
@@ -7771,11 +8216,19 @@
 
     if (rlButton) {
       rlButton.addEventListener("click", () => {
-        downloadRlJson();
+        // Default to compact; hold Shift to request the full / raw dump for
+        // local debugging. The compact path is what matches the overlay
+        // button's documented purpose ("fits an LLM paste buffer").
+        const payload = downloadRlJson({ level: "compact" });
         safeCall(() => persistRlToStorage(), null);
-        const events = runtime.rl ? runtime.rl.events.length : 0;
+        const totalRaw = runtime.rl ? runtime.rl.events.length : 0;
+        const sizeKb = Math.round((payload || "").length / 1024);
         botLog(
-          "RL dump ready (" + events + " events, copied to clipboard + download)",
+          "RL dump ready (compact, " +
+            totalRaw +
+            " raw events → " +
+            sizeKb +
+            " KB, copied + downloaded)",
         );
       });
     }
@@ -8730,8 +9183,13 @@
       get events() {
         return runtime.rl.events;
       },
-      dump: () => dumpRlJson(),
-      download: () => downloadRlJson(),
+      // Default is compact (fits an LLM paste buffer). Opt into full via
+      //   __superhumanBotRL.dump({ level: "full" })
+      // Override the byte budget via
+      //   __superhumanBotRL.dump({ maxBytes: 1_000_000 })
+      dump: (opts) => dumpRlJson(opts),
+      dumpFull: () => dumpRlJson({ level: "full" }),
+      download: (opts) => downloadRlJson(opts),
       persist: () => persistRlToStorage(),
       enable: () => {
         runtime.rl.enabled = true;
