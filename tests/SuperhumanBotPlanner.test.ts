@@ -372,9 +372,42 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     );
   });
 
-  it("exposes a BOT_VERSION constant bumped to 2.5.0", () => {
+  it("exposes a BOT_VERSION constant bumped to 2.5.1", () => {
     const runtime = loadUserscript();
-    expect(runtime.test.internals.BOT_VERSION).toBe("2.5.0");
+    expect(runtime.test.internals.BOT_VERSION).toBe("2.5.1");
+  });
+});
+
+describe("tampermonkey-superhuman-bot reasonLog plain-English output", () => {
+  it("records a (goalId, summary, detail) tuple for the overlay", () => {
+    const runtime = loadUserscript();
+    const { reasonLog } = runtime.test.internals;
+    const before = runtime.reasons.length;
+    reasonLog(
+      "TERRA_NULLIUS_RUSH",
+      "Grabbing unclaimed land to grow income and pop cap.",
+      "~47 tiles",
+    );
+    expect(runtime.reasons.length).toBe(before + 1);
+    const entry = runtime.reasons[runtime.reasons.length - 1];
+    expect(entry.goalId).toBe("TERRA_NULLIUS_RUSH");
+    expect(entry.summary).toBe(
+      "Grabbing unclaimed land to grow income and pop cap.",
+    );
+    expect(entry.detail).toBe("~47 tiles");
+    // The old fields are gone; overlay/readers should only rely on summary/detail.
+    expect("trigger" in entry).toBe(false);
+    expect("outcome" in entry).toBe(false);
+    expect("action" in entry).toBe(false);
+  });
+
+  it("tolerates a missing detail argument", () => {
+    const runtime = loadUserscript();
+    const { reasonLog } = runtime.test.internals;
+    reasonLog("IDLE", "Nothing better to do right now.");
+    const entry = runtime.reasons[runtime.reasons.length - 1];
+    expect(entry.summary).toBe("Nothing better to do right now.");
+    expect(entry.detail).toBe("");
   });
 });
 
