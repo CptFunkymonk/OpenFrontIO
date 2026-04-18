@@ -1266,6 +1266,9 @@
         runtime.stealth.lastGateLogMs = nowMs;
         decisionLog("stealth gate " + permits.reason + " blocked " + intent.type);
       }
+      // RL: emit intent_blocked with per-reason throttling so a pathological
+      // gate loop can't swamp the ring buffer.
+      safeCall(() => rlLogIntentBlocked(intent, permits.reason), null);
       return false;
     }
     const success = sendRawMessage({ type: "intent", intent });
@@ -1274,8 +1277,80 @@
       runtime.state.intentsSent += 1;
       recordStealthIntent(intent);
       decisionLog("sent " + intent.type);
+      // RL: log the outgoing intent + pre-state, and queue a delayed
+      // outcome emission for RL_OUTCOME_WINDOW_TICKS later.
+      safeCall(() => rlLogIntentSent(intent), null);
     }
     return success;
+  }
+
+  /**
+   * RL: record a stealth-gated intent. Throttled per-reason so a build
+   * spammer doesn't drown the ring buffer.
+   */
+  function rlLogIntentBlocked(intent, reason) {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled) return;
+    const nowMs = Date.now();
+    const lastAt = rl.lastStealthBlockLogAtMs.get(reason) || 0;
+    if (nowMs - lastAt < RL_STEALTH_BLOCK_LOG_MS) return;
+    rl.lastStealthBlockLogAtMs.set(reason, nowMs);
+    rl.totalIntentsBlocked += 1;
+    rlLog("intent_blocked", {
+      intentType: intent && intent.type,
+      intent: intent,
+      reason: String(reason || "unknown"),
+      activeGoalId: runtime.planner.activeGoalId || null,
+    });
+  }
+
+  /**
+   * RL: record a successfully-sent intent + enqueue its outcome pairing.
+   * Pulls target name / (x,y) from runtime.world + gameView so the downstream
+   * agent doesn't have to cross-reference two arrays.
+   */
+  function rlLogIntentSent(intent) {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled) return;
+    const actionId = ++rl.lastActionId;
+    const preState = rlSelfSnapshot();
+    const targetSmallID = safeCall(() => intentTargetSmallID(intent), null);
+    const targetEntry =
+      targetSmallID !== null &&
+      runtime.world &&
+      runtime.world.bySmallID &&
+      runtime.world.bySmallID.get
+        ? runtime.world.bySmallID.get(targetSmallID)
+        : null;
+    let tileXY = null;
+    if (intent && Number.isFinite(intent.tile)) {
+      const gv = runtime.hooks.gameView;
+      if (gv && typeof gv.x === "function" && typeof gv.y === "function") {
+        tileXY = { x: safeCall(() => gv.x(intent.tile), null), y: safeCall(() => gv.y(intent.tile), null) };
+      }
+    }
+    rl.totalIntentsSent += 1;
+    const tick = safeCall(
+      () => (runtime.hooks.gameView ? runtime.hooks.gameView.ticks() : 0),
+      0,
+    );
+    rlLog("intent_sent", {
+      actionId,
+      activeGoalId: runtime.planner.activeGoalId || null,
+      intent,
+      preState,
+      targetSmallID,
+      targetName: targetEntry ? targetEntry.name : null,
+      targetTile: tileXY,
+    });
+    rl.pendingOutcomes.push({
+      actionId,
+      fireTick: tick + RL_OUTCOME_WINDOW_TICKS,
+      preState,
+      activeGoalId: runtime.planner.activeGoalId || null,
+      intentType: intent && intent.type,
+      targetSmallID,
+    });
   }
 
   function sendSpawn(tile) {
@@ -1288,8 +1363,54 @@
       runtime.state.spawn.lastChosenTile = tile;
       runtime.state.lastAction = "spawning";
       runtime.state.strategy = "spawn";
+      safeCall(() => rlLogSpawnDecision(tile), null);
     }
     return success;
+  }
+
+  /**
+   * RL: capture the spawn choice + the top alternatives we considered.
+   * Random-spawn path uses runtime.state.spawn.sortedCandidates; manual
+   * path stashes a hand-built list under `manualCandidates` (see
+   * chooseManualSpawnTile). If neither is present (harness / unexpected
+   * path) we still emit the minimal event so the analyst can count
+   * spawns per match.
+   */
+  function rlLogSpawnDecision(tile) {
+    const gv = runtime.hooks.gameView;
+    if (!gv || typeof gv.x !== "function") {
+      rlLog("spawn_decision", { mode: "unknown", chosen: { tile } });
+      return;
+    }
+    const spawn = runtime.state.spawn;
+    const x = safeCall(() => gv.x(tile), null);
+    const y = safeCall(() => gv.y(tile), null);
+    let mode = "manual";
+    let sorted = null;
+    if (spawn.sortedCandidates && spawn.sortedCandidates.length) {
+      mode = "random";
+      sorted = spawn.sortedCandidates;
+    } else if (spawn.manualCandidates && spawn.manualCandidates.length) {
+      sorted = spawn.manualCandidates;
+    }
+    const top = [];
+    if (sorted) {
+      for (let i = 0; i < Math.min(10, sorted.length); i++) {
+        const cand = sorted[i];
+        top.push({
+          tile: cand.center,
+          x: safeCall(() => gv.x(cand.center), null),
+          y: safeCall(() => gv.y(cand.center), null),
+          score: Number((cand.score || 0).toFixed(2)),
+        });
+      }
+    }
+    rlLog("spawn_decision", {
+      mode,
+      chosen: { tile, x, y, score: top[0] && top[0].tile === tile ? top[0].score : null },
+      topCandidates: top,
+      candidateCount: sorted ? sorted.length : 0,
+    });
   }
 
   function sendAttack(targetID, troops) {
@@ -1750,6 +1871,9 @@
 
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => b.score - a.score);
+    // Stash top-10 for the RL spawn_decision event so the analyst can see
+    // the alternatives we rejected. Cheap: at most 10 entries.
+    runtime.state.spawn.manualCandidates = candidates.slice(0, 10);
     return candidates[0].center;
   }
 
@@ -6163,11 +6287,28 @@
     }
     if (planner.activeGoalId !== selection.spec.id) {
       const previous = planner.activeGoalId || "-";
+      // RL: emit goal_switch *before* mutating planner state so the event
+      // captures the pre-transition stats.
+      rlLog("goal_switch", {
+        prev: previous,
+        next: selection.spec.id,
+        priority: selection.evaluation.priority,
+        note: selection.evaluation.note || "",
+        forced: Boolean(selection.forced),
+        myStats: rlSelfSnapshot(),
+      });
       planner.activeGoalId = selection.spec.id;
       planner.activeGoal = selection.spec;
       planner.activeGoalCreatedTick = tick;
       planner.activeGoalExpiresTick = tick + selection.spec.horizonTicks;
       planner.lastSwitchTick = tick;
+      // Track adoption history for match-end suspicion heuristics.
+      if (runtime.rl && runtime.rl.tracking) {
+        runtime.rl.tracking.goalsEverAdopted.add(selection.spec.id);
+        if (selection.spec.id === "TERRAIN_RUSH") {
+          runtime.rl.tracking.everRanTerrainRush = true;
+        }
+      }
       reasonLog(
         selection.spec.id,
         `Switching plan: ${previous} → ${selection.spec.id}.`,
@@ -6181,12 +6322,419 @@
     }
   }
 
+  /**
+   * RL: emit a planner_decision event when either (a) the winner changed
+   * this tick or (b) RL_PLANNER_PERIODIC_EVERY ticks have elapsed since the
+   * last emit. Uses runtime.planner.lastEvaluation which already enumerates
+   * every goal's priority + validity + note.
+   */
+  function maybeEmitPlannerDecision(selection) {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled) return;
+    const planner = runtime.planner;
+    const tick = runtime.world.tick;
+    const evaluations = Array.isArray(planner.lastEvaluation)
+      ? planner.lastEvaluation
+      : [];
+
+    // Track every goal that ever evaluated valid — drives match-end
+    // suspicion heuristics.
+    for (const ev of evaluations) {
+      if (ev && ev.valid) {
+        rl.tracking.plannerGoalsEverValid.add(ev.id);
+      }
+    }
+
+    const winnerId = selection ? selection.spec.id : null;
+    const switched =
+      winnerId !== null && winnerId !== rl.lastKnownWinnerGoalId;
+    const periodic =
+      tick - rl.lastPlannerEmitTick >= RL_PLANNER_PERIODIC_EVERY;
+    if (!switched && !periodic) return;
+    rl.lastPlannerEmitTick = tick;
+    rl.lastKnownWinnerGoalId = winnerId;
+
+    const valid = evaluations.filter((e) => e && e.valid);
+    const invalid = evaluations
+      .filter((e) => e && !e.valid)
+      .map((e) => ({ id: e.id, note: e.note || "" }));
+    const sortedValid = valid
+      .slice()
+      .sort((a, b) => b.priority - a.priority);
+    const winner = sortedValid[0] || null;
+    const winnerPriority = winner ? winner.priority : null;
+    const runnerUps = sortedValid.slice(1, 4).map((e) => ({
+      id: e.id,
+      priority: e.priority,
+      gap: winnerPriority === null ? null : winnerPriority - e.priority,
+      note: e.note || "",
+    }));
+    rlLog("planner_decision", {
+      winnerGoalId: winner ? winner.id : null,
+      winnerPriority,
+      winnerNote: winner ? winner.note || "" : "",
+      forced: Boolean(selection && selection.forced),
+      goalSwitched: switched,
+      runnerUps,
+      rejected: invalid,
+      evaluations: evaluations.map((e) => ({
+        id: e.id,
+        priority: e.priority || 0,
+        valid: Boolean(e.valid),
+        note: e.note || "",
+      })),
+      myStats: rlSelfSnapshot(),
+    });
+  }
+
+  /**
+   * RL: world_snapshot + stat_delta + threat_flash per tick. Only emits when
+   * the relevant sampling intervals have elapsed; cheap otherwise.
+   */
+  function maybeEmitPeriodicRL(me, borderTiles) {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled) return;
+    const world = runtime.world;
+    if (!world || !world.me) return;
+    const tick = world.tick;
+    if (rl.firstActiveTick < 0) rl.firstActiveTick = tick;
+    rl.lastIsAlive = true;
+
+    // Update peak self stats every tick (cheap).
+    const self = world.me;
+    if (!rl.peakSelfStats) {
+      rl.peakSelfStats = {
+        tiles: self.tiles || 0,
+        tileTick: tick,
+        troops: self.troops || 0,
+        troopTick: tick,
+        gold: self.gold || 0,
+        goldTick: tick,
+      };
+    } else {
+      if ((self.tiles || 0) > rl.peakSelfStats.tiles) {
+        rl.peakSelfStats.tiles = self.tiles || 0;
+        rl.peakSelfStats.tileTick = tick;
+      }
+      if ((self.troops || 0) > rl.peakSelfStats.troops) {
+        rl.peakSelfStats.troops = self.troops || 0;
+        rl.peakSelfStats.troopTick = tick;
+      }
+      if ((self.gold || 0) > rl.peakSelfStats.gold) {
+        rl.peakSelfStats.gold = self.gold || 0;
+        rl.peakSelfStats.goldTick = tick;
+      }
+    }
+
+    // world_snapshot every 10 ticks while alive.
+    if (tick - rl.lastWorldSnapshotTick >= RL_WORLD_SNAPSHOT_EVERY) {
+      rl.lastWorldSnapshotTick = tick;
+      const opponents = {};
+      for (const entry of world.everyone) {
+        if (!entry || entry.isMe) continue;
+        const summary = rlOpponentSummary(entry);
+        if (summary) opponents[entry.smallID] = summary;
+      }
+      rlLog("world_snapshot", {
+        self: {
+          tiles: self.tiles || 0,
+          troops: self.troops || 0,
+          gold: self.gold || 0,
+          troopRatio: self.troopRatio || 0,
+          maxTroops: self.maxTroops || 0,
+          tilesPerMin: self.tilesPerMin || 0,
+          troopsPerMin: self.troopsPerMin || 0,
+          goldPerMin: self.goldPerMin || 0,
+          incomingTroops: self.incomingTroops || 0,
+          outgoingTroops: self.outgoingTroops || 0,
+          structures: Object.assign({}, self.structures || {}),
+          structureLevels: Object.assign({}, self.structureLevels || {}),
+          borderTileCount: Array.isArray(borderTiles) ? borderTiles.length : 0,
+        },
+        totals: Object.assign({}, world.totals || {}),
+        allianceGraph: {
+          largestBlocShare:
+            (world.allianceGraph && world.allianceGraph.largestBlocShare) || 0,
+          coalitionThreat: Boolean(
+            world.allianceGraph && world.allianceGraph.coalitionThreat,
+          ),
+        },
+        threats: {
+          crownSmallID: world.threats.crownSmallID,
+          mirvRisk: Boolean(world.threats.mirvRisk),
+          adjacentEnemySmallIDs: (world.threats.adjacentEnemies || []).map(
+            (e) => e.smallID,
+          ),
+          risingStarSmallIDs: (world.threats.risingStars || []).map(
+            (e) => e.smallID,
+          ),
+          softTargetSmallIDs: (world.threats.softTargets || []).map(
+            (e) => e.smallID,
+          ),
+          collapsingTargetSmallIDs: (world.threats.collapsingTargets || []).map(
+            (e) => e.smallID,
+          ),
+          nearestDangerSmallID: world.threats.nearestDanger
+            ? world.threats.nearestDanger.smallID
+            : null,
+          inboundTroopTotal: world.threats.inboundTroopTotal || 0,
+        },
+        opponents,
+        mode: runtime.mode,
+        archetype: world.archetype,
+        activeGoalId: runtime.planner.activeGoalId || null,
+      });
+    }
+
+    // stat_delta every 10 ticks while alive.
+    if (tick - rl.lastStatDeltaTick >= RL_STAT_DELTA_EVERY) {
+      if (rl.prevSelfStats) {
+        const prev = rl.prevSelfStats;
+        const structΔ = {};
+        const keys = new Set([
+          ...Object.keys(prev.structureLevels || {}),
+          ...Object.keys(self.structureLevels || {}),
+        ]);
+        for (const key of keys) {
+          const after = (self.structureLevels && self.structureLevels[key]) || 0;
+          const before = (prev.structureLevels && prev.structureLevels[key]) || 0;
+          if (after - before !== 0) structΔ[key] = after - before;
+        }
+        const rankByTiles = world.rankings.byTiles.indexOf(world.meSmallID);
+        const rankByTroops = world.rankings.byTroops.indexOf(world.meSmallID);
+        rlLog("stat_delta", {
+          dTick: tick - prev.tick,
+          dTiles: (self.tiles || 0) - (prev.tiles || 0),
+          dTroops: (self.troops || 0) - (prev.troops || 0),
+          dGold: (self.gold || 0) - (prev.gold || 0),
+          dStructures: structΔ,
+          rankByTiles,
+          rankByTroops,
+          activeGoalId: runtime.planner.activeGoalId || null,
+        });
+      }
+      rl.lastStatDeltaTick = tick;
+      rl.prevSelfStats = {
+        tick,
+        tiles: self.tiles || 0,
+        troops: self.troops || 0,
+        gold: self.gold || 0,
+        structureLevels: Object.assign({}, self.structureLevels || {}),
+      };
+    }
+
+    // threat_flash: edge-triggered.
+    const crownID = world.threats.crownSmallID;
+    if (crownID !== rl.lastKnownCrownSmallID) {
+      rlLog("threat_flash", {
+        reason: "crown_change",
+        prev: rl.lastKnownCrownSmallID,
+        next: crownID,
+        crownShare: (world.totals && world.totals.crownShare) || 0,
+      });
+      rl.lastKnownCrownSmallID = crownID;
+    }
+    if (world.threats.mirvRisk && !rl.lastKnownMirvRisk) {
+      rlLog("threat_flash", {
+        reason: "mirv_risk",
+        mirvCapable: (world.threats.mirvCapable || []).map((e) => e.smallID),
+      });
+      rl.tracking.everSawMirvRisk = true;
+    }
+    rl.lastKnownMirvRisk = Boolean(world.threats.mirvRisk);
+    const coalition = Boolean(
+      world.allianceGraph && world.allianceGraph.coalitionThreat,
+    );
+    if (coalition && !rl.lastKnownCoalitionThreat) {
+      rlLog("threat_flash", {
+        reason: "coalition_threat",
+        largestBlocShare:
+          (world.allianceGraph && world.allianceGraph.largestBlocShare) || 0,
+      });
+      rl.tracking.everSawCoalitionThreat = true;
+    }
+    rl.lastKnownCoalitionThreat = coalition;
+
+    // Adjacent overmatch: highest adjacent enemy troop ratio. Hysteretic.
+    let maxRatio = 0;
+    const meTroops = Math.max(1, self.troops || 1);
+    for (const enemy of world.threats.adjacentEnemies || []) {
+      const ratio = (enemy.troops || 0) / meTroops;
+      if (ratio > maxRatio) maxRatio = ratio;
+    }
+    if (
+      maxRatio >= RL_ADJ_OVERMATCH_RATIO &&
+      rl.lastAdjDangerRatio < RL_ADJ_OVERMATCH_RATIO
+    ) {
+      rlLog("threat_flash", {
+        reason: "adjacent_overmatch",
+        ratio: Number(maxRatio.toFixed(3)),
+      });
+    }
+    rl.lastAdjDangerRatio = maxRatio;
+
+    // Mark "we saw a collapsing neighbour" once per match for suspicions.
+    if (
+      !rl.tracking.everAdjacentToCollapsing &&
+      (world.threats.collapsingTargets || []).some((e) => e.isAdjacent)
+    ) {
+      rl.tracking.everAdjacentToCollapsing = true;
+    }
+  }
+
+  /**
+   * RL: drain any pending outcomes whose fireTick has arrived. Pairs each
+   * intent with its observed delta + scalar reward.
+   *
+   * If we died before the window closed, flush the remaining outcomes with
+   * diedFlag=true and an empty postState — otherwise we'd leak pending
+   * entries across matches.
+   */
+  function drainRlOutcomes(tick, me) {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled) return;
+    if (!rl.pendingOutcomes.length) return;
+    const world = runtime.world;
+    const selfTiles = (world.me && world.me.tiles) || 0;
+    const selfTroops = (world.me && world.me.troops) || 0;
+    const selfGold = (world.me && world.me.gold) || 0;
+    const selfStructures = (world.me && world.me.structureLevels) || {};
+    const weAreAlive = Boolean(me);
+    const remaining = [];
+    for (const pending of rl.pendingOutcomes) {
+      if (weAreAlive && pending.fireTick > tick) {
+        remaining.push(pending);
+        continue;
+      }
+      const delta = {
+        tiles: selfTiles - (pending.preState.tiles || 0),
+        troops: selfTroops - (pending.preState.troops || 0),
+        gold: selfGold - (pending.preState.gold || 0),
+        structures: {},
+      };
+      const keys = new Set([
+        ...Object.keys(pending.preState.structureLevels || {}),
+        ...Object.keys(selfStructures || {}),
+      ]);
+      for (const key of keys) {
+        const after = selfStructures[key] || 0;
+        const before = (pending.preState.structureLevels || {})[key] || 0;
+        if (after - before !== 0) delta.structures[key] = after - before;
+      }
+      const diedFlag = !weAreAlive;
+      const reward = rlComputeReward(delta, diedFlag);
+      rlLog("intent_outcome", {
+        actionId: pending.actionId,
+        activeGoalId: pending.activeGoalId,
+        intentType: pending.intentType,
+        targetSmallID: pending.targetSmallID,
+        windowTicks: tick - (pending.fireTick - RL_OUTCOME_WINDOW_TICKS),
+        iAmAliveAtWindow: weAreAlive,
+        preState: pending.preState,
+        postState: weAreAlive
+          ? {
+              tiles: selfTiles,
+              troops: selfTroops,
+              gold: selfGold,
+              structureLevels: Object.assign({}, selfStructures),
+            }
+          : null,
+        delta,
+        reward,
+      });
+    }
+    rl.pendingOutcomes = remaining;
+  }
+
+  /**
+   * RL: detect transitions where the match has ended from our perspective:
+   *   - We were alive on a prior tick and now getMyLivingPlayer() is null
+   *     → reason="died".
+   *   - `runtime.state.matchPhase` flipped to "closed" (socket dropped)
+   *     → reason="socket_closed".
+   * Fires exactly once per game via the `rl.matchEnded` latch.
+   */
+  function detectMatchEnd() {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled || rl.matchEnded) return;
+    if (rl.sessionStartedAtMs === 0) return; // never had a match_start
+    const me = getMyLivingPlayer();
+    if (rl.lastIsAlive && !me) {
+      handleMatchEnd("died");
+      return;
+    }
+    if (runtime.state.matchPhase === "closed") {
+      handleMatchEnd("socket_closed");
+      return;
+    }
+  }
+
+  /**
+   * RL: finalize the match. Flushes pending outcomes, emits `match_end` with
+   * peak stats + auto-suspicions, persists to localStorage (best-effort).
+   */
+  function handleMatchEnd(reason) {
+    const rl = runtime.rl;
+    if (!rl || rl.matchEnded) return;
+    rl.matchEnded = true;
+    const world = runtime.world || { rankings: {} };
+    const tick = world.tick || 0;
+
+    // Flush pending outcomes with diedFlag so nothing leaks into the next
+    // match. Passing me=null forces iAmAliveAtWindow=false.
+    safeCall(() => drainRlOutcomes(tick, null), null);
+
+    const lastStats = rlSelfSnapshot();
+    const finalRankByTiles = world.rankings
+      ? (world.rankings.byTiles || []).indexOf(world.meSmallID)
+      : -1;
+    const finalRankByTroops = world.rankings
+      ? (world.rankings.byTroops || []).indexOf(world.meSmallID)
+      : -1;
+    const ticksAlive = rl.firstActiveTick >= 0 ? tick - rl.firstActiveTick : 0;
+    const summary = {
+      reason,
+      endedAtMs: Date.now(),
+      ticksAlive,
+      lastGoalId: runtime.planner.activeGoalId || null,
+      finalRank: { byTiles: finalRankByTiles, byTroops: finalRankByTroops },
+      didMakeMidGame: ticksAlive >= 600,
+      didMakeLateGame: ticksAlive >= 2400,
+      peakSelfStats: rl.peakSelfStats || null,
+      lastStats,
+      totalIntentsSent: rl.totalIntentsSent || 0,
+      totalIntentsBlocked: rl.totalIntentsBlocked || 0,
+      tracking: {
+        goalsEverAdopted: Array.from(rl.tracking.goalsEverAdopted),
+        plannerGoalsEverValid: Array.from(rl.tracking.plannerGoalsEverValid),
+        everAdjacentToCollapsing: rl.tracking.everAdjacentToCollapsing,
+        everRanTerrainRush: rl.tracking.everRanTerrainRush,
+        everSawMirvRisk: rl.tracking.everSawMirvRisk,
+        everSawCoalitionThreat: rl.tracking.everSawCoalitionThreat,
+      },
+    };
+    // Heuristic suspicions consult world + rl.tracking — build after summary.
+    summary.leverSuspicions = generateLeverSuspicions({
+      ticksAlive,
+      peakSelfStats: rl.peakSelfStats || {},
+      totalIntentsSent: rl.totalIntentsSent || 0,
+      totalIntentsBlocked: rl.totalIntentsBlocked || 0,
+      tracking: rl.tracking,
+      reason,
+    });
+    rlLog("match_end", summary);
+
+    // Best-effort persist. Never throw from here; localStorage is optional.
+    safeCall(() => persistRlToStorage(), null);
+  }
+
   async function runModulesForTick() {
     discoverRuntimeReferences();
     const gameView = getGameView();
     if (!gameView) {
       runtime.state.strategy = "waiting for game view";
       runtime.state.lastAction = "discovering hooks";
+      // RL: if the socket died before we ever got a gameView, nothing to do.
       return;
     }
 
@@ -6209,6 +6757,9 @@
     if (!me) {
       runtime.state.lastAction = "waiting for living player";
       runtime.state.strategy = "reconnect";
+      // RL: if we were alive last tick and now we're not, the match just
+      // ended (we died). Fire match_end exactly once per game.
+      safeCall(() => detectMatchEnd(), null);
       refreshOverlay();
       return;
     }
@@ -6244,8 +6795,16 @@
     classifyMapIfNeeded(me);
     maybePeriodicIntelLog();
     updateSnapshot(me, borderTiles);
+
+    // RL decision logger: sample world/delta/threats and drain outcomes.
+    // Runs BEFORE planner so we can emit "state at tick T" and then pair
+    // `planner_decision` in the same tick.
+    safeCall(() => maybeEmitPeriodicRL(me, borderTiles), null);
+    safeCall(() => drainRlOutcomes(tick, me), null);
+
     const selection = selectPrimaryGoal();
     adoptGoal(selection);
+    safeCall(() => maybeEmitPlannerDecision(selection), null);
 
     // Goal-aware dispatch. Active goal gets first crack; if it didn't act we
     // fall through to the legacy maybeX chain (diplomacy → nuke → combat →
@@ -6396,6 +6955,8 @@
 
     runtime.state.lastAction = "holding";
     runtime.state.strategy = "consolidating";
+    // RL: catch socket_closed transitions even when we were alive this tick.
+    safeCall(() => detectMatchEnd(), null);
     refreshOverlay();
   }
 
@@ -6452,6 +7013,93 @@
       runtime._timingLoggedAt = -999;
       runtime._timingSampleSum = 0;
       runtime._timingSampleCount = 0;
+      // ----- RL Decision Logger: full reset on every new match -----
+      // Seeds a fresh ring buffer + counters, then emits match_start +
+      // config_snapshot immediately so event #0 is always bot identity.
+      // If an analyst grepped for `"kind":"match_start"` they should find
+      // exactly one per game.
+      const rl = runtime.rl;
+      if (rl) {
+        // If a previous match is still open when a new `start` arrives
+        // (reconnect/rematch), close it out so match_end appears once per
+        // game in the event log.
+        if (!rl.matchEnded && rl.sessionStartedAtMs > 0) {
+          safeCall(() => handleMatchEnd("restart"), null);
+        }
+        rl.events = [];
+        rl.seq = 0;
+        rl.sessionStartedAtMs = Date.now();
+        rl.configSnapshotSent = false;
+        rl.lastPlannerEmitTick = -999;
+        rl.lastStatDeltaTick = -999;
+        rl.lastWorldSnapshotTick = -999;
+        rl.prevSelfStats = null;
+        rl.peakSelfStats = null;
+        rl.totalIntentsSent = 0;
+        rl.totalIntentsBlocked = 0;
+        rl.lastActionId = 0;
+        rl.pendingOutcomes = [];
+        rl.matchEnded = false;
+        rl.lastIsAlive = false;
+        rl.firstActiveTick = -1;
+        rl.lastKnownCrownSmallID = null;
+        rl.lastKnownMirvRisk = false;
+        rl.lastKnownCoalitionThreat = false;
+        rl.lastAdjDangerRatio = 0;
+        rl.lastStealthBlockLogAtMs = new Map();
+        rl.tracking = {
+          goalsEverAdopted: new Set(),
+          plannerGoalsEverValid: new Set(),
+          everAdjacentToCollapsing: false,
+          everRanTerrainRush: false,
+          everSawMirvRisk: false,
+          everSawCoalitionThreat: false,
+        };
+        const initialPlayers = [];
+        const gameView = runtime.hooks.gameView;
+        const views = safeCall(
+          () => (gameView ? gameView.playerViews() : []),
+          [],
+        );
+        for (const player of views) {
+          initialPlayers.push({
+            smallID: safeCall(() => player.smallID(), null),
+            name: safeCall(() => player.displayName(), "?"),
+            type: safeCall(() => player.type(), null),
+            isFriendly: false, // our identity isn't resolved yet at `start`
+          });
+        }
+        const cfg = safeCall(() => gameView && gameView.config(), null);
+        const myPlayer = safeCall(() => gameView && gameView.myPlayer(), null);
+        rlLog("match_start", {
+          gameID: runtime.identity.gameID,
+          clientID: runtime.identity.clientID,
+          botVersion: BOT_VERSION,
+          mode: runtime.mode,
+          myClanTag: runtime.identity.clanTag,
+          startedAtMs: rl.sessionStartedAtMs,
+          players: initialPlayers,
+          gameConfig: cfg
+            ? {
+                gameMode: safeCall(() =>
+                  cfg.gameConfig ? cfg.gameConfig().gameMode : null,
+                null),
+                isRandomSpawn: safeCall(() => Boolean(cfg.isRandomSpawn()), null),
+                numSpawnPhaseTurns: safeCall(
+                  () => cfg.numSpawnPhaseTurns(),
+                  null,
+                ),
+                maxTroopsForMe: safeCall(
+                  () => (myPlayer ? cfg.maxTroops(myPlayer) : null),
+                  null,
+                ),
+                boatMaxNumber: safeCall(() => cfg.boatMaxNumber(), null),
+              }
+            : null,
+        });
+        rlLog("config_snapshot", buildConfigSnapshot());
+        rl.configSnapshotSent = true;
+      }
       botLog("Game started");
       return;
     }
@@ -6801,6 +7449,7 @@
           <button id="superbot-toggle">ON</button>
           <button id="superbot-mode">BAL</button>
           <button id="superbot-export">export</button>
+          <button id="superbot-rl" title="Copy + download the RL decision log for the current match">RL dump</button>
           <button id="superbot-collapse">_</button>
         </div>
       </div>
@@ -6933,6 +7582,154 @@
     }
   }
 
+  /**
+   * RL: serialize the entire RL event stream + summary. Safe to call at any
+   * time during a match. Schema is stable and documented at the top of this
+   * file; bump `schemaVersion` on breaking changes.
+   */
+  function dumpRlJson() {
+    const rl = runtime.rl;
+    try {
+      return JSON.stringify(
+        {
+          schemaVersion: RL_SCHEMA_VERSION,
+          botVersion: BOT_VERSION,
+          generatedAtMs: Date.now(),
+          gameID: runtime.identity.gameID,
+          clientID: runtime.identity.clientID,
+          mode: runtime.mode,
+          summary: {
+            sessionStartedAtMs: rl ? rl.sessionStartedAtMs : 0,
+            totalIntentsSent: rl ? rl.totalIntentsSent : 0,
+            totalIntentsBlocked: rl ? rl.totalIntentsBlocked : 0,
+            events: rl ? rl.events.length : 0,
+            matchEnded: rl ? rl.matchEnded : false,
+            peakSelfStats: rl ? rl.peakSelfStats : null,
+            firstActiveTick: rl ? rl.firstActiveTick : -1,
+            lastActionId: rl ? rl.lastActionId : 0,
+            tracking: rl
+              ? {
+                  goalsEverAdopted: Array.from(rl.tracking.goalsEverAdopted),
+                  plannerGoalsEverValid: Array.from(rl.tracking.plannerGoalsEverValid),
+                  everAdjacentToCollapsing: rl.tracking.everAdjacentToCollapsing,
+                  everRanTerrainRush: rl.tracking.everRanTerrainRush,
+                  everSawMirvRisk: rl.tracking.everSawMirvRisk,
+                  everSawCoalitionThreat: rl.tracking.everSawCoalitionThreat,
+                }
+              : null,
+          },
+          events: rl ? rl.events : [],
+        },
+        (key, value) =>
+          typeof value === "bigint" ? value.toString() : value,
+      );
+    } catch (err) {
+      return JSON.stringify({ error: err.message });
+    }
+  }
+
+  /**
+   * RL: trigger a browser file download of the current RL dump. No-op
+   * outside real browsers (jsdom/tampermonkey sandboxes that don't expose
+   * Blob / URL.createObjectURL / document.body). Always also copies to the
+   * clipboard via `copyToClipboard` so the user has a guaranteed fallback.
+   */
+  function downloadRlJson() {
+    const payload = dumpRlJson();
+    safeCall(() => copyToClipboard(payload), null);
+    const hasBlob = typeof Blob !== "undefined";
+    const hasUrl = typeof URL !== "undefined" && typeof URL.createObjectURL === "function";
+    if (!hasBlob || !hasUrl || !document || !document.body) {
+      return payload;
+    }
+    try {
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const gameID = runtime.identity.gameID || "unknown";
+      a.href = url;
+      a.download = "superbot-rl-" + gameID + "-" + stamp + ".json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => safeCall(() => URL.revokeObjectURL(url), null), 1000);
+    } catch (_) {
+      // Blob/URL failure — clipboard already has the payload.
+    }
+    return payload;
+  }
+
+  /**
+   * RL: persist the current match's dump into localStorage under the
+   * `superbotRL:<gameID>` key. Honours:
+   *   - RL_STORAGE_MAX_MATCHES (trim oldest entries)
+   *   - RL_STORAGE_MAX_BYTES   (halve `events` iteratively if too big)
+   *
+   * Best-effort: swallows quota + serialization errors (logs once).
+   */
+  function persistRlToStorage() {
+    const rl = runtime.rl;
+    if (!rl || !rl.enabled) return;
+    const storage = safeCall(
+      () => (typeof localStorage !== "undefined" ? localStorage : null),
+      null,
+    );
+    if (!storage) return;
+    const gameID = runtime.identity.gameID || "unknown";
+    const key = RL_STORAGE_KEY_PREFIX + gameID;
+
+    let payload = dumpRlJson();
+    // Shrink payload if it exceeds the cap — iteratively drop half of the
+    // events (keeping the newest half, which includes match_end).
+    let parsed = null;
+    let guard = 0;
+    while (payload.length > RL_STORAGE_MAX_BYTES && guard < 6) {
+      if (parsed === null) {
+        parsed = safeCall(() => JSON.parse(payload), null);
+        if (!parsed) break;
+      }
+      if (!Array.isArray(parsed.events) || parsed.events.length === 0) break;
+      parsed.events = parsed.events.slice(Math.floor(parsed.events.length / 2));
+      parsed.summary = parsed.summary || {};
+      parsed.summary.events = parsed.events.length;
+      parsed.summary.truncated = true;
+      payload = safeCall(() => JSON.stringify(parsed), payload);
+      guard += 1;
+    }
+
+    // Trim oldest matches until under the count cap.
+    const keys = [];
+    safeCall(() => {
+      for (let i = 0; i < storage.length; i++) {
+        const k = storage.key(i);
+        if (k && k.startsWith(RL_STORAGE_KEY_PREFIX)) keys.push(k);
+      }
+    }, null);
+    // Read timestamps (best-effort).
+    const withTs = keys.map((k) => {
+      const raw = safeCall(() => storage.getItem(k), null);
+      const ts = safeCall(() => JSON.parse(raw).generatedAtMs, 0) || 0;
+      return { key: k, ts };
+    });
+    withTs.sort((a, b) => a.ts - b.ts);
+    while (withTs.length >= RL_STORAGE_MAX_MATCHES) {
+      const oldest = withTs.shift();
+      if (!oldest) break;
+      safeCall(() => storage.removeItem(oldest.key), null);
+    }
+
+    try {
+      storage.setItem(key, payload);
+    } catch (err) {
+      // Quota / SecurityError / etc. — one log line then drop.
+      if (!runtime.rl._loggedStorageError) {
+        runtime.rl._loggedStorageError = true;
+        botLog("RL storage failed: " + (err && err.message));
+      }
+    }
+  }
+
   function ensureOverlay() {
     if (runtime.overlay.mounted) return;
     if (!document.body) return;
@@ -6947,6 +7744,7 @@
     const toggleButton = panel.querySelector("#superbot-toggle");
     const modeButton = panel.querySelector("#superbot-mode");
     const exportButton = panel.querySelector("#superbot-export");
+    const rlButton = panel.querySelector("#superbot-rl");
     const collapseButton = panel.querySelector("#superbot-collapse");
     const overrideRow = panel.querySelector("#superbot-override-goals");
     const archetypeSelect = panel.querySelector("#superbot-archetype");
@@ -6970,6 +7768,17 @@
       copyToClipboard(dumpWorldJson());
       botLog("world dump copied to clipboard");
     });
+
+    if (rlButton) {
+      rlButton.addEventListener("click", () => {
+        downloadRlJson();
+        safeCall(() => persistRlToStorage(), null);
+        const events = runtime.rl ? runtime.rl.events.length : 0;
+        botLog(
+          "RL dump ready (" + events + " events, copied to clipboard + download)",
+        );
+      });
+    }
 
     collapseButton.addEventListener("click", () => {
       panel.classList.toggle("collapsed");
@@ -7911,6 +8720,51 @@
       },
       runPlannerSuite: () => runPlannerTestSuite(),
       debugFlags: runtime.debugFlags,
+      rlDump: () => dumpRlJson(),
+      rlDownload: () => downloadRlJson(),
+    };
+    // Dedicated RL namespace for the downstream analyst + devtools use.
+    // Safe to read/write from the console; `enable` / `disable` flip the
+    // logger on the fly without restarting the bot.
+    window.__superhumanBotRL = {
+      get events() {
+        return runtime.rl.events;
+      },
+      dump: () => dumpRlJson(),
+      download: () => downloadRlJson(),
+      persist: () => persistRlToStorage(),
+      enable: () => {
+        runtime.rl.enabled = true;
+      },
+      disable: () => {
+        runtime.rl.enabled = false;
+      },
+      clear: () => {
+        runtime.rl.events = [];
+        runtime.rl.seq = 0;
+        runtime.rl.pendingOutcomes = [];
+      },
+      listStored: () => {
+        const storage = safeCall(
+          () => (typeof localStorage !== "undefined" ? localStorage : null),
+          null,
+        );
+        if (!storage) return [];
+        const out = [];
+        for (let i = 0; i < storage.length; i++) {
+          const k = storage.key(i);
+          if (k && k.startsWith(RL_STORAGE_KEY_PREFIX)) out.push(k);
+        }
+        return out;
+      },
+      loadStored: (key) => {
+        const storage = safeCall(
+          () => (typeof localStorage !== "undefined" ? localStorage : null),
+          null,
+        );
+        if (!storage) return null;
+        return storage.getItem(key);
+      },
     };
     runtime.test = {
       runSuite: runPlannerTestSuite,
@@ -7960,6 +8814,25 @@
         UnitType,
         PlayerType,
         BOT_VERSION,
+        // RL decision-logger internals (Phase 1). Exposed so tests can
+        // exercise them without spinning up the tick loop.
+        rlLog,
+        rlSelfSnapshot,
+        rlComputeReward,
+        RL_REWARD_WEIGHTS,
+        RL_SCHEMA_VERSION,
+        RL_OUTCOME_WINDOW_TICKS,
+        MAX_RL_EVENTS,
+        buildConfigSnapshot,
+        generateLeverSuspicions,
+        dumpRlJson,
+        handleMatchEnd,
+        detectMatchEnd,
+        maybeEmitPeriodicRL,
+        drainRlOutcomes,
+        maybeEmitPlannerDecision,
+        rlLogIntentSent,
+        rlLogIntentBlocked,
       },
     };
     installWebSocketHook();
