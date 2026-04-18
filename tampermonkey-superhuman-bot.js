@@ -29,32 +29,56 @@
  * Event kinds (see `rlLog` callsites for precise shapes):
  *   match_start       — game bootstrap: gameID, clientID, players roster.
  *   config_snapshot   — every named "lever" constant + full GOAL_SPECS list.
- *   world_snapshot    — sampled self/totals/threats every 10 ticks.
+ *   world_snapshot    — sampled self/totals/threats (cadence in constants).
  *   stat_delta        — short-term self deltas (tiles / troops / gold).
- *   planner_decision  — full lastEvaluation: winner + runner-ups + rejected.
- *   goal_switch       — edge-triggered goal transition, with pre-state.
+ *   planner_decision  — winner + top valid evaluations + rejected count.
+ *   goal_switch       — edge-triggered goal transition.
  *   reason            — every reasonLog() mirrored into the stream.
- *   intent_sent       — outgoing intents with actionId + preState.
+ *   intent_sent       — outgoing intents with actionId + target info.
  *   intent_blocked    — stealth-gate rejections (rate-limited per reason).
- *   intent_outcome    — 30-tick-later delta + reward for each intent_sent.
- *   spawn_decision    — chosen spawn tile + top-10 alternatives.
- *   threat_flash      — edge events: crown change, MIRV risk, coalition, overmatch.
- *   match_end         — death / socket close, with ranks + peaks + leverSuspicions.
+ *   intent_outcome    — delta + reward window_ticks after the intent.
+ *   spawn_decision    — chosen spawn tile + top alternatives.
+ *   threat_flash      — crown change, MIRV risk, coalition, overmatch.
+ *   match_end         — death / socket close, ranks + peaks + leverSuspicions.
+ *
+ * Export format (v2.6.1+):
+ *   The dumper defaults to `level: "compact"` with a 500 KB byte budget to
+ *   fit any LLM paste buffer. Compact form uses short keys:
+ *     - Each event:   { k: <code>, t: <tick>, s: <seq>, d: <data> }
+ *     - Kind codes:   MS = match_start, ME = match_end, CS = config_snapshot,
+ *                     WS = world_snapshot, SD = stat_delta,
+ *                     PD = planner_decision, GS = goal_switch, R = reason,
+ *                     IS = intent_sent, IB = intent_blocked,
+ *                     IO = intent_outcome, SP = spawn_decision,
+ *                     TF = threat_flash.
+ *     - Zero-valued / empty fields are stripped.
+ *     - Floats are rounded to 2 decimals.
+ *     - `summary.kindCodes` in the dump maps codes → full names.
+ *   If the compact dump still exceeds `maxBytes`, the noisiest kinds are
+ *   dropped oldest-first (WS → SD → R → IO → IS → PD → SP → IB → GS → TF).
+ *   `summary.droppedByKind` accounts for every drop.
+ *
+ *   For full-fidelity local debugging, call `dumpRlJson({ level: "full" })`.
  *
  * How to export:
- *   - Click "RL dump" in the overlay → clipboard + file download.
- *   - Or from devtools:  window.__superhumanBotRL.dump()  (returns a string)
- *                         window.__superhumanBotRL.download() (triggers file).
- *   - Last 3 matches auto-persist to localStorage under `superbotRL:<gameID>`.
+ *   - Click "RL dump" in the overlay → compact clipboard + file download.
+ *   - Or from devtools:
+ *        window.__superhumanBotRL.dump()                   // compact (default)
+ *        window.__superhumanBotRL.dump({ level: "full" })  // legacy fat form
+ *        window.__superhumanBotRL.dump({ maxBytes: 1e6 })  // custom budget
+ *        window.__superhumanBotRL.dumpFull()               // shortcut
+ *   - Last 3 matches auto-persist to localStorage under `superbotRL:<gameID>`
+ *     using the compact form under RL_STORAGE_MAX_BYTES.
  *
  * Feeding it to the next agent:
  *   Paste the JSON directly into the analyst prompt. Start with:
  *     1. `config_snapshot.leverHints` — named knobs most likely to matter.
- *     2. `match_end.leverSuspicions` — per-match heuristics ("died before
- *        T=300; look at spawn scoring").
- *     3. `planner_decision` entries — look for near-ties and long runs where
- *        the same goal kept winning by a small margin.
- *     4. `intent_outcome` rewards — flag actions whose reward < 0.
+ *     2. `match_end` (code `ME`) `.d.su` — per-match suspicions.
+ *     3. `planner_decision` (`PD`) entries — winner `w`, priority `wp`,
+ *        evaluations `ev[]` with id `id` + priority `p` + note `n`.
+ *     4. `intent_outcome` (`IO`) — reward `r`, tile delta `dT`, troop
+ *        delta `dP`. Flag actions whose `r` < 0.
+ *     5. `summary.droppedByKind` — if present, tells you what was trimmed.
  * ============================================================================
  */
 
