@@ -5681,6 +5681,204 @@
   }
 
   /**
+   * Human-readable descriptions for every goal id. These are surfaced as
+   * mouse-over tooltips in the overlay so the operator can tell at a glance
+   * what each strategy actually does, when it activates, and what tactical
+   * intent it is trying to push.
+   *
+   * Keep these short (2–4 sentences). They render inside a native browser
+   * title=... attribute, so line breaks must be encoded with \n and there's
+   * no markdown support.
+   */
+  const GOAL_DESCRIPTIONS = {
+    MIRV_LAST_RESORT:
+      "Panic-button MIRV salvo.\n" +
+      "Activates only when a hostile crown/coalition owns 45%+ of the map AND we can't afford or land a hydro (e.g. SAM-walled), OR we're about to die with zero retaliation. Spends every silo we have to reset the board.",
+    RETALIATION:
+      "Counter-attack into a player who is actively invading us.\n" +
+      "Fires when incoming troops exceed 25% of our standing army. Priority scales with incoming pressure. Keeps borders from collapsing while turning a defensive tick into an offensive one.",
+    CONSOLIDATE_FRONT:
+      "Hold-the-line defensive posture.\n" +
+      "Triggered at ≥60% front pressure and overtakes RETALIATION above 100% pressure. We stop sending attacks outward and instead thicken the border with DefensePosts and reserves so the line doesn't fold.",
+    SAM_OVERWHELM:
+      "Swamp an enemy's SAM network with multiple silos.\n" +
+      "Requires ≥2 active silos, a crown-tier hostile target, enough gold for 2+ atoms, and at least one enemy SAM to overwhelm. Used to bleed their interceptor stockpile before a decisive hydro/MIRV push.",
+    NUKE_CROWN:
+      "Regular nuclear pressure on the map leader.\n" +
+      "Requires a hostile crown at ≥30% share, at least one ready silo, and enough gold for an atom. Keeps the #1 player from snowballing; typically interleaves with SAM_OVERWHELM and SAVE_FOR_HYDRO.",
+    DEFENSIVE_TURTLE:
+      "We are the crown — defend the lead.\n" +
+      "Active when we own ≥30% of the map AND are ≥1.5x the runner-up. We stop donating, ignore aggressive land grabs, and build DefensePosts on human-facing borders. The goal is to not lose to a coalition collapse.",
+    SAM_WALL_BUILDUP:
+      "Pre-crown anti-nuke insurance.\n" +
+      "Kicks in at 25–30% share (the band just before we become the crown and start attracting MIRVs). Builds SAMs until we have roughly 1 SAM per 2 cities so the incoming nuke wave can't one-shot us.",
+    SAVE_FOR_HYDRO:
+      "Bank gold for a hydrogen bomb.\n" +
+      "Active once we have ≥4M gold but aren't yet at the hydro threshold, and the crown is hostile. Suppresses big non-essential spends so the gold bar actually reaches hydro range instead of leaking to cities.",
+    NEUTRALIZE_RISING_STAR:
+      "Hit-and-pop the fastest-growing enemy before they become a problem.\n" +
+      "Fires when the rising-star tracker flags a neighbour adding tiles fast and their troops are ≤1.2x ours. Goal is a surgical reset, not a conquest — deny snowball, then disengage.",
+    FARM_TRIBE:
+      "Steal free structures off a structure-rich tribe.\n" +
+      "Only triggers against adjacent TRIBE_FARM-tagged entities. Their DefensePosts / Cities convert on capture, so each tile is worth multiples of the troops we spend.",
+    EASY_NATION_GRAB:
+      "Easy conversions against weak Nations / structureless Bots.\n" +
+      "Requires us to have ≥8k troops and an adjacent Nation/Bot that's either <70% of our troops or has >30 tiles. Nations don't ally up, so they're the safest source of mid-game territory.",
+    TERRAIN_RUSH:
+      "Rush a collapsing neighbour before the swarm finishes them off.\n" +
+      "Activates when a neighbour is losing tiles fast with multiple attackers on them. Priority scales with how fast they're melting and how many attackers are piling on. Adjacent beats water-hop.",
+    TERRA_NULLIUS_RUSH:
+      "Grab unclaimed land while it's still available.\n" +
+      "Active early-game while ≥5% of the map is unowned and we're below 50% share. Converts directly into income + pop cap; priority tapers as the map fills up and mid-game goals take over.",
+    NAVAL_LAND_GRAB:
+      "Water-hop to soft targets or claim an island start.\n" +
+      "Needs ≥30k troops and boat capacity available. Fires for soft targets across water, or automatically on ISLAND archetype maps where we have to hop to expand at all.",
+    CHOKEPOINT_LOCK:
+      "Seal a bottleneck on choke-heavy maps.\n" +
+      "Only active on CHOKE_HEAVY archetype while we're under 35% share. Builds DefensePosts up to ~0.75 × city count so the natural terrain funnel becomes a kill-channel.",
+    DEFENSE_NETWORK:
+      "Sustained DefensePost network vs. a human neighbour.\n" +
+      "Requires ≥4 cities and an adjacent hostile Human (we don't waste gold on Nation/Bot borders). Targets DefensePosts at ~35% of city count so we can absorb repeated harass.",
+    DIPLOMACY_ISOLATE_CROWN:
+      "Talk neighbours out of the crown's coalition.\n" +
+      "Active when a hostile crown holds ≥25% share and we aren't the crown. Uses messages/embargoes/alliance outreach to shrink their coalition rather than spending troops.",
+    BETRAY_ALLY:
+      "Backstab an ally that's already dead weight.\n" +
+      "Extremely gated: alliance-break budget must be available, the ally must be confirmed-helpless over multiple ticks, no dangerous hostile nearby, and nobody hostile owns a MIRV. Only fires when the traitor debuff is clearly worth it.",
+    WARSHIP_DEFENSE:
+      "Keep a warship screen up around our ports.\n" +
+      "Requires ≥1 Port. Builds up to 2 warships on ISLAND maps, and matches enemy warship counts on the rest — so enemy transports can't just drive tiles into our ports.",
+    IDLE:
+      "Fallback goal when nothing else qualifies.\n" +
+      "Low-priority safety valve — means the economy/expansion loop is still running but no higher-level goal is driving it this tick.",
+  };
+
+  /**
+   * Tooltip copy for the three high-level overlay modes. Modes bias goal
+   * priorities and the troop reserve ratio; see modeBias() and
+   * computeReserveRatio().
+   */
+  const MODE_DESCRIPTIONS = {
+    balanced:
+      "BALANCED (default).\n" +
+      "No goal bias, standard troop reserve (≈35%). Lets the planner pick whatever scores highest — expansion, defense or nukes — based on the current world state.",
+    aggressive:
+      "AGGRESSIVE.\n" +
+      "Boosts offensive goals (NUKE_CROWN, TERRAIN_RUSH, NEUTRALIZE_RISING_STAR, EASY_NATION_GRAB, FARM_TRIBE, NAVAL_LAND_GRAB) by +12 priority and penalises turtle goals by −8. Lowers troop reserve by 8% so we commit harder on attacks. Use when we're snowballing or need to punish a rival.",
+    turtle:
+      "TURTLE.\n" +
+      "Boosts defensive goals (DEFENSIVE_TURTLE, SAM_WALL_BUILDUP, CONSOLIDATE_FRONT, SAVE_FOR_HYDRO, DEFENSE_NETWORK) by +12 and penalises risky expansion (NEUTRALIZE_RISING_STAR, NAVAL_LAND_GRAB) by −6. Raises troop reserve by 12% so we never overcommit. Use when surrounded or playing for late game.",
+  };
+
+  /**
+   * Tooltip copy for values surfaced in runtime.state.strategy. These are
+   * internal labels the executors set as they run; the overlay shows the
+   * current one under State → Strategy.
+   */
+  const STRATEGY_DESCRIPTIONS = {
+    bootstrap: "Script just loaded — waiting for the game view / UI state.",
+    "waiting for game view":
+      "Hooks captured, but the live GameView isn't ready yet (pre-match or post-reload).",
+    reconnect: "We lost our player handle — usually mid-match reconnect.",
+    spawn: "Early spawn placement module is running.",
+    "random-spawn-sample":
+      "Sampling candidate random-spawn tiles and scoring them (plains, enemy distance).",
+    "random-spawn-lock":
+      "Best random-spawn tile found; locking the final intent.",
+    "random-spawn-thinking":
+      "Waiting a short human-ish delay before confirming the random spawn.",
+    "random-spawn": "Sending the random-spawn intent this tick.",
+    "manual-spawn":
+      "Clicked-map spawn path — the game is looking for a legal tile on our behalf.",
+    "manual-spawn-thinking":
+      "Brief delay before committing the manual-spawn intent (stealth reaction jitter).",
+    expansion:
+      "Expansion executor: pushing troops across our border into free or enemy land.",
+    retaliation:
+      "Retaliation executor: counter-attacking a player who is actively invading us.",
+    "land-combat":
+      "Land-combat executor: sustained pressure on an adjacent enemy (not just a retaliation).",
+    economy:
+      "Economy executor: spending gold on cities/factories/ports (build or upgrade).",
+    naval:
+      "Naval executor: building/sending transports or Warships across water.",
+    nuke: "Nuke executor: constructing/launching Atom/Hydrogen/MIRV.",
+    "terrain-rush":
+      "Terrain-rush executor: grabbing tiles off a collapsing neighbour.",
+    support:
+      "Support executor: donating troops/gold to a struggling ally we want kept alive.",
+    diplomacy:
+      "Diplomacy executor: sending alliance requests/accepts, embargoes, or messages.",
+    consolidating:
+      "Consolidate-front executor: pulling attacks back and thickening the border.",
+  };
+
+  /**
+   * Tooltip copy for each label we render in the overlay (Hooks / State /
+   * Stats / Intel sections). Keyed by the visible label text.
+   */
+  const LABEL_DESCRIPTIONS = {
+    // Hooks
+    WebSocket:
+      "Game WebSocket hook. 'captured' = we can observe/send intents. 'missing' means Tampermonkey didn't intercept the socket.",
+    Worker:
+      "Game Worker hook. 'captured' = we can read game-state updates directly; 'fallback' means we're running off the UI state only.",
+    GameView:
+      "In-game GameView object. 'ready' once the match is live; 'waiting' in lobby / loading.",
+    "UI State":
+      "React UI state handle. 'ready' once the lobby/match renderer has mounted.",
+    // State
+    Phase:
+      "Match phase the bot thinks we're in: boot → spawn → start → active → closed.",
+    Strategy:
+      "Current strategy label (executor that ran last). Hover the value for details.",
+    Action:
+      "Last concrete action the bot took this tick (e.g. 'building Port', 'spawning', 'embargoing X').",
+    "Attack Ratio":
+      "Attack-slider value we're sending intents with (0–100%). Scales with mode and front pressure.",
+    "Rocket Arc":
+      "Preferred missile arc direction when we fire nukes this tick.",
+    "Clan Tag":
+      "Clan tag detected from our nickname. Used to auto-trust clanmates. 'auto' means none detected.",
+    // Stats
+    Tick: "Current game tick (1 tick ≈ 100ms).",
+    Troops: "Our live troop count.",
+    "Max Troops": "Our current population cap (scales with cities).",
+    Gold: "Our live gold balance. Drives builds, nukes, and donations.",
+    Tiles: "Tiles we currently own.",
+    Enemies: "Hostile players we share any border/world presence with.",
+    Allies: "Players we're actively allied with (excludes clanmates).",
+    "Border Tiles":
+      "Our outer-border tile count. Proxy for how much front we're defending.",
+    Outgoing: "Active attacks we're currently sending (intents still live).",
+    Incoming: "Active attacks pointed at us right now.",
+    // Intel
+    Archetype:
+      "Map archetype inferred from geography: CONTINENTAL / ISLAND / CHOKE_HEAVY / NUKE_RACE / ARENA / CONVENTIONAL. Biases which goals fire.",
+    Coalition:
+      "Largest alliance bloc share of the map. '⚠' if the planner flags it as a coalition-level threat.",
+    "My Share": "Fraction of usable land we own.",
+    Crown: "Current #1 player and their share. Primary target for nuke/diplomacy goals.",
+    "#2 Share": "Runner-up's share — used to decide if we've clinched DEFENSIVE_TURTLE.",
+    Rising:
+      "Top fastest-growing neighbours (tiles/min). Candidates for NEUTRALIZE_RISING_STAR.",
+    Collapsing:
+      "Players losing tiles fastest under multiple attackers. Feeds TERRAIN_RUSH.",
+    Danger:
+      "Closest high-threat-score hostile to us (mix of troops, gold, structures, adjacency).",
+    "MIRV Risk":
+      "YES if any hostile has enough gold/silos to plausibly fire an MIRV at us.",
+    Players:
+      "Live player count, broken down as Humans / Nations / Tribes.",
+    // Goal panel labels
+    Active: "Goal currently driving our actions this tick. Hover the id for details.",
+    Note: "One-line justification emitted by the active goal's evaluator.",
+    Horizon:
+      "Ticks remaining before the planner is allowed to switch goals (commit bonus window).",
+    "Mode bias": "Current overlay mode (balanced / aggressive / turtle). Hover for details.",
+  };
+
+  /**
    * Goal specifications. Each spec returns { valid, priority, note } from
    * evaluate(). onAct() is awaited and is expected to return true if the goal
    * actually caused an intent to be sent this tick. The goal list is
@@ -7484,61 +7682,61 @@
         }
       </style>
       <div class="superbot-header">
-        <div class="superbot-title">Superhuman Bot v${BOT_VERSION}</div>
+        <div class="superbot-title" title="Superhuman Bot overlay — hover any label, value, goal or button for a description of what it does.">Superhuman Bot v${BOT_VERSION}</div>
         <div class="superbot-controls">
-          <button id="superbot-toggle">ON</button>
-          <button id="superbot-mode">BAL</button>
-          <button id="superbot-export">export</button>
-          <button id="superbot-rl" title="Copy + download the RL decision log for the current match">RL dump</button>
-          <button id="superbot-collapse">_</button>
+          <button id="superbot-toggle" title="Master enable switch. When OFF the bot stops sending any intents.">ON</button>
+          <button id="superbot-mode" title="Strategy mode — cycle Balanced / Aggressive / Turtle. Hover for a full description.">BAL</button>
+          <button id="superbot-export" title="Copy a JSON dump of the current world model (intel, players, threats) to clipboard.">export</button>
+          <button id="superbot-rl" title="Copy + download the RL decision log for the current match (compact format).">RL dump</button>
+          <button id="superbot-collapse" title="Collapse / expand the overlay body.">_</button>
         </div>
       </div>
       <div class="superbot-body">
         <div class="superbot-section">
-          <div class="superbot-section-title">Hooks</div>
+          <div class="superbot-section-title" title="Which game internals we successfully hooked. All four must be ready before the bot can play.">Hooks</div>
           <div id="superbot-hooks"></div>
         </div>
         <div class="superbot-section">
-          <div class="superbot-section-title">State</div>
+          <div class="superbot-section-title" title="High-level runtime state: what phase we're in, which strategy executor ran last, and what the last action was.">State</div>
           <div id="superbot-state"></div>
         </div>
         <div class="superbot-section">
-          <div class="superbot-section-title">Stats</div>
+          <div class="superbot-section-title" title="Raw per-tick stats for our player (troops, gold, tiles, incoming/outgoing attacks).">Stats</div>
           <div id="superbot-stats"></div>
         </div>
         <div class="superbot-section">
-          <div class="superbot-section-title">Intel</div>
+          <div class="superbot-section-title" title="World-intel summary: map archetype, coalition share, crown, rising stars, danger, MIRV risk, population.">Intel</div>
           <div id="superbot-intel"></div>
         </div>
         <div class="superbot-section wide">
-          <div class="superbot-section-title">Goal</div>
+          <div class="superbot-section-title" title="Planner goal selection this tick: active goal, note, horizon, and the top candidate goals with their priorities. Hover any goal id for details.">Goal</div>
           <div id="superbot-goal"></div>
         </div>
         <div class="superbot-section wide">
-          <div class="superbot-section-title">Why</div>
+          <div class="superbot-section-title" title="Recent plain-English explanations of why the bot took each action. Hover the goal tag for details on that goal.">Why</div>
           <div id="superbot-reasons"></div>
         </div>
         <div class="superbot-section wide">
           <div class="superbot-section-title">
-            <span>Overrides</span>
+            <span title="Click a goal to force the planner into it for 120 seconds. Useful for debugging or overriding a tick-by-tick decision.">Overrides</span>
             <span id="superbot-override-timer" style="color: rgba(216, 228, 255, 0.5); font-weight: 500; text-transform: none; letter-spacing: 0;"></span>
           </div>
           <div class="superbot-override-row" id="superbot-override-goals"></div>
           <div style="margin-top:6px">
-            <span style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">Archetype</span>
-            <select class="superbot-select" id="superbot-archetype"></select>
+            <span title="Map archetype. Leave on (auto) to let the bot classify from geography. Lock to force a bias (ISLAND → naval, CHOKE_HEAVY → choke-lock, etc.)." style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em; cursor: help;">Archetype</span>
+            <select class="superbot-select" id="superbot-archetype" title="Override the detected map archetype."></select>
           </div>
           <div style="margin-top:6px">
-            <span style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">Trusted clan tags (comma-separated)</span>
-            <input class="superbot-input" id="superbot-clan" placeholder="e.g. UN, MLS" />
+            <span title="Additional clan tags that should be treated as trusted (no backstabbing, donation-eligible). Our own clan is auto-trusted." style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em; cursor: help;">Trusted clan tags (comma-separated)</span>
+            <input class="superbot-input" id="superbot-clan" placeholder="e.g. UN, MLS" title="Comma-separated extra clan tags to trust, e.g. 'UN, MLS'." />
           </div>
         </div>
         <div class="superbot-section wide">
-          <div class="superbot-section-title">Decisions</div>
+          <div class="superbot-section-title" title="Rolling log of planner / executor decisions. One line per interesting decision event.">Decisions</div>
           <div id="superbot-decisions" class="superbot-log"></div>
         </div>
         <div class="superbot-section wide">
-          <div class="superbot-section-title">Activity</div>
+          <div class="superbot-section-title" title="Rolling activity log — any user-visible message the bot logged this match.">Activity</div>
           <div id="superbot-activity" class="superbot-log"></div>
         </div>
       </div>
@@ -8267,11 +8465,16 @@
         const btn = document.createElement("button");
         btn.dataset.goal = entry.id;
         btn.textContent = entry.label;
+        const desc = GOAL_DESCRIPTIONS[entry.id];
+        btn.title = desc
+          ? desc + "\n\nClick to force this goal for 120s."
+          : "Force this goal for 120s.";
         btn.addEventListener("click", () => setForcedGoal(entry.id));
         overrideRow.appendChild(btn);
       }
       const clearBtn = document.createElement("button");
       clearBtn.textContent = "Clear";
+      clearBtn.title = "Clear any active force-goal override.";
       clearBtn.addEventListener("click", () => {
         runtime.planner.forcedGoalId = null;
         runtime.planner.forcedGoalExpiresMs = 0;
@@ -8304,17 +8507,40 @@
     refreshOverlay();
   }
 
+  /**
+   * Resolve the tooltip we should attach to a given label/value pair. We look
+   * up LABEL_DESCRIPTIONS first; callers may also pass an explicit
+   * `tooltip` override (e.g. for the Strategy row, whose value itself should
+   * be tooltipped with the per-strategy description).
+   */
+  function tooltipForRow(row) {
+    if (row && row.tooltip) return row.tooltip;
+    return (row && LABEL_DESCRIPTIONS[row.label]) || "";
+  }
+
   function renderRows(rows) {
     return rows
       .map((row) => {
+        const labelTip = tooltipForRow(row);
+        const valueTip = (row && row.valueTooltip) || "";
+        const labelTitle = labelTip
+          ? ' title="' + escapeHtml(labelTip) + '"'
+          : "";
+        const valueTitle = valueTip
+          ? ' title="' + escapeHtml(valueTip) + '"'
+          : "";
         return (
           '<div class="superbot-row">' +
-          '<span class="superbot-label">' +
+          '<span class="superbot-label"' +
+          labelTitle +
+          ">" +
           row.label +
           "</span>" +
           '<span class="superbot-value ' +
           (row.className || "") +
-          '">' +
+          '"' +
+          valueTitle +
+          ">" +
           row.value +
           "</span>" +
           "</div>"
@@ -8361,6 +8587,10 @@
           : runtime.mode === "aggressive"
             ? "AGG"
             : "TUR";
+      const modeTooltip =
+        (MODE_DESCRIPTIONS[runtime.mode] || "") +
+        "\n\nClick to cycle Balanced → Aggressive → Turtle.";
+      modeButton.title = modeTooltip;
     }
 
     if (hooksRoot) {
@@ -8399,7 +8629,13 @@
     if (stateRoot) {
       stateRoot.innerHTML = renderRows([
         { label: "Phase", value: runtime.state.matchPhase },
-        { label: "Strategy", value: runtime.state.strategy },
+        {
+          label: "Strategy",
+          value: runtime.state.strategy,
+          valueTooltip:
+            STRATEGY_DESCRIPTIONS[runtime.state.strategy] ||
+            "Internal strategy label — no extra description registered for this value.",
+        },
         { label: "Action", value: runtime.state.lastAction },
         {
           label: "Attack Ratio",
@@ -8519,25 +8755,48 @@
       const activeNote =
         planner.lastEvaluation.find((e) => e.id === activeId)?.note ||
         "-";
+      const activeDesc = GOAL_DESCRIPTIONS[activeId] || "";
+      const activeLabelTitle = LABEL_DESCRIPTIONS["Active"]
+        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Active"]) + '"'
+        : "";
+      const activeValueTitle = activeDesc
+        ? ' title="' + escapeHtml(activeDesc) + '"'
+        : "";
+      const noteLabelTitle = LABEL_DESCRIPTIONS["Note"]
+        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Note"]) + '"'
+        : "";
+      const horizonLabelTitle = LABEL_DESCRIPTIONS["Horizon"]
+        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Horizon"]) + '"'
+        : "";
+      const modeBiasLabelTitle = LABEL_DESCRIPTIONS["Mode bias"]
+        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Mode bias"]) + '"'
+        : "";
+      const modeBiasValueTitle = MODE_DESCRIPTIONS[runtime.mode]
+        ? ' title="' + escapeHtml(MODE_DESCRIPTIONS[runtime.mode]) + '"'
+        : "";
       const header =
-        `<div class="superbot-row"><span class="superbot-label">Active</span>` +
-        `<span class="superbot-value">${escapeHtml(activeId)}` +
+        `<div class="superbot-row"><span class="superbot-label"${activeLabelTitle}>Active</span>` +
+        `<span class="superbot-value"${activeValueTitle}>${escapeHtml(activeId)}` +
         (planner.forcedGoalId ? " (forced)" : "") +
         `</span></div>` +
-        `<div class="superbot-row"><span class="superbot-label">Note</span>` +
+        `<div class="superbot-row"><span class="superbot-label"${noteLabelTitle}>Note</span>` +
         `<span class="superbot-value">${escapeHtml(activeNote)}</span></div>` +
-        `<div class="superbot-row"><span class="superbot-label">Horizon</span>` +
+        `<div class="superbot-row"><span class="superbot-label"${horizonLabelTitle}>Horizon</span>` +
         `<span class="superbot-value">${remaining} ticks</span></div>` +
-        `<div class="superbot-row"><span class="superbot-label">Mode bias</span>` +
-        `<span class="superbot-value">${runtime.mode}</span></div>`;
+        `<div class="superbot-row"><span class="superbot-label"${modeBiasLabelTitle}>Mode bias</span>` +
+        `<span class="superbot-value"${modeBiasValueTitle}>${runtime.mode}</span></div>`;
 
       const list = planner.lastEvaluation
         .slice(0, 6)
         .map((ev) => {
           const cls =
             ev.id === planner.activeGoalId ? "" : "inactive";
+          const desc = GOAL_DESCRIPTIONS[ev.id];
+          const rowTitle = desc
+            ? ' title="' + escapeHtml(desc) + '"'
+            : "";
           return (
-            `<div class="superbot-goal-row ${cls}">` +
+            `<div class="superbot-goal-row ${cls}"${rowTitle}>` +
             `<span class="gid">${escapeHtml(ev.id)}</span>` +
             `<span class="gp">${ev.priority.toFixed(0)}</span>` +
             `<span class="gt">${escapeHtml(ev.note || (ev.valid ? "" : "invalid"))}</span>` +
@@ -8555,16 +8814,21 @@
           '<div style="color: rgba(216, 228, 255, 0.5); font-size: 11px;">no reasoned actions yet</div>';
       } else {
         reasonsRoot.innerHTML = entries
-          .map(
-            (entry) =>
+          .map((entry) => {
+            const desc = GOAL_DESCRIPTIONS[entry.goalId];
+            const headTitle = desc
+              ? ' title="' + escapeHtml(desc) + '"'
+              : "";
+            return (
               `<div class="superbot-reason">` +
-              `<div><span class="head">T${entry.tick} [${escapeHtml(entry.goalId)}]</span> ` +
+              `<div><span class="head"${headTitle}>T${entry.tick} [${escapeHtml(entry.goalId)}]</span> ` +
               `<span class="tail">${escapeHtml(entry.summary)}</span></div>` +
               (entry.detail
                 ? `<div class="tail">${escapeHtml(entry.detail)}</div>`
                 : "") +
-              `</div>`,
-          )
+              `</div>`
+            );
+          })
           .join("");
       }
     }

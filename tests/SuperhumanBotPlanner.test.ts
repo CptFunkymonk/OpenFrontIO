@@ -517,3 +517,66 @@ describe("tampermonkey-superhuman-bot EASY_NATION_GRAB planner goal", () => {
     expect(runtime.planner.forcedGoalId).toBeNull();
   });
 });
+
+describe("tampermonkey-superhuman-bot overlay tooltips", () => {
+  it("renders mouse-over tooltips on strategy modes, goal buttons, and labels", () => {
+    const runtime = loadUserscript();
+    const win: any = (globalThis as any).window;
+    // Make sure the overlay is mounted and refreshed — the script mounts on
+    // DOMContentLoaded, which in jsdom may have fired before our state is
+    // interesting, so just call the exported refresh handle directly.
+    expect(typeof win.__superhumanBotRefreshOverlay).toBe("function");
+
+    runtime.mode = "aggressive";
+    runtime.state.strategy = "economy";
+    runtime.planner.activeGoalId = "NUKE_CROWN";
+    runtime.planner.lastEvaluation = [
+      {
+        id: "NUKE_CROWN",
+        priority: 84,
+        valid: true,
+        note: "crown=X share=40%",
+      },
+      {
+        id: "DEFENSIVE_TURTLE",
+        priority: 0,
+        valid: false,
+        note: "",
+      },
+    ];
+    win.__superhumanBotRefreshOverlay();
+
+    const panel = win.document.getElementById("superbot-panel");
+    expect(panel, "overlay should be mounted").toBeTruthy();
+
+    // Mode button tooltip should describe AGGRESSIVE specifically.
+    const modeBtn = panel.querySelector("#superbot-mode");
+    expect(modeBtn, "mode button should exist").toBeTruthy();
+    const modeTitle = modeBtn!.getAttribute("title") || "";
+    expect(modeTitle).toContain("AGGRESSIVE");
+    expect(modeTitle).toContain("Balanced → Aggressive → Turtle");
+
+    // Override buttons should carry per-goal tooltips.
+    const overrideRow = panel.querySelector("#superbot-override-goals");
+    const turtleBtn = Array.from(
+      overrideRow!.querySelectorAll("button"),
+    ).find((b) => b.dataset.goal === "DEFENSIVE_TURTLE");
+    expect(turtleBtn, "Turtle override button should exist").toBeTruthy();
+    expect(turtleBtn!.getAttribute("title") || "").toContain(
+      "We are the crown",
+    );
+
+    // Strategy value in the State section should carry a per-strategy tooltip.
+    const stateRoot = panel.querySelector("#superbot-state");
+    const html = stateRoot!.innerHTML;
+    expect(html).toMatch(/title="[^"]*Economy executor/);
+
+    // Active goal value in the Goal section should carry the GOAL_DESCRIPTIONS
+    // tooltip for NUKE_CROWN.
+    const goalRoot = panel.querySelector("#superbot-goal");
+    const goalHtml = goalRoot!.innerHTML;
+    expect(goalHtml).toMatch(
+      /title="[^"]*Regular nuclear pressure on the map leader/,
+    );
+  });
+});
