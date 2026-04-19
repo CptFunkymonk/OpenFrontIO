@@ -518,6 +518,134 @@ describe("tampermonkey-superhuman-bot EASY_NATION_GRAB planner goal", () => {
   });
 });
 
+describe("tampermonkey-superhuman-bot overlay tooltips", () => {
+  it("renders mouse-over tooltips on strategy modes, goal buttons, and labels", () => {
+    const runtime = loadUserscript();
+    const win: any = (globalThis as any).window;
+    // Make sure the overlay is mounted and refreshed — the script mounts on
+    // DOMContentLoaded, which in jsdom may have fired before our state is
+    // interesting, so just call the exported refresh handle directly.
+    expect(typeof win.__superhumanBotRefreshOverlay).toBe("function");
+
+    // Snapshot prior planner + overlay state so we don't pollute sibling
+    // tests in the same file (the runtime is cached across tests).
+    const priorMode = runtime.mode;
+    const priorStrategy = runtime.state.strategy;
+    const priorActiveGoalId = runtime.planner.activeGoalId;
+    const priorLastEvaluation = runtime.planner.lastEvaluation;
+
+    try {
+      runtime.mode = "aggressive";
+      runtime.state.strategy = "economy";
+      runtime.planner.activeGoalId = "NUKE_CROWN";
+      runtime.planner.lastEvaluation = [
+        {
+          id: "NUKE_CROWN",
+          priority: 84,
+          valid: true,
+          note: "crown=X share=40%",
+        },
+        {
+          id: "DEFENSIVE_TURTLE",
+          priority: 0,
+          valid: false,
+          note: "",
+        },
+      ];
+      win.__superhumanBotRefreshOverlay();
+
+      const panel = win.document.getElementById("superbot-panel");
+      expect(panel, "overlay should be mounted").toBeTruthy();
+
+      // Mode button tooltip should describe AGGRESSIVE specifically.
+      const modeBtn = panel.querySelector("#superbot-mode");
+      expect(modeBtn, "mode button should exist").toBeTruthy();
+      const modeTitle = modeBtn!.getAttribute("title") || "";
+      expect(modeTitle).toContain("AGGRESSIVE");
+      expect(modeTitle).toContain("Balanced → Aggressive → Turtle");
+
+      // Override buttons should carry per-goal tooltips.
+      const overrideRow = panel.querySelector("#superbot-override-goals");
+      const turtleBtn = Array.from(
+        overrideRow!.querySelectorAll("button"),
+      ).find((b) => b.dataset.goal === "DEFENSIVE_TURTLE");
+      expect(turtleBtn, "Turtle override button should exist").toBeTruthy();
+      expect(turtleBtn!.getAttribute("title") || "").toContain(
+        "We are the crown",
+      );
+
+      // Strategy value in the State section should carry a per-strategy tooltip.
+      const stateRoot = panel.querySelector("#superbot-state");
+      const html = stateRoot!.innerHTML;
+      expect(html).toMatch(/title="[^"]*Economy executor/);
+
+      // Active goal value in the Goal section should carry the
+      // GOAL_DESCRIPTIONS tooltip for NUKE_CROWN.
+      const goalRoot = panel.querySelector("#superbot-goal");
+      const goalHtml = goalRoot!.innerHTML;
+      expect(goalHtml).toMatch(
+        /title="[^"]*Regular nuclear pressure on the map leader/,
+      );
+    } finally {
+      runtime.mode = priorMode;
+      runtime.state.strategy = priorStrategy;
+      runtime.planner.activeGoalId = priorActiveGoalId;
+      runtime.planner.lastEvaluation = priorLastEvaluation;
+    }
+  });
+
+  it("registers tooltips for the new REPEL_INVASION / PREEMPT_INVASION goals", () => {
+    const runtime = loadUserscript();
+    const win: any = (globalThis as any).window;
+    const priorActiveGoalId = runtime.planner.activeGoalId;
+    const priorLastEvaluation = runtime.planner.lastEvaluation;
+
+    try {
+      runtime.planner.activeGoalId = "REPEL_INVASION";
+      runtime.planner.lastEvaluation = [
+        {
+          id: "REPEL_INVASION",
+          priority: 99,
+          valid: true,
+          note: "invader=Overlord",
+        },
+        {
+          id: "PREEMPT_INVASION",
+          priority: 88,
+          valid: true,
+          note: "brewing=Rumble",
+        },
+      ];
+      win.__superhumanBotRefreshOverlay();
+
+      const panel = win.document.getElementById("superbot-panel");
+      const overrideRow = panel!.querySelector("#superbot-override-goals");
+      const repelBtn = Array.from(
+        overrideRow!.querySelectorAll("button"),
+      ).find((b) => b.dataset.goal === "REPEL_INVASION");
+      const preemptBtn = Array.from(
+        overrideRow!.querySelectorAll("button"),
+      ).find((b) => b.dataset.goal === "PREEMPT_INVASION");
+      expect(repelBtn, "Repel Invasion override button should exist").toBeTruthy();
+      expect(preemptBtn, "Preempt Invasion override button should exist").toBeTruthy();
+      expect(repelBtn!.getAttribute("title") || "").toContain(
+        "live invasion",
+      );
+      expect(preemptBtn!.getAttribute("title") || "").toContain(
+        "brewing invader",
+      );
+
+      const goalRoot = panel!.querySelector("#superbot-goal");
+      const goalHtml = goalRoot!.innerHTML;
+      expect(goalHtml).toMatch(/title="[^"]*Dedicated all-in defence/);
+      expect(goalHtml).toMatch(/title="[^"]*Harden the border/);
+    } finally {
+      runtime.planner.activeGoalId = priorActiveGoalId;
+      runtime.planner.lastEvaluation = priorLastEvaluation;
+    }
+  });
+});
+
 describe("tampermonkey-superhuman-bot invasion-defense goals", () => {
   // These tests wire world.threats directly and use the planner's
   // goal-evaluator machinery to confirm REPEL_INVASION and PREEMPT_INVASION
