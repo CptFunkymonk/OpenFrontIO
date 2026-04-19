@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.6.1
-// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, RL decision logger
+// @version      2.7.0
+// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense, compact RL decision logger
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.6.1";
+  const BOT_VERSION = "2.7.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -339,6 +339,9 @@
         mirvRisk: false,
         mirvCapable: [],
         adjacentEnemies: [],
+        activeInvaders: [],
+        brewingInvaders: [],
+        invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
       },
       archetype: "unknown",
@@ -4016,6 +4019,322 @@
   }
 
   /**
+   * REPEL_INVASION — dedicated defensive stance when a significantly
+   * stronger neighbour is actively invading us.
+   *
+   * Why a separate goal: CONSOLIDATE_FRONT and RETALIATION are both
+   * reasonable responses to pressure, but they each handle part of the
+   * picture. The repel goal coordinates the full defensive package:
+   *
+   *   1. Recall any outgoing attacks so all our troops are at home. The
+   *      game's attackAmount is 20% of our current troops per land attack
+   *      (see DefaultConfig.attackAmount), so every outstanding attack is
+   *      troops that aren't defending the border.
+   *   2. Issue a counter-attack against the invader. AttackExecution
+   *      explicitly cancels opposing attacks between two players
+   *      (incoming.troops() > attack.troops() → subtract), so a matched
+   *      counter directly burns down their force before any tiles flip.
+   *      We commit a big fraction (60–70%) because the game's attackLogic
+   *      gives us a fresh "largeAttackBonus" / defender debuff only when
+   *      *they're* large; when we're the smaller defender the maths are
+   *      already stacked against us, so half-commitments are worse than
+   *      either turtling or full-on pushback.
+   *   3. Build DefensePosts inside the border they're hitting. Each DP
+   *      multiplies defender magnitude ×5 and defender speed ×3 within
+   *      its radius (defensePostDefenseBonus/SpeedBonus), which is the
+   *      single biggest swing we have in the combat equations.
+   *   4. Upgrade SAMs + missile silos (no construction delay) so the
+   *      invader can't drop an Atom on our front stack while we're
+   *      digging in.
+   *
+   * We DO NOT try to attack anyone else or expand; we use maxCommit to
+   * pin every available troop on the repel. If the invader pulls back,
+   * the planner naturally demotes this goal next tick (activeInvaders is
+   * recomputed each update).
+   */
+  async function runGoal_RepelInvasion(me, borderTiles, selectionContext) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const world = runtime.world;
+    const invader =
+      (selectionContext && selectionContext.invader) ||
+      (world.threats.activeInvaders || [])[0];
+    if (!invader) return false;
+    const tick = gameView.ticks();
+
+    // Step 1: recall outgoing attacks. The game's AttackExecution keeps
+    // troops "in the attack" until resolution, so while we're being
+    // invaded those troops are out of the defensive pool. Cancelling is
+    // cheap — a 25% retreat malus vs losing the game entirely.
+    const outgoing = safeCall(() => me.outgoingAttacks(), []);
+    for (const attack of outgoing) {
+      // AttackUpdate properties are plain values on the PlayerView path;
+      // on the simulation-side PlayerImpl they are methods — handle both.
+      const attackID =
+        typeof attack.id === "function" ? attack.id() : attack.id;
+      if (!attackID) continue;
+      const retreating =
+        typeof attack.retreating === "function"
+          ? attack.retreating()
+          : Boolean(attack.retreating);
+      if (retreating) continue;
+      // Never recall an attack on the invader themselves — that IS our
+      // counter-punch (handled below).
+      const targetID =
+        typeof attack.targetID === "function"
+          ? attack.targetID()
+          : attack.targetID;
+      if (targetID === invader.smallID) continue;
+      if (sendIntent({ type: "cancel_attack", attackID })) {
+        reasonLog(
+          "REPEL_INVASION",
+          `Recalling troops from attack ${attackID} — ${invader.name} is invading.`,
+        );
+        // One cancel per tick; the dispatcher will call us again shortly.
+        return true;
+      }
+    }
+
+    // Step 2: counter-attack. Only fires once the combat cooldown clears
+    // (same 6-tick gate Retaliation uses so we don't spam intents).
+    if (tick - runtime.state.cooldowns.combat >= 6) {
+      const maxTroops = gameView.config().maxTroops(me);
+      // Aggressive floor — when we're being invaded we'd rather spend
+      // almost everything on the counter than let the incoming attack
+      // stack our border. The AttackExecution combines vs-subtracts logic
+      // means every troop we commit back directly eats their attack.
+      const reserveRatio = Math.max(
+        0.05,
+        computeReserveRatio(me, maxTroops) - 0.22,
+      );
+      // Prefer the troops-per-hit size the server will actually deal;
+      // calculateAttackTroops already clamps to deployable budget.
+      const troops = calculateAttackTroops(
+        me,
+        invader.player,
+        reserveRatio,
+        maxTroops,
+      );
+      if (troops > 0 && invader.isAdjacent) {
+        if (sendAttack(invader.id, troops)) {
+          runtime.state.cooldowns.combat = tick;
+          reasonLog(
+            "REPEL_INVASION",
+            `Counter-attacking invader ${invader.name} to cancel their push.`,
+            `${fmtTroops(troops)} committed vs ${fmtTroops(invader.invasionIncoming || 0)} inbound`,
+          );
+          return true;
+        }
+      }
+    }
+
+    // Step 3: DefensePost wall on the hot side. Reuse the consolidation
+    // placement logic but target the invader specifically.
+    if (tick - runtime.state.cooldowns.economy >= 10 && borderTiles.length > 0) {
+      const hotBorder = borderTiles.filter((t) => {
+        return gameView.neighbors(t).some(
+          (n) => gameView.ownerID(n) === invader.smallID,
+        );
+      });
+      if (hotBorder.length > 0) {
+        const interiorSet = new Set();
+        for (const t of hotBorder.slice(0, 48)) {
+          for (const n of gameView.neighbors(t)) {
+            if (gameView.ownerID(n) !== me.smallID()) continue;
+            if (safeCall(() => gameView.isBorder(n), false)) continue;
+            interiorSet.add(n);
+          }
+        }
+        const combined = Array.from(interiorSet).concat(hotBorder);
+        for (const tile of combined.slice(0, 32)) {
+          const buildables = await queryPlayerBuildables(tile, [
+            UnitType.DefensePost,
+          ]);
+          const buildable = buildables.find(
+            (b) => b.type === UnitType.DefensePost,
+          );
+          if (!buildable || buildable.canBuild === false) continue;
+          if (sendBuild(UnitType.DefensePost, tile)) {
+            runtime.state.cooldowns.economy = tick;
+            reasonLog(
+              "REPEL_INVASION",
+              `Hardening the front against ${invader.name}'s invasion.`,
+              "DefensePost ×5 defender magnitude",
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    // Step 4: upgrade existing SAMs/silos so nukes can't clear the front
+    // stack. No construction delay — upgrades are the cheapest possible
+    // move under invasion pressure.
+    if (tick - runtime.state.cooldowns.economy >= 8) {
+      for (const type of [UnitType.SAMLauncher, UnitType.MissileSilo]) {
+        if (await tryUpgradeStructure(me, type)) {
+          runtime.state.cooldowns.economy = tick;
+          reasonLog(
+            "REPEL_INVASION",
+            `Upgrading ${type} to survive invader's pressure.`,
+          );
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * PREEMPT_INVASION — a neighbour matching the brewing-invader heuristic
+   * is gaining troops and not spending them elsewhere, so we expect the
+   * push to land soon. Cheap, reversible prep:
+   *
+   *   1. DefensePost cadence along the suspect border (same attackLogic
+   *      ×5/×3 multipliers as REPEL — placing them *before* the attack
+   *      means they're already built, not under construction, when the
+   *      first wave hits).
+   *   2. Try to recruit a co-border ally. AllianceRequestExecution auto-
+   *      accepts when both sides have outstanding requests; partnering
+   *      with a neighbour that borders the invader splits their attention.
+   *   3. Embargo the invader to starve their gold income (they presumably
+   *      need gold for cities/factories to keep growing troops).
+   */
+  async function runGoal_PreemptInvasion(me, borderTiles, selectionContext) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const world = runtime.world;
+    const invader =
+      (selectionContext && selectionContext.invader) ||
+      (world.threats.brewingInvaders || [])[0];
+    if (!invader) return false;
+    const tick = gameView.ticks();
+
+    // Step 1: DefensePost wall along the suspect border.
+    if (tick - runtime.state.cooldowns.economy >= 14 && borderTiles.length > 0) {
+      const hotBorder = borderTiles.filter((t) => {
+        return gameView.neighbors(t).some(
+          (n) => gameView.ownerID(n) === invader.smallID,
+        );
+      });
+      if (hotBorder.length > 0) {
+        const interiorSet = new Set();
+        for (const t of hotBorder.slice(0, 48)) {
+          for (const n of gameView.neighbors(t)) {
+            if (gameView.ownerID(n) !== me.smallID()) continue;
+            if (safeCall(() => gameView.isBorder(n), false)) continue;
+            interiorSet.add(n);
+          }
+        }
+        const combined = Array.from(interiorSet).concat(hotBorder);
+        for (const tile of combined.slice(0, 32)) {
+          const buildables = await queryPlayerBuildables(tile, [
+            UnitType.DefensePost,
+          ]);
+          const buildable = buildables.find(
+            (b) => b.type === UnitType.DefensePost,
+          );
+          if (!buildable || buildable.canBuild === false) continue;
+          if (sendBuild(UnitType.DefensePost, tile)) {
+            runtime.state.cooldowns.economy = tick;
+            reasonLog(
+              "PREEMPT_INVASION",
+              `Pre-building DefensePost — ${invader.name} looks like they're winding up.`,
+              `they gained ${(invader.troopsPerMin || 0).toFixed(0)} troops/min`,
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    // Step 2: recruit a co-bordering ally to split the invader's attention.
+    if (tick - runtime.state.cooldowns.diplomacy >= 50) {
+      const myEntry = world.me;
+      const currentAllies = world.everyone.filter(
+        (e) => e.isAlly || e.isClanmate,
+      );
+      if (myEntry && currentAllies.length < ALLIANCE_CAP) {
+        const candidates = world.everyone
+          .filter(
+            (e) =>
+              !e.isMe &&
+              !e.isAlly &&
+              !e.isClanmate &&
+              !e.isFriendly &&
+              e.smallID !== invader.smallID &&
+              e.type !== PlayerType.Bot,
+          )
+          // Must be able to pressure the invader: either adjacent to them
+          // directly, or adjacent to us so they can join the defense.
+          .filter((e) => {
+            const borderingInvader = safeCall(
+              () =>
+                e.player.isAlliedWith &&
+                world.allianceGraph &&
+                (world.allianceGraph.edges.get(e.smallID) || new Set()).has(
+                  invader.smallID,
+                ),
+              false,
+            );
+            return (e.isAdjacent || !borderingInvader);
+          })
+          .sort((a, b) => (b.strength || 0) - (a.strength || 0));
+        for (const candidate of candidates.slice(0, 4)) {
+          const tile = gatherStructureTiles(candidate.player)[0];
+          if (!tile) continue;
+          const actions = await queryPlayerActions(tile, null);
+          if (
+            !actions ||
+            !actions.interaction ||
+            !actions.interaction.canSendAllianceRequest
+          ) {
+            continue;
+          }
+          if (sendAllianceRequest(candidate.id)) {
+            runtime.state.cooldowns.diplomacy = tick;
+            reasonLog(
+              "PREEMPT_INVASION",
+              `Asking ${candidate.name} to ally — ${invader.name} looks ready to invade us.`,
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    // Step 3: embargo the invader to slow their build-up.
+    if (tick - runtime.state.cooldowns.diplomacy >= 40) {
+      const sampleTile =
+        gatherStructureTiles(invader.player)[0] ||
+        sampleTilesForOwner(invader.smallID, 1, {
+          requireLand: true,
+          maxSamples: 120,
+        })[0];
+      if (sampleTile) {
+        const actions = await queryPlayerActions(sampleTile, null);
+        if (
+          actions &&
+          actions.interaction &&
+          actions.interaction.canEmbargo
+        ) {
+          if (sendEmbargo(invader.id, "start")) {
+            runtime.state.cooldowns.diplomacy = tick;
+            reasonLog(
+              "PREEMPT_INVASION",
+              `Embargoing ${invader.name} to starve their build-up of gold.`,
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * ConsolidateFront — heavy DefensePost cadence on the side of our border
    * that's under attack. Called when incoming troop pressure exceeds 60% of
    * our reserve. Picks border tiles adjacent to the top-threat hostile.
@@ -5245,6 +5564,41 @@
     const softTargets = [];
     const mirvCapable = [];
     const collapsingTargets = [];
+    // INVASION DETECTION.
+    //
+    // A brewing invader is a strong adjacent neighbour hoarding troops without
+    // distributing them across other players' borders — classic "winding up"
+    // pattern before a dedicated push at us. An active invader is any adjacent
+    // stronger neighbour whose incoming-attack troops against us cross a real
+    // threat threshold. Both lists feed the dedicated REPEL/PREEMPT goals
+    // plus the reasonLog summaries.
+    const brewingInvaders = [];
+    const activeInvaders = [];
+    // Pre-compute per-attacker incoming-troop sums onto us so we can tag an
+    // attacker by how hard they're hitting us specifically (many fronts can
+    // hit us in the same tick). Source of truth is meEntry.incomingAttacks.
+    //
+    // `incomingAttacks()` on a PlayerView yields AttackUpdate records where
+    // troops / attackerID / targetID are plain properties (AttackUpdate in
+    // GameUpdates.ts). On the simulation side (PlayerImpl) troops is a
+    // method. We handle both so the same walker works in unit tests
+    // that feed in mocked entries.
+    const incomingBySmallID = new Map();
+    if (meEntry && Array.isArray(meEntry.incomingAttacks)) {
+      for (const attack of meEntry.incomingAttacks) {
+        const attackerID = safeCall(() => attack.attackerID, null);
+        if (attackerID === null || attackerID === 0) continue;
+        const troops =
+          typeof attack.troops === "function"
+            ? safeCall(() => attack.troops(), 0)
+            : Number(attack.troops) || 0;
+        incomingBySmallID.set(
+          attackerID,
+          (incomingBySmallID.get(attackerID) || 0) + troops,
+        );
+      }
+    }
+    let invasionTroopsInbound = 0;
     let inboundTroopTotal = 0;
     let nearestDanger = null;
     let nearestDangerScore = -Infinity;
@@ -5407,13 +5761,88 @@
         (tags.has("ADJACENT") ? 15 : 0) +
         collapseBoost;
 
+      // INVASION detection. We classify a neighbour as an imminent invader
+      // when all of the following hold:
+      //   - they border us AND are hostile (required — a non-adjacent
+      //     attacker can't roll us on land),
+      //   - they are meaningfully stronger than us (troops OR a combined
+      //     strength signal — a gold-rich neighbour with silos is still an
+      //     invasion risk even if their visible troop count is middling),
+      //   - they are a real actor (Human or Nation — Bots/tribes are
+      //     caught by FARM_TRIBE and rarely sustain a push against us).
+      // On top of that baseline we check two signatures:
+      //   - "brewing": they are gaining troops fast AND NOT distributing
+      //     those troops against other neighbours (outgoing attacks ≈ 0,
+      //     or only small skirmishes). That is the classic "winding up"
+      //     pattern before they dedicate everything to us.
+      //   - "active": they are right now sending a large fraction of
+      //     their army at us.
+      // Both signatures also qualify a target as "attacking us" for the
+      // REPEL goal; but we keep them separate in world.threats so the
+      // planner and overlay can distinguish "about to invade" from
+      // "currently invading".
+      if (
+        !entry.isMe &&
+        !entry.isFriendly &&
+        adjacent &&
+        entry.type !== PlayerType.Bot
+      ) {
+        const incomingAtUs = incomingBySmallID.get(entry.smallID) || 0;
+        const strongerByTroops = entry.troops >= meTroops * 1.15;
+        const strongerByStrength =
+          strength >= (meEntry ? meEntry.strength || meTroops : meTroops) * 1.2;
+        const stronger = strongerByTroops || strongerByStrength;
+
+        // Active invader: ongoing attack whose size is meaningful relative
+        // to our defending troops, OR any attack from a notably stronger
+        // neighbour. 25% of our troops is a low bar deliberately — if an
+        // overmatched neighbour is already pushing, we must react even
+        // before it looks catastrophic.
+        const pressureRatio = incomingAtUs / Math.max(1, meTroops);
+        const activeAttack =
+          incomingAtUs > 0 &&
+          (pressureRatio >= 0.25 || (stronger && pressureRatio >= 0.1));
+
+        // Brewing invader: they're banking troops — gaining troops over
+        // the last history window AND not spending them elsewhere. We
+        // sum their outgoing attacks and treat "small skirmishes" (< 10%
+        // of their troops) as still consistent with winding up for us.
+        const troopsGainFast = entry.troopsPerMin >= Math.max(800, meTroops * 0.15);
+        const dedicatedToOthers =
+          entry.outgoingTroops > 0 &&
+          entry.outgoingTroops >= entry.troops * 0.15;
+        const brewing =
+          stronger &&
+          !activeAttack &&
+          (troopsGainFast || entry.troopRatio >= 0.85) &&
+          !dedicatedToOthers;
+
+        if (activeAttack) {
+          tags.add("INVADING_US");
+          entry.invasionPressure = pressureRatio;
+          entry.invasionIncoming = incomingAtUs;
+          invasionTroopsInbound += incomingAtUs;
+          activeInvaders.push(entry);
+          // Active invaders are by construction the top-priority danger
+          // on the border — bump their threatScore so downstream tactics
+          // pick them first.
+          entry.threatScore = threatScore + 40;
+        } else if (brewing) {
+          tags.add("BREWING_INVASION");
+          entry.invasionPressure = 0;
+          entry.invasionIncoming = 0;
+          brewingInvaders.push(entry);
+          entry.threatScore = threatScore + 20;
+        }
+      }
+
       if (
         adjacent &&
         !entry.isFriendly &&
-        threatScore > nearestDangerScore
+        entry.threatScore > nearestDangerScore
       ) {
         nearestDanger = entry;
-        nearestDangerScore = threatScore;
+        nearestDangerScore = entry.threatScore;
       }
     }
 
@@ -5428,6 +5857,13 @@
       if (a.isAdjacent !== b.isAdjacent) return a.isAdjacent ? -1 : 1;
       return b.tiles - a.tiles;
     });
+    // Invasion lists: active first (most urgent), biggest pressure at the
+    // top. Brewing list is ranked by strength so we preempt the scariest
+    // build-up if we can afford to.
+    activeInvaders.sort(
+      (a, b) => (b.invasionIncoming || 0) - (a.invasionIncoming || 0),
+    );
+    brewingInvaders.sort((a, b) => (b.strength || 0) - (a.strength || 0));
 
     // Update crown w/ hysteresis tracking (see Phase 2 acceptance criterion).
     runtime.world.prevCrownSmallID = runtime.world.threats.crownSmallID;
@@ -5442,6 +5878,9 @@
       mirvRisk: mirvCapable.length > 0,
       mirvCapable,
       adjacentEnemies,
+      activeInvaders: activeInvaders.slice(0, 5),
+      brewingInvaders: brewingInvaders.slice(0, 5),
+      invasionTroopsInbound,
       inboundTroopTotal,
     };
   }
@@ -5693,6 +6132,8 @@
         case "CONSOLIDATE_FRONT":
         case "SAVE_FOR_HYDRO":
         case "DEFENSE_NETWORK":
+        case "REPEL_INVASION":
+        case "PREEMPT_INVASION":
           return 12;
         case "NEUTRALIZE_RISING_STAR":
         case "NAVAL_LAND_GRAB":
@@ -5764,6 +6205,90 @@
           valid: true,
           priority: 70 + clamp(pressure * 20, 0, 20),
           note: `${fmtTroops(me.incomingTroops)} inbound vs ${fmtTroops(me.troops)} defending`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      // REPEL_INVASION — a significantly stronger hostile neighbour is
+      // actively invading us. Dedicated survival goal: recall any outgoing
+      // attacks, fortify the hot border with DefensePosts, donate nothing,
+      // and block external aggression via diplomacy (embargo, allies).
+      // Priority is intentionally very high (ladder tops out at 98 for
+      // emergency MIRV) so RETALIATION and offensive goals step aside.
+      id: "REPEL_INVASION",
+      horizonTicks: 160,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const invaders = world.threats.activeInvaders || [];
+        if (invaders.length === 0) return { valid: false };
+        const invader = invaders[0];
+        const inbound = world.threats.invasionTroopsInbound || 0;
+        const pressure = inbound / Math.max(1, me.troops);
+        // Base 90 so it outranks CONSOLIDATE_FRONT (94 when extreme) only
+        // when the situation is already severe, and escalates with how
+        // badly we're overmatched so we always prefer the most acute
+        // response when pressure is high.
+        let priority = 88;
+        if (pressure >= 0.5) priority += 4;
+        if (pressure >= 1.0) priority += 4;
+        if (invader.troops >= me.troops * 2) priority += 2;
+        return {
+          valid: true,
+          priority,
+          note:
+            `invader=${invader.name} ` +
+            `${fmtTroops(inbound)} inbound vs ${fmtTroops(me.troops)} ` +
+            `(pressure ${(pressure * 100).toFixed(0)}%)`,
+          context: { invader },
+        };
+      },
+      onAct: async () => false,
+    },
+    {
+      // PREEMPT_INVASION — a brewing invader: strong, bordering us, gaining
+      // troops but not spending them elsewhere. We haven't been hit yet but
+      // we can see it coming. Cheap, reversible preparations: stockpile
+      // border DefensePosts, upgrade SAMs, and try to draw in a co-bordering
+      // ally so the invader has to choose between two fronts. Lower
+      // priority than REPEL_INVASION and CONSOLIDATE_FRONT — this kicks in
+      // *before* the attack lands.
+      //
+      // The priority is set above TERRA_NULLIUS_RUSH on purpose: when a
+      // significantly stronger neighbour is winding up specifically against
+      // us, spending our last tick on grabbing unclaimed tiles is the
+      // wrong trade — we need DPs and allies more than we need marginal
+      // land. It still sits below RETALIATION/CONSOLIDATE/DEFENSIVE_TURTLE
+      // so we can't stall the late-game crown response.
+      id: "PREEMPT_INVASION",
+      horizonTicks: 300,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        // If someone's already invading we defer to REPEL_INVASION.
+        if ((world.threats.activeInvaders || []).length > 0) {
+          return { valid: false };
+        }
+        const brewing = world.threats.brewingInvaders || [];
+        if (brewing.length === 0) return { valid: false };
+        const invader = brewing[0];
+        const troopRatio = invader.troops / Math.max(1, me.troops);
+        // Scale with how overmatched we are: a 2× invader warrants more
+        // urgency than a 1.2× one. Base 82 clears TERRA_NULLIUS_RUSH's
+        // typical peak (~81) and RETALIATION's idle peak (70).
+        let priority = 82;
+        if (troopRatio >= 1.5) priority += 2;
+        if (troopRatio >= 2.0) priority += 2;
+        return {
+          valid: true,
+          priority,
+          note:
+            `brewing=${invader.name} ratio=${troopRatio.toFixed(2)} ` +
+            `+${(invader.troopsPerMin || 0).toFixed(0)} troops/min`,
+          context: { invader },
         };
       },
       onAct: async () => false,
@@ -6538,6 +7063,13 @@
           collapsingTargetSmallIDs: (world.threats.collapsingTargets || []).map(
             (e) => e.smallID,
           ),
+          activeInvaderSmallIDs: (world.threats.activeInvaders || []).map(
+            (e) => e.smallID,
+          ),
+          brewingInvaderSmallIDs: (world.threats.brewingInvaders || []).map(
+            (e) => e.smallID,
+          ),
+          invasionTroopsInbound: world.threats.invasionTroopsInbound || 0,
           nearestDangerSmallID: world.threats.nearestDanger
             ? world.threats.nearestDanger.smallID
             : null,
@@ -6888,6 +7420,22 @@
       case "SAM_OVERWHELM":
         handled = await runGoal_SamOverwhelm(me);
         if (!handled) handled = await maybeNuke(me);
+        break;
+      case "REPEL_INVASION":
+        handled = await runGoal_RepelInvasion(me, borderTiles, selectionContext);
+        // If the dedicated handler couldn't act this tick (cooldowns,
+        // no buildable border, etc.) fall through to CONSOLIDATE_FRONT's
+        // DP placement and then retaliation so we ALWAYS do something
+        // defensive when under active invasion.
+        if (!handled) handled = await runGoal_ConsolidateFront(me);
+        if (!handled) handled = await runGoal_Retaliation(me, borderTiles);
+        break;
+      case "PREEMPT_INVASION":
+        handled = await runGoal_PreemptInvasion(me, borderTiles, selectionContext);
+        // Pre-emptive goal: if prep moves all failed, fall through to
+        // defense/economy so we keep building cities + SAMs while waiting.
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeDiplomacy(me);
         break;
       case "DEFENSIVE_TURTLE":
         handled = await runGoal_DefensiveTurtle(me);
@@ -8797,6 +9345,9 @@
         mirvRisk: false,
         mirvCapable: [],
         adjacentEnemies: [],
+        activeInvaders: [],
+        brewingInvaders: [],
+        invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
       },
       archetype: "CONTINENTAL",
@@ -9159,6 +9710,98 @@
       pass: unsafe === true,
     });
     runtime.world = previous;
+
+    // Scenario 13: REPEL_INVASION — a significantly stronger adjacent
+    // neighbour is actively attacking us. CONSOLIDATE_FRONT evaluates
+    // against the same pressure (≥0.6), so the test also proves the
+    // repel goal out-prioritizes it when both are valid.
+    const scenario13 = buildTestWorld();
+    scenario13.me.troops = 40_000;
+    scenario13.me.incomingTroops = 50_000;
+    scenario13.threats.activeInvaders = [
+      {
+        smallID: 77,
+        name: "Invader",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 120_000,
+        troopsPerMin: 400,
+        invasionIncoming: 50_000,
+        invasionPressure: 1.25,
+        strength: 150_000,
+      },
+    ];
+    scenario13.threats.invasionTroopsInbound = 50_000;
+    step(
+      "stronger adjacent actively invading -> REPEL_INVASION",
+      scenario13,
+      "REPEL_INVASION",
+    );
+
+    // Scenario 14: PREEMPT_INVASION — strong brewing neighbour, no
+    // incoming attacks yet.
+    const scenario14 = buildTestWorld();
+    scenario14.me.troops = 40_000;
+    scenario14.me.incomingTroops = 0;
+    scenario14.threats.brewingInvaders = [
+      {
+        smallID: 78,
+        name: "Winder",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 90_000,
+        troopsPerMin: 2500,
+        outgoingTroops: 0,
+        troopRatio: 0.9,
+        strength: 100_000,
+      },
+    ];
+    // Small incoming to make sure RETALIATION doesn't trigger; none here.
+    step(
+      "brewing invader only -> PREEMPT_INVASION",
+      scenario14,
+      "PREEMPT_INVASION",
+    );
+
+    // Scenario 15: REPEL_INVASION outranks PREEMPT_INVASION when both
+    // lists are populated at the same time (active takes priority).
+    const scenario15 = buildTestWorld();
+    scenario15.me.troops = 40_000;
+    scenario15.me.incomingTroops = 20_000;
+    scenario15.threats.activeInvaders = [
+      {
+        smallID: 77,
+        name: "Active",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 100_000,
+        invasionIncoming: 20_000,
+        invasionPressure: 0.5,
+        strength: 120_000,
+      },
+    ];
+    scenario15.threats.brewingInvaders = [
+      {
+        smallID: 78,
+        name: "Winder",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 90_000,
+        troopsPerMin: 2500,
+        outgoingTroops: 0,
+        strength: 100_000,
+      },
+    ];
+    scenario15.threats.invasionTroopsInbound = 20_000;
+    step(
+      "active + brewing both present -> REPEL_INVASION wins",
+      scenario15,
+      "REPEL_INVASION",
+    );
 
     // Scenario 6: parabolic SAM check should mark fewer trajectories as
     // intercepted than the linear approximation when the SAM sits on the
