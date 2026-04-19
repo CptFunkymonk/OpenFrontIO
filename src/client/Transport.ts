@@ -173,6 +173,29 @@ export class SendUpdateGameConfigIntentEvent implements GameEvent {
   constructor(public readonly config: Partial<GameConfig>) {}
 }
 
+/**
+ * Shape of the singleplayer/replay bridge that Transport exposes on
+ * `window.__openFrontLocalTransport` when no WebSocket is available.
+ *
+ * External bot userscripts (e.g. the Superhuman Bot) hook `window.WebSocket`
+ * to observe the multiplayer socket. That hook never fires in singleplayer
+ * mode (Impossible AI, replay) because all traffic flows through the
+ * in-process `LocalServer`. This bridge is the singleplayer equivalent: it
+ * lets the same userscripts listen to server messages and submit client
+ * intents without ever opening a socket.
+ */
+export interface LocalTransportBridge {
+  readonly isLocal: true;
+  send(msg: ClientMessage): void;
+  addMessageListener(listener: (msg: ServerMessage) => void): () => void;
+}
+
+declare global {
+  interface Window {
+    __openFrontLocalTransport?: LocalTransportBridge;
+  }
+}
+
 export class Transport {
   private socket: WebSocket | null = null;
 
@@ -182,6 +205,16 @@ export class Transport {
 
   private onconnect: () => void;
   private onmessage: (msg: ServerMessage) => void;
+
+  // Extra listeners that want a copy of every server message. Populated by
+  // the singleplayer bridge below — see `installLocalBridge` — so that
+  // userscripts can observe traffic without patching `Transport`.
+  private messageListeners: Array<(msg: ServerMessage) => void> = [];
+
+  // Most recent "start" server message (singleplayer). The LocalServer emits
+  // exactly one "start" before any userscript has a chance to subscribe via
+  // the local bridge, so we replay it to late subscribers.
+  private lastLocalStart: ServerMessage | null = null;
 
   private pingInterval: number | null = null;
   public readonly isLocal: boolean;
@@ -298,7 +331,7 @@ export class Transport {
     onmessage: (message: ServerMessage) => void,
   ) {
     if (this.isLocal) {
-      this.localServer.updateCallback(onconnect, onmessage);
+      this.localServer.updateCallback(onconnect, this.wrapLocalMessage(onmessage));
     } else {
       this.onconnect = onconnect;
       this.onmessage = onmessage;
@@ -309,13 +342,77 @@ export class Transport {
     onconnect: () => void,
     onmessage: (message: ServerMessage) => void,
   ) {
+    this.removeLocalBridge();
     this.localServer = new LocalServer(
       this.lobbyConfig,
       this.lobbyConfig.gameRecord !== undefined,
       this.eventBus,
     );
-    this.localServer.updateCallback(onconnect, onmessage);
+    this.localServer.updateCallback(onconnect, this.wrapLocalMessage(onmessage));
+    this.installLocalBridge();
     this.localServer.start();
+  }
+
+  // Wrap the client's onmessage callback so extra listeners (the singleplayer
+  // bridge) get a copy of every server message that LocalServer emits.
+  private wrapLocalMessage(
+    onmessage: (message: ServerMessage) => void,
+  ): (message: ServerMessage) => void {
+    return (message: ServerMessage) => {
+      if (message.type === "start") {
+        this.lastLocalStart = message;
+      }
+      onmessage(message);
+      for (const listener of this.messageListeners) {
+        try {
+          listener(message);
+        } catch (e) {
+          console.error("local transport listener error", e);
+        }
+      }
+    };
+  }
+
+  // Attach a singleplayer bridge to `window` so external userscripts that
+  // normally hook `window.WebSocket` can still see server messages and send
+  // client intents while LocalServer is in charge. The real multiplayer path
+  // is unaffected — this is only installed in `connectLocal`.
+  private installLocalBridge() {
+    if (typeof window === "undefined") return;
+    const bridge: LocalTransportBridge = {
+      isLocal: true,
+      send: (msg: ClientMessage) => {
+        try {
+          this.localServer.onMessage(msg);
+        } catch (e) {
+          console.error("local transport bridge send error", e);
+        }
+      },
+      addMessageListener: (listener: (msg: ServerMessage) => void) => {
+        this.messageListeners.push(listener);
+        if (this.lastLocalStart) {
+          try {
+            listener(this.lastLocalStart);
+          } catch (e) {
+            console.error("local transport listener error", e);
+          }
+        }
+        return () => {
+          const idx = this.messageListeners.indexOf(listener);
+          if (idx >= 0) this.messageListeners.splice(idx, 1);
+        };
+      },
+    };
+    window.__openFrontLocalTransport = bridge;
+  }
+
+  private removeLocalBridge() {
+    if (typeof window === "undefined") return;
+    if (window.__openFrontLocalTransport) {
+      delete window.__openFrontLocalTransport;
+    }
+    this.messageListeners.length = 0;
+    this.lastLocalStart = null;
   }
 
   private connectRemote(
@@ -419,6 +516,7 @@ export class Transport {
   leaveGame() {
     if (this.isLocal) {
       this.localServer.endGame();
+      this.removeLocalBridge();
       return;
     }
     this.stopPing();

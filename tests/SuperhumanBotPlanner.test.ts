@@ -720,3 +720,97 @@ describe("tampermonkey-superhuman-bot invasion-defense goals", () => {
     expect(typeof runtime.world.threats.invasionTroopsInbound).toBe("number");
   });
 });
+
+describe("tampermonkey-superhuman-bot local transport bridge", () => {
+  // When the game is running locally against Impossible AI, Transport.ts
+  // never opens a WebSocket. Instead it publishes a bridge on
+  // `window.__openFrontLocalTransport` that the userscript is supposed to
+  // latch onto. Without this path every `sendRawMessage` call fails with
+  // "socket unavailable" — i.e. the bot "doesn't work locally".
+  it("captures window.__openFrontLocalTransport and sends via it when no socket is present", () => {
+    const runtime = loadUserscript();
+    const { installLocalTransportBridge, sendRawMessage, handleServerMessage } =
+      runtime.test.internals;
+    const win: any = (globalThis as any).window;
+
+    const sent: any[] = [];
+    const listeners: Array<(msg: any) => void> = [];
+    const bridge = {
+      isLocal: true as const,
+      send(msg: any) {
+        sent.push(msg);
+      },
+      addMessageListener(listener: (msg: any) => void) {
+        listeners.push(listener);
+        return () => {
+          const idx = listeners.indexOf(listener);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
+    };
+
+    const priorSocket = runtime.hooks.socket;
+    const priorBridge = runtime.hooks.localBridge;
+    const priorUnsub = runtime.hooks.localBridgeUnsubscribe;
+    const priorWsBridge = win.__openFrontLocalTransport;
+    runtime.hooks.socket = null;
+    win.__openFrontLocalTransport = bridge;
+
+    try {
+      installLocalTransportBridge();
+      expect(runtime.hooks.localBridge).toBe(bridge);
+      expect(listeners.length).toBe(1);
+
+      // Server messages arriving via the bridge should flow through the
+      // same handleServerMessage path the WebSocket hook uses.
+      expect(handleServerMessage).toBeTypeOf("function");
+
+      // Without a socket, sendRawMessage must fall back to the bridge.
+      const ok = sendRawMessage({ type: "intent", intent: { type: "spawn", tile: 7 } });
+      expect(ok).toBe(true);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toEqual({ type: "intent", intent: { type: "spawn", tile: 7 } });
+
+      // Idempotent — re-running the installer while the same bridge is
+      // still published must not double-subscribe.
+      installLocalTransportBridge();
+      expect(listeners.length).toBe(1);
+
+      // When the bridge disappears (e.g. player leaves the singleplayer
+      // game), the installer should notice on the next discovery tick and
+      // unhook. This keeps the overlay accurate and prevents "sending" into
+      // a dead LocalServer.
+      delete win.__openFrontLocalTransport;
+      installLocalTransportBridge();
+      expect(runtime.hooks.localBridge).toBeNull();
+      expect(listeners.length).toBe(0);
+    } finally {
+      runtime.hooks.socket = priorSocket;
+      runtime.hooks.localBridge = priorBridge;
+      runtime.hooks.localBridgeUnsubscribe = priorUnsub;
+      if (priorWsBridge === undefined) {
+        delete win.__openFrontLocalTransport;
+      } else {
+        win.__openFrontLocalTransport = priorWsBridge;
+      }
+    }
+  });
+
+  it("sendRawMessage fails closed if neither a socket nor a local bridge is available", () => {
+    const runtime = loadUserscript();
+    const { sendRawMessage } = runtime.test.internals;
+
+    const priorSocket = runtime.hooks.socket;
+    const priorBridge = runtime.hooks.localBridge;
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = null;
+
+    try {
+      const ok = sendRawMessage({ type: "ping" });
+      expect(ok).toBe(false);
+    } finally {
+      runtime.hooks.socket = priorSocket;
+      runtime.hooks.localBridge = priorBridge;
+    }
+  });
+});
