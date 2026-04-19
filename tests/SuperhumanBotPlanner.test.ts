@@ -372,9 +372,9 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     );
   });
 
-  it("exposes a BOT_VERSION constant bumped to 2.6.1", () => {
+  it("exposes a BOT_VERSION constant bumped to 2.7.0", () => {
     const runtime = loadUserscript();
-    expect(runtime.test.internals.BOT_VERSION).toBe("2.6.1");
+    expect(runtime.test.internals.BOT_VERSION).toBe("2.7.0");
   });
 });
 
@@ -527,56 +527,418 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
     // interesting, so just call the exported refresh handle directly.
     expect(typeof win.__superhumanBotRefreshOverlay).toBe("function");
 
-    runtime.mode = "aggressive";
-    runtime.state.strategy = "economy";
-    runtime.planner.activeGoalId = "NUKE_CROWN";
-    runtime.planner.lastEvaluation = [
-      {
-        id: "NUKE_CROWN",
-        priority: 84,
-        valid: true,
-        note: "crown=X share=40%",
+    // Snapshot prior planner + overlay state so we don't pollute sibling
+    // tests in the same file (the runtime is cached across tests).
+    const priorMode = runtime.mode;
+    const priorStrategy = runtime.state.strategy;
+    const priorActiveGoalId = runtime.planner.activeGoalId;
+    const priorLastEvaluation = runtime.planner.lastEvaluation;
+
+    try {
+      runtime.mode = "aggressive";
+      runtime.state.strategy = "economy";
+      runtime.planner.activeGoalId = "NUKE_CROWN";
+      runtime.planner.lastEvaluation = [
+        {
+          id: "NUKE_CROWN",
+          priority: 84,
+          valid: true,
+          note: "crown=X share=40%",
+        },
+        {
+          id: "DEFENSIVE_TURTLE",
+          priority: 0,
+          valid: false,
+          note: "",
+        },
+      ];
+      win.__superhumanBotRefreshOverlay();
+
+      const panel = win.document.getElementById("superbot-panel");
+      expect(panel, "overlay should be mounted").toBeTruthy();
+
+      // Mode button tooltip should describe AGGRESSIVE specifically.
+      const modeBtn = panel.querySelector("#superbot-mode");
+      expect(modeBtn, "mode button should exist").toBeTruthy();
+      const modeTitle = modeBtn!.getAttribute("title") || "";
+      expect(modeTitle).toContain("AGGRESSIVE");
+      expect(modeTitle).toContain("Balanced → Aggressive → Turtle");
+
+      // Override buttons should carry per-goal tooltips.
+      const overrideRow = panel.querySelector("#superbot-override-goals");
+      const turtleBtn = Array.from(
+        overrideRow!.querySelectorAll("button"),
+      ).find((b) => b.dataset.goal === "DEFENSIVE_TURTLE");
+      expect(turtleBtn, "Turtle override button should exist").toBeTruthy();
+      expect(turtleBtn!.getAttribute("title") || "").toContain(
+        "We are the crown",
+      );
+
+      // Strategy value in the State section should carry a per-strategy tooltip.
+      const stateRoot = panel.querySelector("#superbot-state");
+      const html = stateRoot!.innerHTML;
+      expect(html).toMatch(/title="[^"]*Economy executor/);
+
+      // Active goal value in the Goal section should carry the
+      // GOAL_DESCRIPTIONS tooltip for NUKE_CROWN.
+      const goalRoot = panel.querySelector("#superbot-goal");
+      const goalHtml = goalRoot!.innerHTML;
+      expect(goalHtml).toMatch(
+        /title="[^"]*Regular nuclear pressure on the map leader/,
+      );
+    } finally {
+      runtime.mode = priorMode;
+      runtime.state.strategy = priorStrategy;
+      runtime.planner.activeGoalId = priorActiveGoalId;
+      runtime.planner.lastEvaluation = priorLastEvaluation;
+    }
+  });
+
+  it("registers tooltips for the new REPEL_INVASION / PREEMPT_INVASION goals", () => {
+    const runtime = loadUserscript();
+    const win: any = (globalThis as any).window;
+    const priorActiveGoalId = runtime.planner.activeGoalId;
+    const priorLastEvaluation = runtime.planner.lastEvaluation;
+
+    try {
+      runtime.planner.activeGoalId = "REPEL_INVASION";
+      runtime.planner.lastEvaluation = [
+        {
+          id: "REPEL_INVASION",
+          priority: 99,
+          valid: true,
+          note: "invader=Overlord",
+        },
+        {
+          id: "PREEMPT_INVASION",
+          priority: 88,
+          valid: true,
+          note: "brewing=Rumble",
+        },
+      ];
+      win.__superhumanBotRefreshOverlay();
+
+      const panel = win.document.getElementById("superbot-panel");
+      const overrideRow = panel!.querySelector("#superbot-override-goals");
+      const repelBtn = Array.from(
+        overrideRow!.querySelectorAll("button"),
+      ).find((b) => b.dataset.goal === "REPEL_INVASION");
+      const preemptBtn = Array.from(
+        overrideRow!.querySelectorAll("button"),
+      ).find((b) => b.dataset.goal === "PREEMPT_INVASION");
+      expect(repelBtn, "Repel Invasion override button should exist").toBeTruthy();
+      expect(preemptBtn, "Preempt Invasion override button should exist").toBeTruthy();
+      expect(repelBtn!.getAttribute("title") || "").toContain(
+        "live invasion",
+      );
+      expect(preemptBtn!.getAttribute("title") || "").toContain(
+        "brewing invader",
+      );
+
+      const goalRoot = panel!.querySelector("#superbot-goal");
+      const goalHtml = goalRoot!.innerHTML;
+      expect(goalHtml).toMatch(/title="[^"]*Dedicated all-in defence/);
+      expect(goalHtml).toMatch(/title="[^"]*Harden the border/);
+    } finally {
+      runtime.planner.activeGoalId = priorActiveGoalId;
+      runtime.planner.lastEvaluation = priorLastEvaluation;
+    }
+  });
+});
+
+describe("tampermonkey-superhuman-bot invasion-defense goals", () => {
+  // These tests wire world.threats directly and use the planner's
+  // goal-evaluator machinery to confirm REPEL_INVASION and PREEMPT_INVASION
+  // fire under the correct conditions — i.e. we spot winding-up and
+  // actively-invading neighbours before they finish rolling us.
+  function stubGameView(runtime: any) {
+    runtime.hooks.gameView = {
+      ticks: () => 1500,
+      myPlayer: () => ({
+        isAlive: () => true,
+        units: () => [],
+        smallID: () => 1,
+      }),
+      config: () => ({
+        maxTroops: () => 100_000,
+        boatMaxNumber: () => 3,
+        isUnitDisabled: () => false,
+      }),
+    };
+  }
+
+  function worldWithInvasionThreats(runtime: any, overrides: any = {}) {
+    runtime.world = {
+      ...runtime.world,
+      tick: 1500,
+      archetype: "CONTINENTAL",
+      me: {
+        smallID: 1,
+        name: "Me",
+        gold: 500_000,
+        troops: 40_000,
+        maxTroops: 100_000,
+        troopRatio: 0.4,
+        tiles: 1500,
+        incomingTroops: 0,
+        outgoingTroops: 0,
+        structures: { City: 4, Factory: 1, Port: 0, DefensePost: 2 },
+        structureLevels: { City: 4, Factory: 1, DefensePost: 2 },
+        incomingAttacks: [],
+        outgoingAttacks: [],
+        ...(overrides.me ?? {}),
       },
-      {
-        id: "DEFENSIVE_TURTLE",
-        priority: 0,
-        valid: false,
-        note: "",
+      meSmallID: 1,
+      everyone: [],
+      bySmallID: new Map(),
+      history: new Map(),
+      totals: {
+        alivePlayers: 4,
+        humanCount: 1,
+        nationCount: 2,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.18,
+        myShare: 0.15,
+        secondShare: 0.14,
       },
-    ];
-    win.__superhumanBotRefreshOverlay();
+      rankings: {
+        byTiles: [],
+        byTroops: [],
+        byTilesVelocity: [],
+        byTroopsVelocity: [],
+      },
+      allianceGraph: {
+        edges: new Map(),
+        cliques: [],
+        largestBlocShare: 0,
+        coalitionThreat: false,
+      },
+      threats: {
+        crownSmallID: null,
+        crown: null,
+        prevCrownSmallID: null,
+        risingStars: [],
+        softTargets: [],
+        collapsingTargets: [],
+        nearestDanger: null,
+        mirvRisk: false,
+        mirvCapable: [],
+        adjacentEnemies: [],
+        activeInvaders: [],
+        brewingInvaders: [],
+        invasionTroopsInbound: 0,
+        inboundTroopTotal: 0,
+        ...(overrides.threats ?? {}),
+      },
+      classifiedAt: 100,
+    };
+  }
 
-    const panel = win.document.getElementById("superbot-panel");
-    expect(panel, "overlay should be mounted").toBeTruthy();
+  it("picks REPEL_INVASION when a stronger neighbour is actively attacking", () => {
+    const runtime = loadUserscript();
+    const { PlayerType } = runtime.test.internals;
+    stubGameView(runtime);
+    worldWithInvasionThreats(runtime, {
+      me: { troops: 40_000, incomingTroops: 60_000 },
+      threats: {
+        activeInvaders: [
+          {
+            smallID: 77,
+            name: "Overlord",
+            type: PlayerType.Human,
+            isFriendly: false,
+            isAdjacent: true,
+            troops: 120_000,
+            invasionIncoming: 60_000,
+            invasionPressure: 1.5,
+            strength: 180_000,
+          },
+        ],
+        invasionTroopsInbound: 60_000,
+      },
+    });
+    runtime.planner.forcedGoalId = null;
+    runtime.planner.forcedGoalExpiresMs = 0;
+    runtime.planner.activeGoalId = null;
 
-    // Mode button tooltip should describe AGGRESSIVE specifically.
-    const modeBtn = panel.querySelector("#superbot-mode");
-    expect(modeBtn, "mode button should exist").toBeTruthy();
-    const modeTitle = modeBtn!.getAttribute("title") || "";
-    expect(modeTitle).toContain("AGGRESSIVE");
-    expect(modeTitle).toContain("Balanced → Aggressive → Turtle");
+    // Drive the planner by re-running it via the scripted suite's helper.
+    // We just need the top-of-stack winner.
+    const debug = (globalThis as any).window.__superhumanBotDebug;
+    const suite = debug.runPlannerSuite();
+    // The suite also runs other scenarios, but the last winner it exposes
+    // is not what we want — instead, use the lastEvaluation the planner
+    // populated for our manually-installed world. Force a fresh selection
+    // through the forced-goal debug path: set + clear to trigger a run.
+    debug.forceGoal("REPEL_INVASION");
+    expect(runtime.planner.forcedGoalId).toBe("REPEL_INVASION");
+    debug.clearForcedGoal();
 
-    // Override buttons should carry per-goal tooltips.
-    const overrideRow = panel.querySelector("#superbot-override-goals");
-    const turtleBtn = Array.from(
-      overrideRow!.querySelectorAll("button"),
-    ).find((b) => b.dataset.goal === "DEFENSIVE_TURTLE");
-    expect(turtleBtn, "Turtle override button should exist").toBeTruthy();
-    expect(turtleBtn!.getAttribute("title") || "").toContain(
-      "We are the crown",
+    // Reinstall our world (the suite resets it) and re-run the planner
+    // evaluator manually by reading the goal spec directly.
+    stubGameView(runtime);
+    worldWithInvasionThreats(runtime, {
+      me: { troops: 40_000, incomingTroops: 60_000 },
+      threats: {
+        activeInvaders: [
+          {
+            smallID: 77,
+            name: "Overlord",
+            type: PlayerType.Human,
+            isFriendly: false,
+            isAdjacent: true,
+            troops: 120_000,
+            invasionIncoming: 60_000,
+            invasionPressure: 1.5,
+            strength: 180_000,
+          },
+        ],
+        invasionTroopsInbound: 60_000,
+      },
+    });
+
+    // Use the overlay-level runtime.test.set + direct evaluator run.
+    // Easiest path: run the same goal evaluation the planner would.
+    const GOAL_SPECS_fn = (r: any) => r.planner; // placeholder
+    // Instead, assert via the last-evaluation list after a planner run.
+    // The planner is internal to the script's IIFE — we invoke it by
+    // temporarily swapping GOAL_SPECS into lastEvaluation. Simpler: just
+    // call runPlannerSuite which exercises the scenarios and reports the
+    // invasion scenario (13) as PASS.
+    const summary = runtime.test.runSuite();
+    const invasionResult = summary.results.find((r: any) =>
+      r.name.startsWith("stronger adjacent actively invading"),
     );
+    expect(invasionResult, "invasion scenario should be in suite").toBeDefined();
+    expect(invasionResult.pass).toBe(true);
+    expect(invasionResult.actual).toBe("REPEL_INVASION");
+    // Unused placeholder to silence TS.
+    void GOAL_SPECS_fn;
+    void suite;
+  });
 
-    // Strategy value in the State section should carry a per-strategy tooltip.
-    const stateRoot = panel.querySelector("#superbot-state");
-    const html = stateRoot!.innerHTML;
-    expect(html).toMatch(/title="[^"]*Economy executor/);
-
-    // Active goal value in the Goal section should carry the GOAL_DESCRIPTIONS
-    // tooltip for NUKE_CROWN.
-    const goalRoot = panel.querySelector("#superbot-goal");
-    const goalHtml = goalRoot!.innerHTML;
-    expect(goalHtml).toMatch(
-      /title="[^"]*Regular nuclear pressure on the map leader/,
+  it("picks PREEMPT_INVASION when a brewing invader is winding up", () => {
+    const runtime = loadUserscript();
+    const summary = runtime.test.runSuite();
+    const preemptResult = summary.results.find((r: any) =>
+      r.name.startsWith("brewing invader only"),
     );
+    expect(preemptResult, "preempt scenario should be in suite").toBeDefined();
+    expect(preemptResult.pass).toBe(true);
+    expect(preemptResult.actual).toBe("PREEMPT_INVASION");
+  });
+
+  it("prefers REPEL_INVASION over PREEMPT when both are present", () => {
+    const runtime = loadUserscript();
+    const summary = runtime.test.runSuite();
+    const bothResult = summary.results.find((r: any) =>
+      r.name.startsWith("active + brewing both present"),
+    );
+    expect(bothResult, "both-present scenario should be in suite").toBeDefined();
+    expect(bothResult.pass).toBe(true);
+    expect(bothResult.actual).toBe("REPEL_INVASION");
+  });
+
+  it("exposes activeInvaders + brewingInvaders on world.threats after reset", () => {
+    const runtime = loadUserscript();
+    // Fresh boot state: lists should exist and start empty.
+    expect(Array.isArray(runtime.world.threats.activeInvaders)).toBe(true);
+    expect(Array.isArray(runtime.world.threats.brewingInvaders)).toBe(true);
+    expect(typeof runtime.world.threats.invasionTroopsInbound).toBe("number");
+  });
+});
+
+describe("tampermonkey-superhuman-bot local transport bridge", () => {
+  // When the game is running locally against Impossible AI, Transport.ts
+  // never opens a WebSocket. Instead it publishes a bridge on
+  // `window.__openFrontLocalTransport` that the userscript is supposed to
+  // latch onto. Without this path every `sendRawMessage` call fails with
+  // "socket unavailable" — i.e. the bot "doesn't work locally".
+  it("captures window.__openFrontLocalTransport and sends via it when no socket is present", () => {
+    const runtime = loadUserscript();
+    const { installLocalTransportBridge, sendRawMessage, handleServerMessage } =
+      runtime.test.internals;
+    const win: any = (globalThis as any).window;
+
+    const sent: any[] = [];
+    const listeners: Array<(msg: any) => void> = [];
+    const bridge = {
+      isLocal: true as const,
+      send(msg: any) {
+        sent.push(msg);
+      },
+      addMessageListener(listener: (msg: any) => void) {
+        listeners.push(listener);
+        return () => {
+          const idx = listeners.indexOf(listener);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
+    };
+
+    const priorSocket = runtime.hooks.socket;
+    const priorBridge = runtime.hooks.localBridge;
+    const priorUnsub = runtime.hooks.localBridgeUnsubscribe;
+    const priorWsBridge = win.__openFrontLocalTransport;
+    runtime.hooks.socket = null;
+    win.__openFrontLocalTransport = bridge;
+
+    try {
+      installLocalTransportBridge();
+      expect(runtime.hooks.localBridge).toBe(bridge);
+      expect(listeners.length).toBe(1);
+
+      // Server messages arriving via the bridge should flow through the
+      // same handleServerMessage path the WebSocket hook uses.
+      expect(handleServerMessage).toBeTypeOf("function");
+
+      // Without a socket, sendRawMessage must fall back to the bridge.
+      const ok = sendRawMessage({ type: "intent", intent: { type: "spawn", tile: 7 } });
+      expect(ok).toBe(true);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toEqual({ type: "intent", intent: { type: "spawn", tile: 7 } });
+
+      // Idempotent — re-running the installer while the same bridge is
+      // still published must not double-subscribe.
+      installLocalTransportBridge();
+      expect(listeners.length).toBe(1);
+
+      // When the bridge disappears (e.g. player leaves the singleplayer
+      // game), the installer should notice on the next discovery tick and
+      // unhook. This keeps the overlay accurate and prevents "sending" into
+      // a dead LocalServer.
+      delete win.__openFrontLocalTransport;
+      installLocalTransportBridge();
+      expect(runtime.hooks.localBridge).toBeNull();
+      expect(listeners.length).toBe(0);
+    } finally {
+      runtime.hooks.socket = priorSocket;
+      runtime.hooks.localBridge = priorBridge;
+      runtime.hooks.localBridgeUnsubscribe = priorUnsub;
+      if (priorWsBridge === undefined) {
+        delete win.__openFrontLocalTransport;
+      } else {
+        win.__openFrontLocalTransport = priorWsBridge;
+      }
+    }
+  });
+
+  it("sendRawMessage fails closed if neither a socket nor a local bridge is available", () => {
+    const runtime = loadUserscript();
+    const { sendRawMessage } = runtime.test.internals;
+
+    const priorSocket = runtime.hooks.socket;
+    const priorBridge = runtime.hooks.localBridge;
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = null;
+
+    try {
+      const ok = sendRawMessage({ type: "ping" });
+      expect(ok).toBe(false);
+    } finally {
+      runtime.hooks.socket = priorSocket;
+      runtime.hooks.localBridge = priorBridge;
+    }
   });
 });
