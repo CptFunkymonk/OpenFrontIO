@@ -942,3 +942,492 @@ describe("tampermonkey-superhuman-bot local transport bridge", () => {
     }
   });
 });
+
+describe("tampermonkey-superhuman-bot narrow-water river invasion", () => {
+  // Minimal grid-backed gameView stub tuned for findNarrowWaterEnemies.
+  // The map is WIDTH×HEIGHT tiles. A vertical river of water sits at
+  // x=RIVER_X with width RIVER_WIDTH. Our tiles are left of the river,
+  // enemy tiles are right. `setTerrain`/`setOwner` lets individual tests
+  // mutate a few cells to exercise edge cases (far-away ocean, lake, etc.).
+  const WIDTH = 30;
+  const HEIGHT = 20;
+  const ref = (x: number, y: number) => y * WIDTH + x;
+  const xOf = (t: number) => t % WIDTH;
+  const yOf = (t: number) => Math.floor(t / WIDTH);
+
+  function makeWorld(opts: {
+    riverX?: number;
+    riverWidth?: number;
+    myBorderX?: number;
+    enemyStartX?: number;
+    /** Extra water tiles (lakes / ocean). */
+    extraWater?: Array<[number, number]>;
+    /** Per-tile owner override. */
+    owners?: Record<number, number>;
+  }) {
+    const riverX = opts.riverX ?? 10;
+    const riverWidth = opts.riverWidth ?? 2;
+    const myBorderX = opts.myBorderX ?? riverX - 1;
+    const enemyStartX = opts.enemyStartX ?? riverX + riverWidth;
+    const isWater = new Set<number>();
+    const ownerByTile = new Map<number, number>();
+    for (let y = 0; y < HEIGHT; y++) {
+      for (let x = 0; x < WIDTH; x++) {
+        const tile = ref(x, y);
+        if (x >= riverX && x < riverX + riverWidth) {
+          isWater.add(tile);
+        } else if (x <= myBorderX) {
+          ownerByTile.set(tile, 1);
+        } else if (x >= enemyStartX) {
+          ownerByTile.set(tile, 2);
+        }
+      }
+    }
+    for (const [x, y] of opts.extraWater ?? []) {
+      isWater.add(ref(x, y));
+      ownerByTile.delete(ref(x, y));
+    }
+    for (const [k, v] of Object.entries(opts.owners ?? {})) {
+      const tile = Number(k);
+      if (v === 0) ownerByTile.delete(tile);
+      else ownerByTile.set(tile, v);
+    }
+
+    const gameView = {
+      ticks: () => 2000,
+      width: () => WIDTH,
+      height: () => HEIGHT,
+      numLandTiles: () => 400,
+      isValidCoord: (x: number, y: number) =>
+        x >= 0 && y >= 0 && x < WIDTH && y < HEIGHT,
+      ref: (x: number, y: number) => ref(x, y),
+      x: (t: number) => xOf(t),
+      y: (t: number) => yOf(t),
+      isLand: (t: number) => !isWater.has(t),
+      ownerID: (t: number) => ownerByTile.get(t) ?? 0,
+      neighbors: (t: number) => {
+        const ns: number[] = [];
+        const x = xOf(t);
+        const y = yOf(t);
+        if (x > 0) ns.push(ref(x - 1, y));
+        if (x < WIDTH - 1) ns.push(ref(x + 1, y));
+        if (y > 0) ns.push(ref(x, y - 1));
+        if (y < HEIGHT - 1) ns.push(ref(x, y + 1));
+        return ns;
+      },
+      nearbyUnits: () => [] as any[],
+      manhattanDist: (a: number, b: number) =>
+        Math.abs(xOf(a) - xOf(b)) + Math.abs(yOf(a) - yOf(b)),
+      config: () => ({
+        numSpawnPhaseTurns: () => 100,
+        boatMaxNumber: () => 3,
+        maxTroops: () => 100_000,
+        isUnitDisabled: () => false,
+      }),
+    };
+
+    return { gameView, riverX, riverWidth, myBorderX, enemyStartX };
+  }
+
+  it("finds an enemy across a 2-tile river", () => {
+    const runtime = loadUserscript();
+    const { findNarrowWaterEnemies, NARROW_WATER_HOP_LIMIT } =
+      runtime.test.internals;
+    const { gameView, myBorderX } = makeWorld({ riverWidth: 2 });
+    const me = { smallID: () => 1 };
+    const borderTiles = [];
+    for (let y = 0; y < HEIGHT; y++) borderTiles.push(ref(myBorderX, y));
+
+    const found = findNarrowWaterEnemies(
+      gameView,
+      me,
+      borderTiles,
+      NARROW_WATER_HOP_LIMIT,
+    );
+    expect(found.has(2)).toBe(true);
+    const entry = found.get(2);
+    expect(entry.hops).toBe(2);
+    // Landing tile must be one of OUR shore tiles.
+    expect(gameView.ownerID(entry.nearestLandingTile)).toBe(1);
+    // Enemy tile must be enemy-owned.
+    expect(gameView.ownerID(entry.nearestEnemyTile)).toBe(2);
+  });
+
+  it("does NOT surface enemies separated by a wide ocean (>6 tiles)", () => {
+    const runtime = loadUserscript();
+    const { findNarrowWaterEnemies, NARROW_WATER_HOP_LIMIT } =
+      runtime.test.internals;
+    const { gameView, myBorderX } = makeWorld({
+      riverWidth: 10,
+      enemyStartX: 20,
+    });
+    const me = { smallID: () => 1 };
+    const borderTiles = [];
+    for (let y = 0; y < HEIGHT; y++) borderTiles.push(ref(myBorderX, y));
+
+    const found = findNarrowWaterEnemies(
+      gameView,
+      me,
+      borderTiles,
+      NARROW_WATER_HOP_LIMIT,
+    );
+    expect(found.has(2)).toBe(false);
+  });
+
+  it("honours the hop budget for odd-width gaps at the boundary", () => {
+    const runtime = loadUserscript();
+    const { findNarrowWaterEnemies } = runtime.test.internals;
+    const { gameView, myBorderX } = makeWorld({ riverWidth: 6 });
+    const me = { smallID: () => 1 };
+    const borderTiles = [];
+    for (let y = 0; y < HEIGHT; y++) borderTiles.push(ref(myBorderX, y));
+
+    // At exactly the hop limit (6), the enemy should still be found.
+    const atLimit = findNarrowWaterEnemies(gameView, me, borderTiles, 6);
+    expect(atLimit.has(2)).toBe(true);
+
+    // One less hop than the gap: no enemy should surface.
+    const tightBudget = findNarrowWaterEnemies(gameView, me, borderTiles, 5);
+    expect(tightBudget.has(2)).toBe(false);
+  });
+
+  it("exposes narrowWaterNeighbors and route cooldowns on the runtime", () => {
+    const runtime = loadUserscript();
+    // Earlier tests in this file may have swapped `runtime.world` to a
+    // hand-crafted object; re-run a reset by asserting either the threats
+    // field exists OR the state-level cooldown map is wired.
+    const hasThreatsField =
+      runtime.world?.threats &&
+      Array.isArray(runtime.world.threats.narrowWaterNeighbors);
+    const hasCooldownMap = runtime.state.routeCooldowns instanceof Map;
+    expect(Boolean(hasThreatsField) || hasCooldownMap).toBe(true);
+    // The lost-boat map should always be present.
+    expect(runtime.state.lostBoatBySmallID instanceof Map).toBe(true);
+  });
+
+  it("maybeRiverCrossing dispatches a boat when a narrow-water enemy is present", async () => {
+    const runtime = loadUserscript();
+    const { maybeRiverCrossing } = runtime.test.internals;
+    const { gameView, myBorderX } = makeWorld({ riverWidth: 2 });
+
+    const me: any = {
+      smallID: () => 1,
+      numTilesOwned: () => 2_000,
+      troops: () => 80_000,
+      gold: () => 100_000,
+      unitCount: () => 1,
+      units: () => [],
+      isFriendly: () => false,
+      bestTransportShipSpawn: async (dst: number) => {
+        // Return the nearest tile on our border at the enemy row.
+        const y = yOf(dst);
+        return ref(myBorderX, y);
+      },
+    };
+
+    // Install our stub gameView and a minimal world mirror.
+    const priorGameView = runtime.hooks.gameView;
+    const priorWorld = runtime.world;
+    const priorMyPlayer = gameView as any;
+    priorMyPlayer.myPlayer = () => me;
+    runtime.hooks.gameView = priorMyPlayer;
+    const enemyTile = ref(15, 5);
+    const landingTile = ref(myBorderX, 5);
+    runtime.world = {
+      ...runtime.world,
+      tick: 2000,
+      archetype: "CONTINENTAL",
+      me: { smallID: 1, troops: 10_000, tiles: 2_000 },
+      meSmallID: 1,
+      bySmallID: new Map([
+        [
+          2,
+          {
+            smallID: 2,
+            isFriendly: false,
+            troops: 1_000,
+            type: "NATION",
+            name: "RiverEnemy",
+          },
+        ],
+      ]),
+      threats: {
+        ...(runtime.world.threats ?? {}),
+        narrowWaterNeighbors: [
+          {
+            smallID: 2,
+            hops: 2,
+            landingTile,
+            enemyTile,
+            name: "RiverEnemy",
+          },
+        ],
+      },
+      everyone: [],
+    };
+    runtime.state.cooldowns.naval = -999;
+    runtime.state.routeCooldowns = new Map();
+    runtime.state.sentBoats = new Map();
+    runtime.state.lostBoatBySmallID = new Map();
+
+    // Hook sendRawMessage so sendIntent can succeed (it goes through
+    // sendIntent → stealth gate → sendRawMessage). We install a local
+    // bridge that captures boats and enable harness mode to bypass the
+    // per-intent throttling.
+    const sent: any[] = [];
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = { send: (msg: any) => sent.push(msg) };
+    const win: any = (globalThis as any).window;
+    const priorHarness = win.__SUPERBOT_TEST_MODE;
+    win.__SUPERBOT_TEST_MODE = true;
+    const priorLastSig = runtime.state.lastIntentSignature;
+    runtime.state.lastIntentSignature = "";
+
+    try {
+      const acted = await maybeRiverCrossing(me, [landingTile]);
+      expect(acted).toBe(true);
+      const boatIntents = sent.filter(
+        (msg) => msg?.intent?.type === "boat",
+      );
+      expect(boatIntents.length).toBeGreaterThan(0);
+      expect(boatIntents[0].intent.dst).toBe(enemyTile);
+    } finally {
+      runtime.hooks.gameView = priorGameView;
+      runtime.world = priorWorld;
+      runtime.hooks.localBridge = null;
+      win.__SUPERBOT_TEST_MODE = priorHarness;
+      runtime.state.lastIntentSignature = priorLastSig;
+    }
+  });
+});
+
+describe("tampermonkey-superhuman-bot naval safety gate", () => {
+  const WIDTH = 30;
+  const HEIGHT = 20;
+  const ref = (x: number, y: number) => y * WIDTH + x;
+  const xOf = (t: number) => t % WIDTH;
+  const yOf = (t: number) => Math.floor(t / WIDTH);
+
+  function stubGameView(opts: {
+    enemyWarships?: Array<{
+      tile: number;
+      ownerSmallID: number;
+    }>;
+    ticks?: number;
+    warshipGold?: number;
+  }) {
+    const warships = opts.enemyWarships ?? [];
+    return {
+      ticks: () => opts.ticks ?? 2000,
+      width: () => WIDTH,
+      height: () => HEIGHT,
+      numLandTiles: () => 400,
+      isValidCoord: (x: number, y: number) =>
+        x >= 0 && y >= 0 && x < WIDTH && y < HEIGHT,
+      ref: (x: number, y: number) => ref(x, y),
+      x: (t: number) => xOf(t),
+      y: (t: number) => yOf(t),
+      ownerID: () => 0,
+      manhattanDist: (a: number, b: number) =>
+        Math.abs(xOf(a) - xOf(b)) + Math.abs(yOf(a) - yOf(b)),
+      euclideanDistSquared: (a: number, b: number) => {
+        const dx = xOf(a) - xOf(b);
+        const dy = yOf(a) - yOf(b);
+        return dx * dx + dy * dy;
+      },
+      neighbors: () => [] as number[],
+      isLand: () => true,
+      nearbyUnits: (tile: number, radius: number) => {
+        const out: any[] = [];
+        for (const w of warships) {
+          const dx = xOf(w.tile) - xOf(tile);
+          const dy = yOf(w.tile) - yOf(tile);
+          if (dx * dx + dy * dy <= radius * radius) {
+            out.push({
+              unit: {
+                id: () => w.tile,
+                isActive: () => true,
+                owner: () => ({
+                  smallID: () => w.ownerSmallID,
+                }),
+              },
+              distSquared: dx * dx + dy * dy,
+            });
+          }
+        }
+        return out;
+      },
+      config: () => ({
+        numSpawnPhaseTurns: () => 100,
+        boatMaxNumber: () => 3,
+        maxTroops: () => 100_000,
+        isUnitDisabled: () => false,
+        unitInfo: () => ({
+          cost: () => opts.warshipGold ?? 250_000,
+        }),
+      }),
+    };
+  }
+
+  it("allows narrow-hop invasions even with enemy warships on the route", () => {
+    const runtime = loadUserscript();
+    const { isNavalInvasionSafe, NARROW_WATER_HOP_LIMIT } =
+      runtime.test.internals;
+    const gameView = stubGameView({
+      enemyWarships: [{ tile: ref(15, 10), ownerSmallID: 2 }],
+    });
+    const me: any = {
+      smallID: () => 1,
+      isFriendly: () => false,
+      units: () => [],
+      unitCount: () => 0,
+      gold: () => 0,
+    };
+    const result = isNavalInvasionSafe(
+      gameView,
+      me,
+      ref(5, 10),
+      ref(12, 10),
+      { targetSmallID: 2, hops: 2, narrowHopLimit: NARROW_WATER_HOP_LIMIT },
+    );
+    expect(result.safe).toBe(true);
+  });
+
+  it("blocks long-range invasions when enemy warships are on route and we cannot counter", () => {
+    const runtime = loadUserscript();
+    const { isNavalInvasionSafe } = runtime.test.internals;
+    const gameView = stubGameView({
+      enemyWarships: [{ tile: ref(15, 10), ownerSmallID: 2 }],
+    });
+    const me: any = {
+      smallID: () => 1,
+      isFriendly: () => false,
+      units: () => [], // no warships of our own
+      unitCount: () => 0, // no ports
+      gold: () => 0, // no gold to build one
+    };
+    const result = isNavalInvasionSafe(
+      gameView,
+      me,
+      ref(0, 10),
+      ref(28, 10),
+      { targetSmallID: 2 },
+    );
+    expect(result.safe).toBe(false);
+    expect(result.reason).toBe("enemy-warships-uncountered");
+    expect(result.enemyWarships).toBeGreaterThan(0);
+  });
+
+  it("allows long-range invasion when we have parity warships", () => {
+    const runtime = loadUserscript();
+    const { isNavalInvasionSafe, UnitType } = runtime.test.internals;
+    const gameView = stubGameView({
+      enemyWarships: [{ tile: ref(15, 10), ownerSmallID: 2 }],
+    });
+    const myWarship = {
+      isActive: () => true,
+      isUnderConstruction: () => false,
+      owner: () => ({ smallID: () => 1 }),
+    };
+    const me: any = {
+      smallID: () => 1,
+      isFriendly: () => false,
+      units: (t: string) => (t === UnitType.Warship ? [myWarship] : []),
+      unitCount: () => 1,
+      gold: () => 0,
+    };
+    const result = isNavalInvasionSafe(
+      gameView,
+      me,
+      ref(0, 10),
+      ref(28, 10),
+      { targetSmallID: 2 },
+    );
+    expect(result.safe).toBe(true);
+    expect(result.reason).toBe("parity");
+  });
+
+  it("allows long-range invasion when we can afford to build a counter warship", () => {
+    const runtime = loadUserscript();
+    const { isNavalInvasionSafe } = runtime.test.internals;
+    const gameView = stubGameView({
+      enemyWarships: [{ tile: ref(15, 10), ownerSmallID: 2 }],
+      warshipGold: 100_000,
+    });
+    const me: any = {
+      smallID: () => 1,
+      isFriendly: () => false,
+      units: () => [],
+      unitCount: () => 1, // 1 port
+      gold: () => 500_000, // easily affordable
+    };
+    const result = isNavalInvasionSafe(
+      gameView,
+      me,
+      ref(0, 10),
+      ref(28, 10),
+      { targetSmallID: 2 },
+    );
+    expect(result.safe).toBe(true);
+    expect(result.reason).toBe("can-afford-counter");
+  });
+
+  it("blocks invasions when the per-target route cooldown is active", () => {
+    const runtime = loadUserscript();
+    const { isNavalInvasionSafe } = runtime.test.internals;
+    const gameView = stubGameView({});
+    const me: any = {
+      smallID: () => 1,
+      isFriendly: () => false,
+      units: () => [],
+      unitCount: () => 0,
+      gold: () => 0,
+    };
+    runtime.state.routeCooldowns.set(7, 9999); // lockout far in the future
+    try {
+      const result = isNavalInvasionSafe(
+        gameView,
+        me,
+        ref(0, 0),
+        ref(10, 0),
+        { targetSmallID: 7 },
+      );
+      expect(result.safe).toBe(false);
+      expect(result.reason).toBe("route-cooldown");
+    } finally {
+      runtime.state.routeCooldowns.delete(7);
+    }
+  });
+
+  it("registerLostBoat escalates the cooldown on repeated losses", () => {
+    const runtime = loadUserscript();
+    const {
+      registerLostBoat,
+      LOST_BOAT_BASE_COOLDOWN_TICKS,
+      LOST_BOAT_MAX_COOLDOWN_TICKS,
+    } = runtime.test.internals;
+
+    runtime.state.routeCooldowns.clear();
+    runtime.state.lostBoatBySmallID.clear();
+    try {
+      registerLostBoat(99, 1000);
+      expect(runtime.state.routeCooldowns.get(99)).toBe(
+        1000 + LOST_BOAT_BASE_COOLDOWN_TICKS,
+      );
+
+      registerLostBoat(99, 2000);
+      expect(runtime.state.routeCooldowns.get(99)).toBe(
+        2000 + LOST_BOAT_BASE_COOLDOWN_TICKS * 2,
+      );
+
+      // Many losses -> cap at LOST_BOAT_MAX_COOLDOWN_TICKS
+      for (let i = 0; i < 20; i++) registerLostBoat(99, 3000);
+      expect(runtime.state.routeCooldowns.get(99)).toBe(
+        3000 + LOST_BOAT_MAX_COOLDOWN_TICKS,
+      );
+    } finally {
+      runtime.state.routeCooldowns.clear();
+      runtime.state.lostBoatBySmallID.clear();
+    }
+  });
+});

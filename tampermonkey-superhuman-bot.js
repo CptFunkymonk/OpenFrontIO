@@ -284,6 +284,21 @@
       // Pending alliance-accept attempts, smallID -> tick when we fired the
       // back-request. Prevents spamming the same partner every tick.
       recentAllianceAccepts: new Map(),
+      // Naval safety bookkeeping.
+      //
+      // sentBoats: per-boat records we've dispatched. Each record captures
+      //   unitId, destTile, targetSmallID, troops, tick, and a lastSeenTick
+      //   so we can detect when the transport disappeared mid-voyage (which
+      //   almost always means it was sunk by a warship or pirate).
+      // lostBoatBySmallID: smallID -> { count, lastTick }. Per-target loss
+      //   counter used to back off from repeatedly shipping troops to the
+      //   same death trap.
+      // routeCooldowns: smallID -> tick. Dynamic per-target cooldown
+      //   escalation: every confirmed sunk boat bumps this further into the
+      //   future so a sequence of losses snowballs into a long lockout.
+      sentBoats: new Map(),
+      lostBoatBySmallID: new Map(),
+      routeCooldowns: new Map(),
     },
     overlay: {
       root: null,
@@ -339,6 +354,10 @@
         mirvRisk: false,
         mirvCapable: [],
         adjacentEnemies: [],
+        // Enemies separated from us only by a short water hop (rivers,
+        // straits). Populated every tick from findNarrowWaterEnemies().
+        // Each entry: { smallID, hops, landingTile, enemyTile }.
+        narrowWaterNeighbors: [],
         activeInvaders: [],
         brewingInvaders: [],
         invasionTroopsInbound: 0,
@@ -1488,12 +1507,30 @@
     });
   }
 
-  function sendBoat(dst, troops) {
-    return sendIntent({
+  function sendBoat(dst, troops, opts) {
+    const ok = sendIntent({
       type: "boat",
       dst,
       troops: Math.max(1, Math.floor(troops)),
     });
+    if (ok) {
+      // Track this outgoing transport so reconcileBoatLosses() can spot
+      // the boat being sunk in transit and set a per-target cooldown.
+      const gameView = getGameView();
+      const me = getMyLivingPlayer();
+      const targetSmallID =
+        opts && typeof opts.targetSmallID === "number"
+          ? opts.targetSmallID
+          : safeCall(() => gameView.ownerID(dst), null);
+      trackOutgoingBoat(
+        gameView,
+        me,
+        dst,
+        Math.max(1, Math.floor(troops)),
+        targetSmallID,
+      );
+    }
+    return ok;
   }
 
   function sendBuild(unit, tile, rocketDirectionUp) {
@@ -1885,6 +1922,405 @@
       return 40;
     }
     return 24;
+  }
+
+  // Maximum number of water tiles a boat can hop over before we no longer
+  // classify the gap as "narrow river / strait". Anything at or below this
+  // counts as effectively adjacent for invasion planning — even the early
+  // game gates should let us hop across these safely.
+  const NARROW_WATER_HOP_LIMIT = 6;
+
+  // Ticks we consider a dispatched transport "in flight" before we give up
+  // trying to correlate it with a surviving unit. Boats can travel a long
+  // way, but if a boat's unitId still isn't visible after this many ticks we
+  // treat it as sunk regardless.
+  const BOAT_TRACKING_TIMEOUT_TICKS = 900;
+
+  // Per-target cooldown (ticks) we apply each time we lose a boat to a
+  // given enemy. Scales with loss streak — see registerLostBoat.
+  const LOST_BOAT_BASE_COOLDOWN_TICKS = 600;
+  const LOST_BOAT_MAX_COOLDOWN_TICKS = 3600;
+
+  // How far from the planned boat route we scan for enemy warships when
+  // deciding whether the invasion is safe to launch.
+  const WARSHIP_ROUTE_SCAN_RADIUS = 40;
+
+  /**
+   * Scan across water from our own border tiles and record every enemy-owned
+   * land tile reachable within a small water hop budget. Captures
+   * "river / narrow strait" invasions that `sharesBorderWith` misses because
+   * that predicate only looks at land-land adjacency.
+   *
+   * Returns a Map<smallID, { nearestEnemyTile, nearestLandingTile, hops }>.
+   * - nearestEnemyTile is the enemy land tile reached via the shortest water path.
+   * - nearestLandingTile is our own shore tile the boat should spawn from.
+   * - hops is the number of water tiles crossed (≤ NARROW_WATER_HOP_LIMIT).
+   *
+   * The caller can then invade the enemy with a short transport without
+   * relying on the heavy, long-range `maybeNaval` pipeline.
+   */
+  function findNarrowWaterEnemies(gameView, me, borderTiles, maxHops) {
+    const out = new Map();
+    if (!gameView || !me || !borderTiles || borderTiles.length === 0) {
+      return out;
+    }
+    const limit = Math.max(1, maxHops || NARROW_WATER_HOP_LIMIT);
+    const mySmallID = safeCall(() => me.smallID(), null);
+    if (mySmallID === null) return out;
+
+    // Multi-source BFS from every shore tile we own. Each frontier layer
+    // expands through water tiles; whenever we step onto an enemy land tile
+    // we record that (and keep exploring because other enemies might still
+    // be unseen). Cap hops aggressively to stay river-scale.
+    const visited = new Map(); // tile -> { hops, seedShore }
+    const queue = [];
+    let head = 0;
+    for (const border of borderTiles) {
+      // Only shore tiles we own can spawn a transport, but we seed from any
+      // border tile — when the border tile is land, we still want to look at
+      // its water neighbours in the first hop.
+      visited.set(border, { hops: 0, seedShore: border });
+      queue.push(border);
+    }
+
+    while (head < queue.length) {
+      const current = queue[head++];
+      const currentMeta = visited.get(current);
+      if (!currentMeta) continue;
+
+      for (const neighbor of gameView.neighbors(current)) {
+        if (visited.has(neighbor)) continue;
+        const ownerID = safeCall(() => gameView.ownerID(neighbor), 0);
+        const isLand = safeCall(() => gameView.isLand(neighbor), false);
+
+        if (isLand) {
+          if (
+            ownerID !== 0 &&
+            ownerID !== mySmallID &&
+            currentMeta.hops >= 1
+          ) {
+            // Reached enemy land via at least one water tile. Prefer the
+            // shortest hop path; ties broken by the first sighting.
+            const prior = out.get(ownerID);
+            if (!prior || currentMeta.hops < prior.hops) {
+              out.set(ownerID, {
+                nearestEnemyTile: neighbor,
+                nearestLandingTile: currentMeta.seedShore,
+                hops: currentMeta.hops,
+              });
+            }
+          }
+          // Do not expand through land tiles — we only hop over water.
+          visited.set(neighbor, {
+            hops: currentMeta.hops,
+            seedShore: currentMeta.seedShore,
+          });
+          continue;
+        }
+
+        // Water tile: keep expanding up to the hop budget.
+        if (currentMeta.hops + 1 > limit) continue;
+        visited.set(neighbor, {
+          hops: currentMeta.hops + 1,
+          seedShore: currentMeta.seedShore,
+        });
+        queue.push(neighbor);
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * Count active warships a player currently owns. Warships are the only
+   * meaningful counter to an enemy transport: they auto-target and one-shot
+   * transports on contact.
+   */
+  function getActiveWarshipCount(player) {
+    if (!player) return 0;
+    return safeCall(
+      () =>
+        player
+          .units(UnitType.Warship)
+          .filter(
+            (unit) =>
+              safeCall(() => unit.isActive(), false) &&
+              !safeCall(() => unit.isUnderConstruction(), false),
+          ).length,
+      0,
+    );
+  }
+
+  /**
+   * Scan the approximate boat route (spawn → dst) for enemy warships and
+   * return a summary so the caller can decide whether to launch, hold, or
+   * replan. We intentionally over-scan a bit (radius around both endpoints)
+   * because exact pathing runs server-side and we don't want to stall the
+   * planner on a precise check.
+   */
+  function scanRouteForEnemyWarships(gameView, me, spawnTile, dst) {
+    const summary = {
+      warships: 0,
+      warshipOwners: new Set(),
+      sampledAt: [],
+    };
+    if (!gameView || spawnTile === undefined || dst === undefined) {
+      return summary;
+    }
+    const mySmallID = safeCall(() => me.smallID(), null);
+    const seen = new Set();
+    // Sample a few points along the line between spawn and dst so
+    // mid-route warships get counted even when the endpoints are clear.
+    const samples = [spawnTile, dst];
+    const spawnX = safeCall(() => gameView.x(spawnTile), null);
+    const spawnY = safeCall(() => gameView.y(spawnTile), null);
+    const dstX = safeCall(() => gameView.x(dst), null);
+    const dstY = safeCall(() => gameView.y(dst), null);
+    if (
+      spawnX !== null &&
+      spawnY !== null &&
+      dstX !== null &&
+      dstY !== null
+    ) {
+      const steps = 3;
+      for (let i = 1; i < steps; i++) {
+        const mx = Math.round(spawnX + ((dstX - spawnX) * i) / steps);
+        const my = Math.round(spawnY + ((dstY - spawnY) * i) / steps);
+        if (safeCall(() => gameView.isValidCoord(mx, my), false)) {
+          samples.push(gameView.ref(mx, my));
+        }
+      }
+    }
+
+    for (const sample of samples) {
+      const nearby = safeCall(
+        () => gameView.nearbyUnits(sample, WARSHIP_ROUTE_SCAN_RADIUS, UnitType.Warship),
+        [],
+      );
+      for (const entry of nearby) {
+        const unit = entry && entry.unit ? entry.unit : entry;
+        if (!unit) continue;
+        const id = safeCall(() => unit.id(), null);
+        if (id === null || seen.has(id)) continue;
+        if (!safeCall(() => unit.isActive(), false)) continue;
+        const owner = safeCall(() => unit.owner(), null);
+        if (!owner) continue;
+        const ownerID = safeCall(() => owner.smallID(), null);
+        if (ownerID === mySmallID) continue;
+        if (safeCall(() => me.isFriendly(owner), false)) continue;
+        seen.add(id);
+        summary.warships += 1;
+        summary.warshipOwners.add(ownerID);
+        summary.sampledAt.push(sample);
+      }
+    }
+    return summary;
+  }
+
+  /**
+   * Naval invasion safety gate.
+   *
+   * Returns { safe, reason } where `safe=false` tells the caller to abort
+   * the boat launch. Gates:
+   *   1. Per-target route cooldown: we recently lost a boat to this target.
+   *   2. Enemy warships along the route we can't realistically counter
+   *      (no ports / no warships of our own / can't afford one).
+   *
+   * Narrow-water hops (hops <= narrowHopLimit) are always considered safe
+   * from the warship perspective — rivers are too short for a mid-ocean
+   * interception to meaningfully threaten the troopship, and we still want
+   * to hop enemies that sit across a river even when they have a warship
+   * fleet patrolling the far ocean.
+   */
+  function isNavalInvasionSafe(gameView, me, spawnTile, dst, opts) {
+    if (!gameView || !me) return { safe: true, reason: "no gameView" };
+    const options = opts || {};
+    const tick = safeCall(() => gameView.ticks(), 0);
+    const targetSmallID = options.targetSmallID ?? null;
+
+    // Per-target cooldown from prior lost boats.
+    if (targetSmallID !== null) {
+      const cooldownUntil = runtime.state.routeCooldowns.get(targetSmallID);
+      if (typeof cooldownUntil === "number" && cooldownUntil > tick) {
+        return {
+          safe: false,
+          reason: "route-cooldown",
+          untilTick: cooldownUntil,
+          targetSmallID,
+        };
+      }
+    }
+
+    const isNarrowHop =
+      typeof options.hops === "number" &&
+      options.hops <= (options.narrowHopLimit || NARROW_WATER_HOP_LIMIT);
+
+    if (isNarrowHop) {
+      return { safe: true, reason: "narrow-hop" };
+    }
+
+    const route = scanRouteForEnemyWarships(gameView, me, spawnTile, dst);
+    if (route.warships === 0) {
+      return { safe: true, reason: "no enemy warships on route" };
+    }
+
+    // We've got hostile warships within range of our planned route. Require
+    // that we can plausibly counter them: at least parity in active
+    // warships, OR we already have a port AND the gold to build another
+    // warship RIGHT NOW (so we can escort the next wave).
+    const myWarships = getActiveWarshipCount(me);
+    if (myWarships >= route.warships) {
+      return { safe: true, reason: "parity", myWarships };
+    }
+
+    const myPorts = safeCall(() => me.unitCount(UnitType.Port), null);
+    const warshipCost = safeCall(
+      () => gameView.config().unitInfo(UnitType.Warship),
+      null,
+    );
+    const warshipGold =
+      warshipCost && typeof warshipCost.cost === "function"
+        ? Number(safeCall(() => warshipCost.cost(me), 0))
+        : 0;
+    const myGold = Number(safeCall(() => me.gold(), 0));
+    const affordCounter =
+      (myPorts === null || myPorts > 0) &&
+      warshipGold > 0 &&
+      myGold >= warshipGold;
+    if (affordCounter) {
+      return {
+        safe: true,
+        reason: "can-afford-counter",
+        myWarships,
+        enemyWarships: route.warships,
+      };
+    }
+
+    return {
+      safe: false,
+      reason: "enemy-warships-uncountered",
+      myWarships,
+      enemyWarships: route.warships,
+      enemyOwners: Array.from(route.warshipOwners),
+    };
+  }
+
+  /**
+   * Record a boat we've just dispatched so we can later detect whether it
+   * was lost in transit. Called from sendBoat() on success.
+   */
+  function trackOutgoingBoat(gameView, me, dst, troops, targetSmallID) {
+    if (!gameView || !me) return;
+    const tick = safeCall(() => gameView.ticks(), 0);
+    // Our most-recently spawned transport ship is the one we just sent.
+    // Snapshot unitIds of our current transports so we can match on the
+    // next world-model pass.
+    const transports = safeCall(() => me.units(UnitType.TransportShip), []);
+    let newest = null;
+    let newestId = -1;
+    for (const t of transports) {
+      const id = safeCall(() => t.id(), -1);
+      if (id > newestId) {
+        newest = t;
+        newestId = id;
+      }
+    }
+    const unitId = newest ? safeCall(() => newest.id(), null) : null;
+    runtime.state.sentBoats.set(tick + "-" + (unitId ?? "?"), {
+      unitId,
+      dst,
+      troops,
+      targetSmallID,
+      tick,
+      lastSeenTick: tick,
+    });
+    // Bound map size so long matches don't balloon memory.
+    if (runtime.state.sentBoats.size > 32) {
+      const entries = Array.from(runtime.state.sentBoats.entries());
+      entries.sort((a, b) => a[1].tick - b[1].tick);
+      for (const [k] of entries.slice(0, entries.length - 32)) {
+        runtime.state.sentBoats.delete(k);
+      }
+    }
+  }
+
+  /**
+   * Escalating per-target cooldown when we lose a boat. Each loss doubles
+   * the lockout (capped) so a sequence of failed invasions stops us
+   * throwing more troops into the meat grinder.
+   */
+  function registerLostBoat(targetSmallID, tick) {
+    if (targetSmallID === null || targetSmallID === undefined) return;
+    const prior = runtime.state.lostBoatBySmallID.get(targetSmallID) || {
+      count: 0,
+      lastTick: -999,
+    };
+    prior.count += 1;
+    prior.lastTick = tick;
+    runtime.state.lostBoatBySmallID.set(targetSmallID, prior);
+    const multiplier = Math.min(prior.count, 6);
+    const cooldown = Math.min(
+      LOST_BOAT_BASE_COOLDOWN_TICKS * multiplier,
+      LOST_BOAT_MAX_COOLDOWN_TICKS,
+    );
+    runtime.state.routeCooldowns.set(targetSmallID, tick + cooldown);
+  }
+
+  /**
+   * Reconcile our outgoing-boat ledger against visible transport units.
+   * A tracked boat whose unitId is no longer in our transports list (or has
+   * gone inactive) and never reached its destination is assumed destroyed
+   * — we bump the per-target lost counter and set a cooldown so future
+   * invasion logic stops sending troops into the same death trap.
+   *
+   * Runs every tick from updateWorldModel() so it's cheap (one lookup per
+   * sent boat) and always up to date.
+   */
+  function reconcileBoatLosses(gameView, me) {
+    if (!gameView || !me) return;
+    const tick = safeCall(() => gameView.ticks(), 0);
+    const mySmallID = safeCall(() => me.smallID(), null);
+    const live = new Map();
+    for (const unit of safeCall(() => me.units(UnitType.TransportShip), [])) {
+      if (!safeCall(() => unit.isActive(), false)) continue;
+      const id = safeCall(() => unit.id(), null);
+      if (id !== null) live.set(id, unit);
+    }
+    const ledger = runtime.state.sentBoats;
+    for (const [key, record] of ledger) {
+      if (record.unitId !== null && live.has(record.unitId)) {
+        record.lastSeenTick = tick;
+        continue;
+      }
+      const aged = tick - record.tick;
+      if (record.unitId === null && aged < 30) {
+        // We couldn't match a unit on send (race with world update); give
+        // it a few ticks before considering the boat missing.
+        continue;
+      }
+      if (aged > BOAT_TRACKING_TIMEOUT_TICKS) {
+        // Timed out without seeing the unit. Treat as lost to be safe.
+        registerLostBoat(record.targetSmallID, tick);
+        ledger.delete(key);
+        continue;
+      }
+      // If the unit was alive at some point but is now gone, and we don't
+      // own the destination tile, it was almost certainly destroyed.
+      if (record.lastSeenTick > record.tick) {
+        const arrivedOwner = safeCall(
+          () => gameView.ownerID(record.dst),
+          null,
+        );
+        if (arrivedOwner !== mySmallID) {
+          registerLostBoat(record.targetSmallID, tick);
+        }
+        ledger.delete(key);
+      }
+    }
+    // Garbage-collect route cooldowns that have expired.
+    for (const [id, until] of runtime.state.routeCooldowns) {
+      if (until <= tick) runtime.state.routeCooldowns.delete(id);
+    }
   }
 
   function countUnownedLandNear(tile, radius) {
@@ -3176,6 +3612,22 @@
         const boatDistance = gameView.manhattanDist(spawnTile, candidate);
         if (boatDistance > maxBoatDistance) continue;
 
+        const safety = isNavalInvasionSafe(gameView, me, spawnTile, candidate, {
+          targetSmallID: safeCall(() => enemy.smallID(), null),
+        });
+        if (!safety.safe) {
+          decisionLog(
+            "naval skip " +
+              enemy.displayName() +
+              ": " +
+              safety.reason +
+              (safety.enemyWarships
+                ? " (enemy warships=" + safety.enemyWarships + ")"
+                : ""),
+          );
+          continue;
+        }
+
         const troops = clamp(
           Math.floor(available * 0.28),
           8000,
@@ -3198,7 +3650,9 @@
 
     plans.sort((a, b) => b.score - a.score);
     for (const plan of plans) {
-      const success = sendBoat(plan.candidate, plan.troops);
+      const success = sendBoat(plan.candidate, plan.troops, {
+        targetSmallID: safeCall(() => plan.enemy.smallID(), null),
+      });
       if (!success) continue;
 
       runtime.state.cooldowns.naval = tick;
@@ -3225,6 +3679,125 @@
         (Number.isFinite(maxBoatDistance) ? maxBoatDistance : "full-map") +
         " tiles",
     );
+    return false;
+  }
+
+  /**
+   * Short-hop boat invasion across rivers and narrow straits.
+   *
+   * `maybeNaval` and the dedicated naval goals are tuned for mid-game
+   * overseas campaigns — they gate on 30k+ troops, long boat-distance
+   * budgets, and expensive cooldowns. Those gates make sense for
+   * cross-continent expeditions but they also prevent us from crossing a
+   * 2-tile river when we should obviously do so. This helper is the cheap
+   * counterpart: when we've found a neighbour separated from us only by
+   * a narrow water gap (see findNarrowWaterEnemies → world.threats
+   * .narrowWaterNeighbors) we drop in a light transport to claim coast
+   * even when the heavier naval pipeline wouldn't fire.
+   *
+   * Runs at a fast cadence (4s between attempts), but still honours the
+   * per-target route cooldown so a bad first hop doesn't turn into a
+   * chain of destroyed transports.
+   */
+  async function maybeRiverCrossing(me, borderTiles) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    // Dedicated short cadence — river hops are cheap so we don't need the
+    // long cross-map cooldown.
+    if (tick - runtime.state.cooldowns.naval < 24) return false;
+
+    if (
+      getUnitEntityCount(me, UnitType.TransportShip) >=
+      gameView.config().boatMaxNumber()
+    ) {
+      return false;
+    }
+
+    const neighbours = runtime.world.threats.narrowWaterNeighbors || [];
+    if (neighbours.length === 0) return false;
+
+    // Troop floor — we still want some defensive buffer even for a short hop.
+    const maxTroops = gameView.config().maxTroops(me);
+    const reserveRatio = Math.max(0.1, computeReserveRatio(me, maxTroops) - 0.05);
+    const available = Math.floor(me.troops() - maxTroops * reserveRatio);
+    if (available < 2000) {
+      decisionLog("river-cross: reserve too low");
+      return false;
+    }
+
+    for (const neighbour of neighbours) {
+      const entry = runtime.world.bySmallID.get(neighbour.smallID);
+      if (!entry || entry.isFriendly) continue;
+
+      // Prefer a spawn tile the server agrees is legal (checks water
+      // connectivity and port availability). Fall back to our cached
+      // narrow-water landing seed if the worker query fails — that tile is
+      // already known to be a shore we own that can reach the enemy.
+      let spawn = null;
+      let dst = neighbour.enemyTile;
+      const querySpawn = await queryTransportShipSpawn(neighbour.enemyTile);
+      if (querySpawn !== false) {
+        spawn = querySpawn;
+      } else if (neighbour.landingTile !== null && neighbour.landingTile !== undefined) {
+        spawn = neighbour.landingTile;
+      }
+      if (spawn === null) continue;
+
+      // River hops are narrow by definition — mark them as such in the
+      // safety check so we don't block on distant-warship scans.
+      const safety = isNavalInvasionSafe(gameView, me, spawn, dst, {
+        targetSmallID: neighbour.smallID,
+        hops: neighbour.hops,
+        narrowHopLimit: NARROW_WATER_HOP_LIMIT,
+      });
+      if (!safety.safe) {
+        decisionLog(
+          "river-cross skip " + neighbour.name + ": " + safety.reason,
+        );
+        continue;
+      }
+
+      // Troop sizing: aim to beat the defender by ~1.5× (standard attack
+      // math) but keep it bounded relative to the narrow-hop reserve.
+      let troops;
+      if (entry.type === PlayerType.Bot) {
+        troops = calcTribeAttackTroops(entry.troops, available);
+      } else {
+        const defender = Math.max(entry.troops, 1);
+        troops = clamp(
+          Math.ceil(defender * 1.5),
+          2000,
+          Math.min(available, Math.floor(me.troops() * 0.35)),
+        );
+      }
+      if (troops <= 0) continue;
+
+      if (
+        sendBoat(dst, troops, { targetSmallID: neighbour.smallID })
+      ) {
+        runtime.state.cooldowns.naval = tick;
+        runtime.state.cooldowns.combat = tick;
+        runtime.state.lastAction =
+          "river-crossing -> " + neighbour.name;
+        runtime.state.strategy = "river-crossing";
+        reasonLog(
+          "RIVER_CROSSING",
+          `Hopping a boat across a ${neighbour.hops}-tile river to claim ${neighbour.name}'s near coast.`,
+          `${fmtTroops(troops)} troops, ${neighbour.hops} water tiles`,
+        );
+        botLog(
+          "River -> " +
+            neighbour.name +
+            " " +
+            fmtTroops(troops) +
+            " (" +
+            neighbour.hops +
+            " water tiles)",
+        );
+        return true;
+      }
+    }
     return false;
   }
 
@@ -3830,12 +4403,21 @@
       const spawn = await queryTransportShipSpawn(landingTile);
       if (spawn === false) continue;
       if (!isBoatWithinRange(gameView, me, spawn, landingTile)) continue;
+      const rushSafety = isNavalInvasionSafe(gameView, me, spawn, landingTile, {
+        targetSmallID: target.smallID,
+      });
+      if (!rushSafety.safe) {
+        decisionLog(
+          "terrain-rush boat skip " + target.name + ": " + rushSafety.reason,
+        );
+        continue;
+      }
       const boatTroops = Math.min(
         troops,
         Math.floor(me.troops() * 0.35),
       );
       if (boatTroops <= 0) continue;
-      if (sendBoat(landingTile, boatTroops)) {
+      if (sendBoat(landingTile, boatTroops, { targetSmallID: target.smallID })) {
         runtime.state.cooldowns.terrainRush = tick;
         runtime.state.cooldowns.naval = tick;
         runtime.state.cooldowns.combat = tick;
@@ -3946,7 +4528,16 @@
       const spawnTile = await queryTransportShipSpawn(target);
       if (spawnTile === false) return false;
       if (!isBoatWithinRange(gameView, me, spawnTile, target)) return false;
-      if (sendBoat(target, troops)) {
+      const retSafety = isNavalInvasionSafe(gameView, me, spawnTile, target, {
+        targetSmallID: largest.id,
+      });
+      if (!retSafety.safe) {
+        decisionLog(
+          "retaliation boat skip: " + retSafety.reason,
+        );
+        return false;
+      }
+      if (sendBoat(target, troops, { targetSmallID: largest.id })) {
         runtime.state.cooldowns.combat = tick;
         runtime.state.cooldowns.naval = tick;
         reasonLog(
@@ -4006,7 +4597,22 @@
     const spawn = await queryTransportShipSpawn(landingTile);
     if (spawn === false) return false;
     if (!isBoatWithinRange(gameView, me, spawn, landingTile)) return false;
-    if (sendBoat(landingTile, Math.min(required, Math.floor(me.troops() * 0.35)))) {
+    const risingSafety = isNavalInvasionSafe(gameView, me, spawn, landingTile, {
+      targetSmallID: target.smallID,
+    });
+    if (!risingSafety.safe) {
+      decisionLog(
+        "rising-star boat skip " + target.name + ": " + risingSafety.reason,
+      );
+      return false;
+    }
+    if (
+      sendBoat(
+        landingTile,
+        Math.min(required, Math.floor(me.troops() * 0.35)),
+        { targetSmallID: target.smallID },
+      )
+    ) {
       runtime.state.cooldowns.combat = tick;
       runtime.state.cooldowns.naval = tick;
       reasonLog(
@@ -4430,7 +5036,17 @@
       const target = findUncontestedIslandSeed(gameView);
       if (target) {
         const spawn = await queryTransportShipSpawn(target);
-        if (spawn !== false && isBoatWithinRange(gameView, me, spawn, target)) {
+        const islandSafety =
+          spawn !== false
+            ? isNavalInvasionSafe(gameView, me, spawn, target, {
+                targetSmallID: null,
+              })
+            : { safe: false, reason: "no spawn" };
+        if (
+          spawn !== false &&
+          isBoatWithinRange(gameView, me, spawn, target) &&
+          islandSafety.safe
+        ) {
           const troops = clamp(Math.floor(available * 0.25), 6000, 20000);
           if (sendBoat(target, troops)) {
             runtime.state.cooldowns.naval = tick;
@@ -4463,8 +5079,22 @@
       const spawn = await queryTransportShipSpawn(candidate);
       if (spawn === false) continue;
       if (!isBoatWithinRange(gameView, me, spawn, candidate)) continue;
+      const landGrabSafety = isNavalInvasionSafe(gameView, me, spawn, candidate, {
+        targetSmallID: target.smallID,
+      });
+      if (!landGrabSafety.safe) {
+        decisionLog(
+          "land-grab boat skip " +
+            target.name +
+            ": " +
+            landGrabSafety.reason,
+        );
+        continue;
+      }
       const troops = clamp(Math.floor(available * 0.3), 8000, 30000);
-      if (sendBoat(candidate, troops)) {
+      if (
+        sendBoat(candidate, troops, { targetSmallID: target.smallID })
+      ) {
         runtime.state.cooldowns.naval = tick;
         reasonLog(
           "NAVAL_LAND_GRAB",
@@ -5431,6 +6061,10 @@
       .map((e) => e.smallID);
 
     buildAllianceGraph(everyone, bySmallID, usableLand);
+
+    // Reconcile tracked boats: detect sinkings so follow-up invasion
+    // decisions can back off death-trap routes.
+    reconcileBoatLosses(gameView, me);
   }
 
   /**
@@ -5865,6 +6499,38 @@
     );
     brewingInvaders.sort((a, b) => (b.strength || 0) - (a.strength || 0));
 
+    // River / strait neighbours: enemies we're NOT land-adjacent to but
+    // reachable with a short water hop. These are first-class invasion
+    // targets — a neighbour across a 2-tile river is effectively adjacent
+    // from a strategic standpoint.
+    const gameView = getGameView();
+    const narrowWaterNeighbors = [];
+    if (gameView && me && borderTiles && borderTiles.length > 0) {
+      const nearMap = findNarrowWaterEnemies(
+        gameView,
+        me,
+        borderTiles,
+        NARROW_WATER_HOP_LIMIT,
+      );
+      for (const [smallID, info] of nearMap) {
+        const entry = world.bySmallID.get(smallID);
+        if (!entry) continue;
+        if (entry.isFriendly) continue;
+        // Tag the player entry so goal evaluators can see the river flag.
+        entry.narrowWaterHops = info.hops;
+        entry.narrowWaterLandingTile = info.nearestLandingTile;
+        entry.narrowWaterEnemyTile = info.nearestEnemyTile;
+        narrowWaterNeighbors.push({
+          smallID,
+          hops: info.hops,
+          landingTile: info.nearestLandingTile,
+          enemyTile: info.nearestEnemyTile,
+          name: entry.name,
+        });
+      }
+      narrowWaterNeighbors.sort((a, b) => a.hops - b.hops);
+    }
+
     // Update crown w/ hysteresis tracking (see Phase 2 acceptance criterion).
     runtime.world.prevCrownSmallID = runtime.world.threats.crownSmallID;
     runtime.world.threats = {
@@ -5878,6 +6544,7 @@
       mirvRisk: mirvCapable.length > 0,
       mirvCapable,
       adjacentEnemies,
+      narrowWaterNeighbors,
       activeInvaders: activeInvaders.slice(0, 5),
       brewingInvaders: brewingInvaders.slice(0, 5),
       invasionTroopsInbound,
@@ -6219,6 +6886,9 @@
     WARSHIP_DEFENSE:
       "Keep a warship screen up around our ports.\n" +
       "Requires ≥1 Port. Builds up to 2 warships on ISLAND maps, and matches enemy warship counts on the rest — so enemy transports can't just drive tiles into our ports.",
+    RIVER_CROSSING:
+      "Short-hop transport across a river or narrow strait.\n" +
+      "Fires when an enemy is within a handful of water tiles of one of our border tiles. Narrow gaps are too short for enemy warships to meaningfully intercept, so we use a light transport load and the naval safety gate skips the warship check for short hops.",
     IDLE:
       "Fallback goal when nothing else qualifies.\n" +
       "Low-priority safety valve — means the economy/expansion loop is still running but no higher-level goal is driving it this tick.",
@@ -7656,6 +8326,7 @@
       case "RETALIATION":
         handled = await runGoal_Retaliation(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         break;
       case "CONSOLIDATE_FRONT":
       case "CHOKEPOINT_LOCK":
@@ -7665,25 +8336,31 @@
       case "FARM_TRIBE":
         handled = await runGoal_FarmTribe(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         break;
       case "EASY_NATION_GRAB":
         handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "TERRAIN_RUSH":
         handled = await runGoal_TerrainRush(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "NEUTRALIZE_RISING_STAR":
         handled = await runGoal_NeutralizeRisingStar(me);
         if (!handled) handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         break;
       case "TERRA_NULLIUS_RUSH":
         handled = await maybeExpand(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         break;
       case "NAVAL_LAND_GRAB":
         handled = await runGoal_NavalLandGrab(me);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         if (!handled) handled = await maybeNaval(me);
         break;
       case "DIPLOMACY_ISOLATE_CROWN":
@@ -7759,6 +8436,17 @@
 
     const didEconomy = await maybeEconomy(me, getEnemies());
     if (didEconomy) {
+      refreshOverlay();
+      return;
+    }
+
+    // River crossings are cheap and always a good idea when a neighbour is
+    // separated from us only by a short water gap. We try this BEFORE the
+    // heavy `maybeNaval` pipeline, which gates on 30k+ troops and longer
+    // cooldowns — those are right for cross-continent expeditions but stop
+    // us hopping a river when we obviously should.
+    const didRiver = await maybeRiverCrossing(me, borderTiles);
+    if (didRiver) {
       refreshOverlay();
       return;
     }
@@ -10281,6 +10969,17 @@
         getBoatDistanceLimit,
         isTooEarlyForNaval,
         isBoatWithinRange,
+        findNarrowWaterEnemies,
+        isNavalInvasionSafe,
+        scanRouteForEnemyWarships,
+        registerLostBoat,
+        trackOutgoingBoat,
+        reconcileBoatLosses,
+        maybeRiverCrossing,
+        NARROW_WATER_HOP_LIMIT,
+        LOST_BOAT_BASE_COOLDOWN_TICKS,
+        LOST_BOAT_MAX_COOLDOWN_TICKS,
+        WARSHIP_ROUTE_SCAN_RADIUS,
         isTileNearHumanBorder,
         filterHumanBorderTiles,
         shouldBuildType,
