@@ -372,9 +372,9 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     );
   });
 
-  it("exposes a BOT_VERSION constant bumped to 2.7.0", () => {
+  it("exposes a BOT_VERSION constant bumped to 2.8.0", () => {
     const runtime = loadUserscript();
-    expect(runtime.test.internals.BOT_VERSION).toBe("2.7.0");
+    expect(runtime.test.internals.BOT_VERSION).toBe("2.8.0");
   });
 });
 
@@ -1431,3 +1431,123 @@ describe("tampermonkey-superhuman-bot naval safety gate", () => {
     }
   });
 });
+
+describe("tampermonkey-superhuman-bot invasion-defense stall", () => {
+  function freshWorld(runtime: any) {
+    // Seed a minimal threats structure so shouldStallForInvasionDefense
+    // and gates have something to read. We copy from the script's
+    // buildTestWorld-compatible shape so every field the helpers touch
+    // exists.
+    runtime.world = runtime.world ?? {};
+    runtime.world.threats = runtime.world.threats ?? {
+      adjacentEnemies: [],
+      mirvCapable: [],
+      narrowWaterNeighbors: [],
+      activeInvaders: [],
+      brewingInvaders: [],
+      invasionTroopsInbound: 0,
+      inboundTroopTotal: 0,
+    };
+    runtime.world.threats.overwhelmingNeighbor = null;
+    return runtime.world;
+  }
+
+  it("2.5x threshold matches the saturated-defender derivation", () => {
+    const runtime = loadUserscript();
+    const { computeOverwhelmingNeighbor, INVASION_STALL_TROOP_RATIO, PlayerType } =
+      runtime.test.internals;
+    expect(INVASION_STALL_TROOP_RATIO).toBe(2.5);
+
+    const me = { troops: 10_000 };
+
+    // 2.49× — just under the threshold → no stall.
+    const under = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 7,
+        name: "Peer",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 24_900,
+      },
+    ]);
+    expect(under).toBeNull();
+
+    // 2.5× exactly — boundary → no stall (strict >).
+    const boundary = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 7,
+        name: "Peer",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 25_000,
+      },
+    ]);
+    expect(boundary).toBeNull();
+
+    // 2.51× — now overwhelming.
+    const over = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 7,
+        name: "Giant",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 25_100,
+      },
+    ]);
+    expect(over).not.toBeNull();
+    expect(over.ratio).toBeCloseTo(2.51, 2);
+    // Ideal min troops = 0.4 × attacker.troops (defender saturation point).
+    expect(over.idealMinTroops).toBe(Math.ceil(25_100 * 0.4));
+  });
+
+  it("computeOverwhelmingNeighbor picks the worst ratio across multiple enemies", () => {
+    const runtime = loadUserscript();
+    const { computeOverwhelmingNeighbor, PlayerType } = runtime.test.internals;
+    const me = { troops: 10_000 };
+    const worst = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 1,
+        name: "Mid",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 30_000, // 3×
+      },
+      {
+        smallID: 2,
+        name: "Worst",
+        type: PlayerType.Nation,
+        isFriendly: false,
+        troops: 80_000, // 8×
+      },
+      {
+        smallID: 3,
+        name: "Friendly",
+        type: PlayerType.Human,
+        isFriendly: true,
+        troops: 200_000, // 20× but friendly, skip
+      },
+    ]);
+    expect(worst).not.toBeNull();
+    expect(worst.enemy.name).toBe("Worst");
+    expect(worst.ratio).toBe(8);
+  });
+
+  it("shouldStallForInvasionDefense reads world.threats.overwhelmingNeighbor", () => {
+    const runtime = loadUserscript();
+    const { shouldStallForInvasionDefense } = runtime.test.internals;
+
+    const world = freshWorld(runtime);
+    expect(shouldStallForInvasionDefense()).toBe(false);
+
+    world.threats.overwhelmingNeighbor = {
+      enemy: { name: "Giant" },
+      ratio: 3.0,
+      idealMinTroops: 100_000,
+    };
+    expect(shouldStallForInvasionDefense()).toBe(true);
+
+    world.threats.overwhelmingNeighbor = null;
+    expect(shouldStallForInvasionDefense()).toBe(false);
+  });
+});
+

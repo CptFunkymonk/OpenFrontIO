@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.7.0
-// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense, compact RL decision logger
+// @version      2.8.0
+// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.7.0";
+  const BOT_VERSION = "2.8.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -132,6 +132,33 @@
   const RL_WORLD_SNAPSHOT_EVERY = 30;
   const RL_STEALTH_BLOCK_LOG_MS = 500;
   const RL_ADJ_OVERMATCH_RATIO = 1.25;
+
+  // Invasion-defense stall threshold.
+  //
+  // We can't keep letting a massive neighbour roll over us: if any hostile
+  // border-sharing actor has significantly more troops than we do, the
+  // right move is to hoard troops and fortify, not to bleed our reserve on
+  // offensive attacks that will just get the defender bonus stripped.
+  //
+  // Derivation from the engine's source code
+  // (src/core/configuration/DefaultConfig.ts):
+  //   - attackAmount commits  attacker.troops() / 5  per attack (Human / Nation).
+  //   - In attackLogic the attacker's per-tile loss multiplier scales with
+  //         within(defender.troops() / attackTroops, 0.6, 2)
+  //     The defensive side of that term saturates at 2 once
+  //         defender.troops() >= 2 * attackTroops.
+  //   - Substituting  attackTroops = attacker.troops() / 5  gives
+  //         defender.troops() >= 0.4 * attacker.troops()
+  //     i.e. the defender keeps the saturated bonus as long as
+  //         attacker.troops() <= 2.5 * our troops.
+  //
+  // So 0.4 × neighbour.troops() is the ideal minimum troop floor; any
+  // adjacent hostile with more than 2.5× our troops has enough mass to
+  // break through the saturated defender term. This also matches the
+  // Medium-difficulty threat rule in
+  // src/core/execution/nation/NationAllianceBehavior.ts
+  // (isAlliancePartnerThreat):  otherPlayer.troops() > this.player.troops() * 2.5.
+  const INVASION_STALL_TROOP_RATIO = 2.5;
   const RL_STORAGE_KEY_PREFIX = "superbotRL:";
   const RL_STORAGE_MAX_MATCHES = 3;
   // Compact export budget. The default dump target — 500 KB easily fits
@@ -362,6 +389,7 @@
         brewingInvaders: [],
         invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
+        overwhelmingNeighbor: null,
       },
       archetype: "unknown",
       archetypeLocked: null, // manual override from overlay
@@ -734,6 +762,7 @@
         RL_WORLD_SNAPSHOT_EVERY,
         RL_STEALTH_BLOCK_LOG_MS,
         RL_ADJ_OVERMATCH_RATIO,
+        INVASION_STALL_TROOP_RATIO,
       },
       buildPriority: BuildPriority.slice(),
       structureTypes: StructureTypes.slice(),
@@ -3069,6 +3098,22 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.expand < 5) return false;
 
+    // Stall offense when a bordering neighbour can trivially roll us —
+    // we'd rather claim no new tiles than bleed troops on expansion while
+    // sitting below the defender-bonus saturation point. See
+    // INVASION_STALL_TROOP_RATIO for the derivation.
+    if (shouldStallForInvasionDefense()) {
+      const overwhelming = runtime.world.threats.overwhelmingNeighbor;
+      decisionLog(
+        "expand: stalling — " +
+          (overwhelming.enemy.name || "neighbour") +
+          " has " +
+          overwhelming.ratio.toFixed(2) +
+          "x our troops",
+      );
+      return false;
+    }
+
     const segments = getAdjacentExpansionSegments(borderTiles, me);
     if (segments.length === 0) {
       decisionLog("expand: no terra nullius frontier");
@@ -3151,6 +3196,23 @@
           return true;
         }
       }
+    }
+
+    // Counter-target retaliation above already handled real defensive
+    // cases. The rest of this function is proactive "pick a neighbour and
+    // attack them"; skip it entirely if any bordering neighbour is big
+    // enough to invade us. Proactively attacking while overmatched costs
+    // us the saturated defender bonus and invites the follow-up push.
+    if (shouldStallForInvasionDefense()) {
+      const overwhelming = runtime.world.threats.overwhelmingNeighbor;
+      decisionLog(
+        "combat: stalling — " +
+          (overwhelming.enemy.name || "neighbour") +
+          " has " +
+          overwhelming.ratio.toFixed(2) +
+          "x our troops",
+      );
+      return false;
     }
 
     adjacentEnemies.sort((a, b) => {
@@ -3572,6 +3634,14 @@
       return false;
     }
 
+    // Shipping troops overseas while an overmatched land neighbour is
+    // staring at our border is exactly the invasion window we want to
+    // close. Hoard troops at home until the ratio is tenable.
+    if (shouldStallForInvasionDefense()) {
+      decisionLog("naval: stalling under overwhelming bordering neighbour");
+      return false;
+    }
+
     const currentBoats = getUnitEntityCount(me, UnitType.TransportShip);
     if (currentBoats >= gameView.config().boatMaxNumber()) {
       decisionLog("naval: transport cap reached");
@@ -3711,6 +3781,13 @@
       getUnitEntityCount(me, UnitType.TransportShip) >=
       gameView.config().boatMaxNumber()
     ) {
+      return false;
+    }
+
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "river-crossing: stalling under overwhelming bordering neighbour",
+      );
       return false;
     }
 
@@ -4237,6 +4314,7 @@
     if (!me) return false;
     const tick = runtime.world.tick;
     if (tick - runtime.state.cooldowns.betray < 60) return false;
+    if (shouldStallForInvasionDefense()) return false;
 
     // Safety re-check.
     const hostile = runtime.world.threats.adjacentEnemies.find(
@@ -4335,6 +4413,12 @@
     if (!gameView || !me) return false;
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.terrainRush < 12) return false;
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "terrain-rush: stalling under overwhelming bordering neighbour",
+      );
+      return false;
+    }
     const collapsing = runtime.world.threats.collapsingTargets || [];
     if (collapsing.length === 0) return false;
 
@@ -4442,6 +4526,10 @@
     if (!gameView || !me) return false;
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.combat < 10) return false;
+    if (shouldStallForInvasionDefense()) {
+      decisionLog("farm-tribe: stalling under overwhelming bordering neighbour");
+      return false;
+    }
 
     const adj = runtime.world.threats.adjacentEnemies || [];
     const tribe = adj.find((e) => e.tags && e.tags.has("TRIBE_FARM"));
@@ -4560,6 +4648,12 @@
     if (!gameView || !me) return false;
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.combat < 30) return false;
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "rising-star: stalling under overwhelming bordering neighbour",
+      );
+      return false;
+    }
     const rising = runtime.world.threats.risingStars;
     if (!rising || rising.length === 0) return false;
 
@@ -5020,6 +5114,13 @@
 
     if (isTooEarlyForNaval(gameView, me)) return false;
 
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "naval-land-grab: stalling under overwhelming bordering neighbour",
+      );
+      return false;
+    }
+
     if (
       getUnitEntityCount(me, UnitType.TransportShip) >=
       gameView.config().boatMaxNumber()
@@ -5260,6 +5361,71 @@
    * Would be dangerous to break this alliance right now? True if we're under
    * real threat — traitor debuff would be punishing.
    */
+  /**
+   * Pick the worst "overwhelming bordering neighbour" — any adjacent hostile
+   * actor with troops > INVASION_STALL_TROOP_RATIO × our troops. Returns
+   * { enemy, ratio, idealMinTroops } for the highest-ratio offender, or
+   * null if no such neighbour exists.
+   *
+   * Only meaningful actors (Humans + Nations) count — bots are already
+   * handled by FARM_TRIBE and rarely sustain a real invasion. Friendlies
+   * are skipped by construction because they are not on the
+   * adjacentEnemies list. Disconnected actors are filtered out so we
+   * don't turtle against a stalled AFK giant.
+   */
+  function computeOverwhelmingNeighbor(myEntry, adjacentEnemies) {
+    if (!myEntry) return null;
+    const myTroops = Number(myEntry.troops) || 0;
+    if (myTroops < 1) return null;
+    if (!Array.isArray(adjacentEnemies) || adjacentEnemies.length === 0) {
+      return null;
+    }
+    let worst = null;
+    let worstRatio = INVASION_STALL_TROOP_RATIO;
+    for (const entry of adjacentEnemies) {
+      if (!entry) continue;
+      if (entry.isFriendly) continue;
+      if (entry.isDisconnected) continue;
+      if (entry.type === PlayerType.Bot) continue;
+      const theirTroops = Number(entry.troops) || 0;
+      const ratio = theirTroops / myTroops;
+      if (ratio > worstRatio) {
+        worst = entry;
+        worstRatio = ratio;
+      }
+    }
+    if (!worst) return null;
+    const theirTroops = Number(worst.troops) || 0;
+    return {
+      enemy: worst,
+      ratio: worstRatio,
+      // idealMinTroops: the troop floor we want to sit at so the defender
+      // bonus stays saturated against this neighbour. Derived above —
+      // defender >= 0.4 × attacker keeps within(..., 0.6, 2) pinned at 2.
+      idealMinTroops: Math.ceil(theirTroops * 0.4),
+    };
+  }
+
+  /**
+   * Should the bot stall every proactive/offensive attack this tick because
+   * a border-sharing neighbour can trivially roll us?
+   *
+   * We gate anything that would spend troops on expansion, tribe farming,
+   * rising-star neutralization, betray-and-attack, or terrain rushes.
+   * We specifically do NOT gate:
+   *   - RETALIATION / REPEL_INVASION — those are defensive, they use
+   *     opposing-attack cancellation (AttackExecution subtracts troops
+   *     between matching attacks) to burn down the invader.
+   *   - Fortification paths (DefensePost / SAM / alliance requests) which
+   *     are what PREEMPT_INVASION and REPEL_INVASION already run.
+   */
+  function shouldStallForInvasionDefense() {
+    const world = runtime.world;
+    if (!world) return false;
+    const overwhelming = world.threats && world.threats.overwhelmingNeighbor;
+    return Boolean(overwhelming);
+  }
+
   function isUnsafeToBreakAlliance(myEntry) {
     if (!myEntry) return true;
     const world = runtime.world;
@@ -6533,6 +6699,16 @@
 
     // Update crown w/ hysteresis tracking (see Phase 2 acceptance criterion).
     runtime.world.prevCrownSmallID = runtime.world.threats.crownSmallID;
+    // Overwhelming bordering neighbour — someone strong enough to trivially
+    // invade us (troops > INVASION_STALL_TROOP_RATIO × our troops). When
+    // this is set, offensive tactical goals stall and we hoard troops
+    // for defence. See `computeOverwhelmingNeighbor` for the full
+    // source-code derivation behind the 2.5× threshold.
+    const overwhelmingNeighbor = computeOverwhelmingNeighbor(
+      runtime.world.me,
+      adjacentEnemies,
+    );
+
     runtime.world.threats = {
       crownSmallID: crownEntry ? crownEntry.smallID : null,
       crown: crownEntry,
@@ -6549,6 +6725,7 @@
       brewingInvaders: brewingInvaders.slice(0, 5),
       invasionTroopsInbound,
       inboundTroopTotal,
+      overwhelmingNeighbor,
     };
   }
 
@@ -10309,6 +10486,7 @@
         brewingInvaders: [],
         invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
+        overwhelmingNeighbor: null,
       },
       archetype: "CONTINENTAL",
       archetypeLocked: null,
@@ -10763,6 +10941,102 @@
       "REPEL_INVASION",
     );
 
+    // Scenarios 16–19: invasion-defense stall.
+    //
+    // The engine's combat math (src/core/configuration/DefaultConfig.ts)
+    // gives the defender a saturated attack-loss multiplier when
+    //     defender.troops() >= 0.4 × attacker.troops().
+    // Equivalently, any adjacent hostile with more than 2.5× our troops
+    // can roll us. These scenarios exercise the helper we use to keep
+    // the bot from blowing its reserve on offense when that's true.
+    const overwhelmingMe = { troops: 40_000 };
+    const scenario16 = computeOverwhelmingNeighbor(overwhelmingMe, [
+      {
+        smallID: 201,
+        name: "Giant",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 120_000, // 3.0× our troops
+      },
+    ]);
+    results.push({
+      name:
+        "computeOverwhelmingNeighbor flags bordering human with 3× our troops",
+      expected: "3.00",
+      actual: scenario16 ? scenario16.ratio.toFixed(2) : "null",
+      pass: scenario16 !== null && scenario16.ratio >= 2.5,
+    });
+
+    const scenario17 = computeOverwhelmingNeighbor(overwhelmingMe, [
+      {
+        smallID: 202,
+        name: "Peer",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 80_000, // 2.0× our troops — below the 2.5× threshold
+      },
+    ]);
+    results.push({
+      name:
+        "computeOverwhelmingNeighbor returns null when neighbour is only 2× our troops",
+      expected: "null",
+      actual: scenario17 === null ? "null" : "set",
+      pass: scenario17 === null,
+    });
+
+    // Bots don't count — they are handled by FARM_TRIBE and aren't
+    // credible invaders even at 5× our troops.
+    const scenario18 = computeOverwhelmingNeighbor(overwhelmingMe, [
+      {
+        smallID: 203,
+        name: "Tribe",
+        type: PlayerType.Bot,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 200_000,
+      },
+    ]);
+    results.push({
+      name: "computeOverwhelmingNeighbor ignores bot neighbours",
+      expected: "null",
+      actual: scenario18 === null ? "null" : "set",
+      pass: scenario18 === null,
+    });
+
+    // shouldStallForInvasionDefense reads world.threats.overwhelmingNeighbor.
+    // Set it explicitly and verify the gate fires; clear it and verify it
+    // doesn't.
+    const stashedWorld16 = runtime.world;
+    const stallOn = buildTestWorld();
+    stallOn.threats.overwhelmingNeighbor = {
+      enemy: { name: "Giant" },
+      ratio: 3.1,
+      idealMinTroops: 160_000,
+    };
+    runtime.world = stallOn;
+    const stallFires = shouldStallForInvasionDefense();
+    runtime.world = stashedWorld16;
+    results.push({
+      name: "shouldStallForInvasionDefense: fires when overwhelmingNeighbor set",
+      expected: "true",
+      actual: String(stallFires),
+      pass: stallFires === true,
+    });
+
+    const stallOff = buildTestWorld();
+    runtime.world = stallOff;
+    const stallQuiet = shouldStallForInvasionDefense();
+    runtime.world = stashedWorld16;
+    results.push({
+      name:
+        "shouldStallForInvasionDefense: stays off when no overwhelming neighbour",
+      expected: "false",
+      actual: String(stallQuiet),
+      pass: stallQuiet === false,
+    });
+
     // Scenario 6: parabolic SAM check should mark fewer trajectories as
     // intercepted than the linear approximation when the SAM sits on the
     // straight line between silo and target but NOT under the parabolic
@@ -10976,6 +11250,9 @@
         trackOutgoingBoat,
         reconcileBoatLosses,
         maybeRiverCrossing,
+        computeOverwhelmingNeighbor,
+        shouldStallForInvasionDefense,
+        INVASION_STALL_TROOP_RATIO,
         NARROW_WATER_HOP_LIMIT,
         LOST_BOAT_BASE_COOLDOWN_TICKS,
         LOST_BOAT_MAX_COOLDOWN_TICKS,
