@@ -512,28 +512,29 @@
     if (!toastEl) {
       toastEl = document.createElement("div");
       toastEl.className = "of-eb-toast";
-      // Stash the toast in an invisible container so the overlay style
-      // selector can still reach it.
-      const host = document.createElement("div");
-      host.id = OVERLAY_ID + "-toast-host";
-      host.style.display = "contents";
-      host.appendChild(toastEl);
-      // Re-use the overlay's style scope by putting the toast inside a
-      // zero-size root with the same id prefix.
-      const scope = document.createElement("div");
-      scope.id = OVERLAY_ID;
-      scope.style.all = "unset";
-      scope.style.position = "fixed";
-      scope.style.inset = "auto";
-      scope.style.pointerEvents = "none";
-      scope.appendChild(host);
-      document.body.appendChild(scope);
+      toastEl.style.position = "fixed";
+      toastEl.style.left = "50%";
+      toastEl.style.bottom = "56px";
+      toastEl.style.transform = "translateX(-50%)";
+      toastEl.style.background = "rgba(24, 24, 27, 0.94)";
+      toastEl.style.color = "#fafafa";
+      toastEl.style.borderRadius = "999px";
+      toastEl.style.padding = "8px 14px";
+      toastEl.style.fontSize = "13px";
+      toastEl.style.border = "1px solid rgba(255, 255, 255, 0.08)";
+      toastEl.style.zIndex = String(OVERLAY_Z_INDEX + 1);
+      toastEl.style.pointerEvents = "none";
+      toastEl.style.opacity = "0";
+      toastEl.style.transition = "opacity 160ms ease";
+      toastEl.style.fontFamily =
+        "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
+      document.body.appendChild(toastEl);
     }
     toastEl.textContent = text;
-    toastEl.classList.add("visible");
+    toastEl.style.opacity = "1";
     if (toastTimeout) clearTimeout(toastTimeout);
     toastTimeout = setTimeout(() => {
-      if (toastEl) toastEl.classList.remove("visible");
+      if (toastEl) toastEl.style.opacity = "0";
     }, 1400);
   }
 
