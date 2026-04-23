@@ -208,6 +208,17 @@ export class AiAttackBehavior {
       if (this.attackBots()) return;
     }
 
+    // Stall offense if a bordering enemy significantly outnumbers us.
+    // We still retaliate against active incoming attacks, but skip every
+    // proactive attack so we can hoard troops for defense.
+    if (this.hasOverwhelmingNeighbor(borderingEnemies)) {
+      const incomingAttacker = this.findIncomingAttackPlayer();
+      if (incomingAttacker) {
+        this.sendAttack(incomingAttacker, true);
+      }
+      return;
+    }
+
     // Save up troops until we reach the reserve ratio
     if (!this.hasReserveRatioTroops()) return;
 
@@ -364,6 +375,33 @@ export class AiAttackBehavior {
           !this.player.isFriendly(n) &&
           n.units().some((u) => Structures.has(u.type())),
       );
+  }
+
+  // Returns true if any bordering enemy has significantly more troops than us,
+  // meaning we should stall offense and hoard troops for defense.
+  //
+  // The 2.5x threshold is derived from the combat math in DefaultConfig.ts:
+  //   - A Nation/Human attacker commits attackAmount = attacker.troops() / 5.
+  //   - In attackLogic the attacker's per-tile loss scales with
+  //     within(defender.troops() / attackTroops, 0.6, 2). The defensive
+  //     multiplier saturates at 2 once defender.troops() >= 2 * attackTroops.
+  //   - Substituting attackTroops = attacker.troops() / 5 yields
+  //     defender.troops() >= 0.4 * attacker.troops(), i.e. we keep the
+  //     saturated defensive bonus as long as attacker.troops() <= 2.5 * our
+  //     troops. Beyond that ratio the defensive math tips against us.
+  //
+  // This matches the existing Medium-difficulty "is a threat" rule in
+  // NationAllianceBehavior.isAlliancePartnerThreat:
+  //   otherPlayer.troops() > this.player.troops() * 2.5.
+  //
+  // So 0.4 * neighbor.troops() is our ideal minimum troop floor; equivalently,
+  // if any bordering enemy has more than 2.5x our troops we should stall.
+  private hasOverwhelmingNeighbor(borderingEnemies: Player[]): boolean {
+    if (borderingEnemies.length === 0) return false;
+    if (this.player.troops() < 1) return false;
+    return borderingEnemies.some(
+      (enemy) => enemy.troops() > this.player.troops() * 2.5,
+    );
   }
 
   private hasReserveRatioTroops(): boolean {
