@@ -32,6 +32,7 @@ const DefaultKeybinds: Record<string, string> = {
   boatAttack: "KeyB",
   groundAttack: "KeyG",
   swapDirection: "KeyU",
+  broadcastEmoji: "KeyZ",
   zoomOut: "KeyQ",
   zoomIn: "KeyE",
   centerCamera: "KeyC",
@@ -588,6 +589,16 @@ export class UserSettingModal extends BaseModal {
         .defaultKey=${DefaultKeybinds.altKey}
         .value=${this.getKeyValue("altKey")}
         .display=${this.getKeyChar("altKey")}
+        @change=${this.handleKeybindChange}
+      ></setting-keybind>
+
+      <setting-keybind
+        action="broadcastEmoji"
+        label=${translateText("user_setting.broadcast_emoji")}
+        description=${translateText("user_setting.broadcast_emoji_desc")}
+        .defaultKey=${DefaultKeybinds.broadcastEmoji}
+        .value=${this.getKeyValue("broadcastEmoji")}
+        .display=${this.getKeyChar("broadcastEmoji")}
         @change=${this.handleKeybindChange}
       ></setting-keybind>
 

@@ -55,6 +55,7 @@ export class HelpModal extends BaseModal {
       attackRatioDown: "KeyT",
       attackRatioUp: "KeyY",
       swapDirection: "KeyU",
+      broadcastEmoji: "KeyZ",
       shiftKey: "ShiftLeft",
       modifierKey: isMac ? "MetaLeft" : "ControlLeft",
       altKey: "AltLeft",
@@ -368,6 +369,14 @@ export class HelpModal extends BaseModal {
                     </td>
                     <td class="py-3 border-b border-white/5 text-white/70">
                       ${translateText("help_modal.action_emote")}
+                    </td>
+                  </tr>
+                  <tr class="hover:bg-white/5 transition-colors">
+                    <td class="py-3 pl-4 border-b border-white/5">
+                      ${this.renderKey(keybinds.broadcastEmoji)}
+                    </td>
+                    <td class="py-3 border-b border-white/5 text-white/70">
+                      ${translateText("help_modal.action_broadcast_emoji")}
                     </td>
                   </tr>
                   <tr class="hover:bg-white/5 transition-colors">

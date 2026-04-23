@@ -5,7 +5,11 @@ import { AllPlayers } from "../../../core/game/Game";
 import { GameView, PlayerView } from "../../../core/game/GameView";
 import { TerraNulliusImpl } from "../../../core/game/TerraNulliusImpl";
 import { Emoji, flattenedEmojiTable } from "../../../core/Util";
-import { CloseViewEvent, ShowEmojiMenuEvent } from "../../InputHandler";
+import {
+  CloseViewEvent,
+  ShowEmojiBroadcastMenuEvent,
+  ShowEmojiMenuEvent,
+} from "../../InputHandler";
 import { SendEmojiIntentEvent } from "../../Transport";
 import { TransformHandler } from "../TransformHandler";
 
@@ -42,6 +46,24 @@ export class EmojiTable extends LitElement {
         eventBus.emit(
           new SendEmojiIntentEvent(
             recipient,
+            flattenedEmojiTable.indexOf(emoji as Emoji),
+          ),
+        );
+        this.hideTable();
+      });
+    });
+    eventBus.on(ShowEmojiBroadcastMenuEvent, () => {
+      const myPlayer = this.game.myPlayer();
+      if (myPlayer === null || !myPlayer.isAlive()) {
+        return;
+      }
+      if (this.game.inSpawnPhase()) {
+        return;
+      }
+      this.showTable((emoji) => {
+        eventBus.emit(
+          new SendEmojiIntentEvent(
+            AllPlayers,
             flattenedEmojiTable.indexOf(emoji as Emoji),
           ),
         );

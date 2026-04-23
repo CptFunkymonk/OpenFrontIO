@@ -111,6 +111,13 @@ export class ShowEmojiMenuEvent implements GameEvent {
   ) {}
 }
 
+/**
+ * Event emitted to open the emoji picker for broadcasting an emoji to
+ * every other player (friendly and enemy). Unlike ShowEmojiMenuEvent,
+ * this does not require pointing at a specific player on the map.
+ */
+export class ShowEmojiBroadcastMenuEvent implements GameEvent {}
+
 export class DoBoatAttackEvent implements GameEvent {}
 
 export class DoGroundAttackEvent implements GameEvent {}
@@ -231,6 +238,7 @@ export class InputHandler {
       boatAttack: "KeyB",
       groundAttack: "KeyG",
       swapDirection: "KeyU",
+      broadcastEmoji: "KeyZ",
       modifierKey: isMac ? "MetaLeft" : "ControlLeft",
       altKey: "AltLeft",
       buildCity: "Digit1",
@@ -488,6 +496,11 @@ export class InputHandler {
         e.preventDefault();
         const nextDirection = !this.uiState.rocketDirectionUp;
         this.eventBus.emit(new SwapRocketDirectionEvent(nextDirection));
+      }
+
+      if (!e.repeat && e.code === this.keybinds.broadcastEmoji) {
+        e.preventDefault();
+        this.eventBus.emit(new ShowEmojiBroadcastMenuEvent());
       }
 
       if (!e.repeat && e.code === this.keybinds.pauseGame) {
