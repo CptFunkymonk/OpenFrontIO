@@ -8295,6 +8295,13 @@
     const allies = getAllies();
     const enemies = getEnemies();
 
+    // Team-mode donation: the dedicated `maybeDonateToStrugglingTeammate`
+    // runs earlier in the main loop (Plan §2.10) with a tight 0.25
+    // ratio trigger and surplus formula. This legacy-diplomacy donate
+    // path acts as a smaller top-up for teammates who don't meet the
+    // critical-struggle bar but are still in combat AND we're already
+    // sitting well above 75% of cap (plenty of headroom). Amount is a
+    // conservative 12% so we don't double-donate into an empty cap.
     if (isTeamMode(gameView) && allies.length > 0) {
       let mostNeedy = null;
       for (const ally of allies) {
