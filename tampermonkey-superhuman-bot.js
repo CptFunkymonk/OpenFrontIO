@@ -5974,7 +5974,14 @@
 
     // Troop floor — we still want some defensive buffer even for a short hop.
     const maxTroops = gameView.config().maxTroops(me);
-    const reserveRatio = Math.max(0.1, computeReserveRatio(me, maxTroops) - 0.05);
+    // Plan §2.3: cap early-game so short river raids don't starve
+    // when baseReserve exceeds current army.
+    const reserveRatio = cappedReserveRatio(
+      me,
+      maxTroops,
+      computeReserveRatio(me, maxTroops) - 0.05,
+      0.1,
+    );
     const available = Math.floor(me.troops() - maxTroops * reserveRatio);
     if (available < 2000) {
       decisionLog("river-cross: reserve too low");
@@ -6643,9 +6650,13 @@
     // Rush reserve is aggressive — we'd rather win tiles now and rebuild
     // troops than sit and lose the race. Reduce reserve by 18 pts vs the
     // standard calc; floor at 8% so we still keep some defensive buffer.
-    const reserveRatio = Math.max(
-      0.08,
+    // Also cap at 0.5 × currentRatio so early-game rushes don't starve
+    // on baseReserve > current army (Plan §2.3).
+    const reserveRatio = cappedReserveRatio(
+      me,
+      maxTroops,
       computeReserveRatio(me, maxTroops) - 0.18,
+      0.08,
     );
 
     // Prefer adjacent collapsing targets; only consider non-adjacent ones
@@ -6753,7 +6764,14 @@
     if (!tribe) return false;
 
     const maxTroops = gameView.config().maxTroops(me);
-    const reserveRatio = Math.max(0.15, computeReserveRatio(me, maxTroops) - 0.1);
+    // Plan §2.3: cap early-game so we don't silently skip tribe farms
+    // when baseReserve exceeds current army.
+    const reserveRatio = cappedReserveRatio(
+      me,
+      maxTroops,
+      computeReserveRatio(me, maxTroops) - 0.1,
+      0.15,
+    );
     const budget = Math.floor(me.troops() - maxTroops * reserveRatio);
     const troops = calcTribeAttackTroops(tribe.troops, budget);
     if (troops <= 0) return false;
@@ -6882,7 +6900,14 @@
     if (!rising || rising.length === 0) return false;
 
     const maxTroops = gameView.config().maxTroops(me);
-    const reserveRatio = computeReserveRatio(me, maxTroops);
+    // Plan §2.3: cap early-game so neutralize rushes don't silently
+    // starve when baseReserve exceeds current army.
+    const reserveRatio = cappedReserveRatio(
+      me,
+      maxTroops,
+      computeReserveRatio(me, maxTroops),
+      0.08,
+    );
     const target = rising
       .slice()
       .sort((a, b) => a.troops - b.troops)
