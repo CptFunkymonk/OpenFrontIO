@@ -5168,7 +5168,19 @@
     // Up to a 10-point reduction when we own <5% of the map. Tapers off
     // linearly so established players don't over-spend on expansion.
     const aggressionBonus = clamp(0.1 * (0.2 - mapShare) / 0.2, 0, 0.1);
-    const reserveRatio = Math.max(0.08, baseReserve - 0.08 - aggressionBonus);
+    // Plan §2.3/§2.4: never reserve more troops than we actually have.
+    // Early-game `computeReserveRatio` returns 0.55 (> current 0.2),
+    // which would generate a negative `available` in
+    // calculateAttackTroops and silently block TN expansion exactly
+    // when it matters most. Cap the reserve at half of our current
+    // troop ratio so there's always a visible TN budget when we're
+    // small. The floor is still 0.08.
+    const currentRatio = maxTroops > 0 ? me.troops() / maxTroops : 0;
+    const maxReserveCap = Math.max(0.08, currentRatio * 0.5);
+    const reserveRatio = Math.min(
+      maxReserveCap,
+      Math.max(0.08, baseReserve - 0.08 - aggressionBonus),
+    );
     const troops = calculateAttackTroops(me, null, reserveRatio, maxTroops);
     if (troops <= 0) {
       decisionLog("expand: insufficient troops");

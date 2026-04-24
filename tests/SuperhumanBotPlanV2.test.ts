@@ -1048,6 +1048,29 @@ describe("Plan §5 — spawn scorer synthetic scenarios", () => {
   });
 });
 
+describe("Plan §2.3 — early-game expansion acceptance", () => {
+  it("calculateAttackTroops returns available for TN even at 20% troop ratio", async () => {
+    // Previously early-game the baseline reserveRatio (0.55 at ratio<0.2)
+    // generated a negative `available` in calculateAttackTroops so TN
+    // expansion was silently blocked exactly when most critical.
+    // maybeExpand now clamps reserveRatio to half of currentRatio.
+    const runtime = loadUserscript();
+    const { calculateAttackTroops } = runtime.test.internals;
+
+    // 20k troops, 100k max = 20% ratio. Post-cap effective reserve
+    // should be <= 10% of maxTroops = 10k. Available = 20k - 10k = 10k.
+    const me = { troops: () => 20_000 };
+    // Compute the effective reserveRatio that maybeExpand would use:
+    const currentRatio = 0.2;
+    const effectiveReserve = Math.max(0.08, currentRatio * 0.5); // 0.10
+    const troops = calculateAttackTroops(me, null, effectiveReserve, 100_000);
+    expect(troops).toBeGreaterThan(0);
+    // For a tiny army we still commit what's available (Plan §2.3
+    // TN branch: 'return available').
+    expect(troops).toBe(20_000 - Math.floor(100_000 * 0.1));
+  });
+});
+
 describe("Plan §2.4 — invasion stall acceptance", () => {
   it("maybeExpand still dispatches a TN attack when shouldStallForInvasionDefense() is true", async () => {
     const runtime = loadUserscript();
