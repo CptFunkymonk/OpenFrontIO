@@ -315,7 +315,11 @@
         /** @type {{ center: number, score: number }[] | null} */
         sortedCandidates: null,
         finalIndex: 0,
-        maxCandidateCenters: 2000,
+        // Raised from 2000 (Plan §2.1): with the 20× burst-sample rate
+        // we expect ~4000 unique candidates during the collection
+        // window, and keeping them all gives the final `chooseBest`
+        // pass a much richer pool to pick from.
+        maxCandidateCenters: 6000,
         randomSpawnIntentSent: false,
         thinkUntilMs: 0,
       },
@@ -3437,6 +3441,107 @@
     return penalty;
   }
 
+  // ------------------------------------------------------------------
+  // Strategic spawn features (Plan §2.1). These three helpers reward
+  // defensible peninsulas: low perimeter-to-area, few land corridors,
+  // and far from the currently-known opponent cluster.
+  // ------------------------------------------------------------------
+
+  /**
+   * Perimeter-to-area ratio of the local land patch surrounding `center`.
+   * A compact blob-of-land (e.g. the interior of a continent) has low
+   * perimeter relative to area. A thin peninsula — which is what we
+   * want — *also* has low perimeter because the sea takes the place of
+   * land neighbours on 3 sides. We therefore bias the scorer toward
+   * shapes with a high water-ratio on the edge of a small-radius disc.
+   *
+   * Returns a value in [0, 1]. Higher = worse (more exposed perimeter).
+   */
+  function perimeterToAreaRatio(gameView, center, radius) {
+    let area = 0;
+    let boundary = 0;
+    for (const tile of gameView.circleSearch(center, radius)) {
+      if (!gameView.isLand(tile)) continue;
+      area += 1;
+      for (const neighbor of gameView.neighbors(tile)) {
+        if (!gameView.isLand(neighbor)) {
+          boundary += 1;
+          break;
+        }
+      }
+    }
+    if (area <= 0) return 1;
+    return boundary / area;
+  }
+
+  /**
+   * Count "land corridors" — tiles inside a medium radius whose land
+   * fraction in their local 3-disc is low (i.e. narrow necks). Few
+   * corridors means we only have to defend a small number of choke
+   * points, which is the ideal spawn topology.
+   *
+   * Returns an integer corridor count, capped at 6 to keep the math
+   * bounded for the scorer.
+   */
+  function corridorCount(gameView, center, radius) {
+    let count = 0;
+    for (const tile of gameView.circleSearch(center, radius)) {
+      if (!gameView.isLand(tile)) continue;
+      let landN = 0;
+      let totalN = 0;
+      for (const neighbor of gameView.neighbors(tile)) {
+        totalN += 1;
+        if (gameView.isLand(neighbor)) landN += 1;
+      }
+      // A corridor tile has exactly 2 land neighbours in the cardinal
+      // neighbourhood: that's a 1-wide land strip.
+      if (totalN >= 4 && landN === 2) {
+        count += 1;
+        if (count >= 6) break;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Gaussian-weighted distance to every known opponent's spawn tile /
+   * owned territory. Close clusters stack quickly, far clusters fall
+   * off to zero. Used as a multiplicative penalty so the same spawn
+   * becomes less attractive when the opposition is bunched up nearby.
+   *
+   * Returns a non-negative scalar (we cap at 1.0 to keep the weight
+   * bounded).
+   */
+  function gaussianEnemyClusterPenalty(gameView, center) {
+    const mySmall = runtime.world.meSmallID;
+    let sum = 0;
+    for (const p of safeCall(() => gameView.playerViews(), [])) {
+      if (!p) continue;
+      const smallID = safeCall(() => p.smallID(), -1);
+      if (smallID === mySmall) continue;
+      const type = safeCall(() => p.type(), null);
+      // Humans dominate diplomacy + nuke timing; weight them heaviest.
+      const weight = type === PlayerType.Human ? 1.0 : 0.6;
+      let dist = Infinity;
+      const spawnTile = safeCall(() => p.spawnTile(), undefined);
+      if (spawnTile !== undefined && spawnTile !== null) {
+        dist = gameView.manhattanDist(center, spawnTile);
+      } else if (safeCall(() => p.hasSpawned(), false)) {
+        const sample = sampleTilesForOwner(smallID, 1, {
+          requireLand: true,
+          maxSamples: 60,
+        });
+        if (sample.length > 0) {
+          dist = gameView.manhattanDist(center, sample[0]);
+        }
+      }
+      if (!Number.isFinite(dist)) continue;
+      // σ = 80 tiles → two players at d=40 contribute ~0.78 each.
+      sum += weight * Math.exp(-(dist * dist) / (2 * 80 * 80));
+    }
+    return Math.min(1, sum);
+  }
+
   function computeSpawnCenterScore(gameView, center) {
     if (!gameView.isLand(center) || gameView.hasOwner(center)) return null;
     if (safeCall(() => gameView.isBorder(center), false)) return null;
@@ -3469,6 +3574,14 @@
       else if (typ === TerrainType.Highland) highland += 1;
       else if (typ === TerrainType.Mountain) mountain += 1;
     }
+    // Plains-first gate (Plan §2.1.6): Plains give attackers `mag=80`
+    // (cheapest terrain to push off of), Highland 100, Mountain 120. A
+    // patch that is <60% plains forces us to grind against higher
+    // defensive magnitudes on every outgoing attack — reject outright.
+    const totalTerrain = Math.max(1, plains + highland + mountain);
+    if (plains / totalTerrain < 0.6) {
+      return null;
+    }
 
     let ownedPenalty = 0;
     for (const tile of gameView.circleSearch(center, 18)) {
@@ -3493,6 +3606,17 @@
     const choke = isChokepointLike(gameView, center, 20) ? 1 : 0;
     const enemyPenalty = enemyProximityPenalty(gameView, center);
 
+    // Strategic-topology components (Plan §2.1): peninsula shape,
+    // corridor count, and Gaussian-weighted enemy cluster distance.
+    // The peninsula score is (1 - perimeterRatio) so a low-perimeter
+    // coastal patch scores near 1. The corridor score rewards spawns
+    // with <= 1 land neck; more necks mean more borders to defend.
+    const perimeter = perimeterToAreaRatio(gameView, center, 16);
+    const peninsulaScore = 1 - Math.min(1, perimeter);
+    const necks = corridorCount(gameView, center, 40);
+    const corridorScore = 1 - Math.min(necks, 3) / 3;
+    const clusterPenalty = gaussianEnemyClusterPenalty(gameView, center);
+
     // Nation spawns already placed nearby — keep distance.
     let falloutNearby = 0;
     for (const tile of gameView.circleSearch(center, 12)) {
@@ -3510,7 +3634,13 @@
       frontier * 5 +
       elev * 0.8 +
       coast * 120 +
-      choke * 40 -
+      choke * 40 +
+      // Plan §2.1.3/4/5: peninsula shape, narrow-neck count, and
+      // Gaussian enemy-cluster distance. These three terms together
+      // account for the bulk of "pick the defensible coastal spot".
+      peninsulaScore * 300 +
+      corridorScore * 200 -
+      clusterPenalty * 600 -
       ownedPenalty -
       oceanPenalty -
       enemyPenalty * 4 -
@@ -4086,8 +4216,23 @@
     const gameView = getGameView();
     if (!gameView) return null;
 
+    // Plan §2.1.1: out-sample the server. The engine collects one
+    // candidate per tick for ~2/3 of the spawn phase (~200 ticks on
+    // public matches) and locks the best. We only pick once, so we
+    // burst-sample every call. Budget is bounded so we do not starve
+    // the main loop on slow clients.
+    //
+    // 40× the spawn-phase tick count keeps us above the server's
+    // sample density while capping well below 10k so the per-call
+    // cost stays under ~50ms.
+    const spawnPhaseTicks = safeCall(
+      () => gameView.config().numSpawnPhaseTurns(),
+      300,
+    );
+    const SAMPLES = Math.min(6000, Math.max(1500, spawnPhaseTicks * 20));
+
     const candidates = [];
-    for (let i = 0; i < 320; i++) {
+    for (let i = 0; i < SAMPLES; i++) {
       const sampled = trySampleSpawnCandidate(gameView);
       if (!sampled) continue;
       candidates.push(sampled);
@@ -4642,9 +4787,16 @@
       const tick = gameView.ticks();
 
       if (tick <= collectionEnd) {
-        const sampled = trySampleSpawnCandidate(gameView);
-        if (sampled) {
-          rememberSpawnCandidate(sampled);
+        // Plan §2.1.1/.2: the server samples 1 random tile per tick. We
+        // burst 20 per tick so after the collection window we have a
+        // ~4000-candidate pool (vs ~200 before), deeply out-sampling the
+        // server scorer. `rememberSpawnCandidate` already caps the set
+        // size, so we cannot grow unbounded.
+        for (let i = 0; i < 20; i++) {
+          const sampled = trySampleSpawnCandidate(gameView);
+          if (sampled) {
+            rememberSpawnCandidate(sampled);
+          }
         }
         runtime.state.lastAction =
           "scoring spawns (" +
