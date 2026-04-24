@@ -237,4 +237,56 @@ describe("superhuman bot emoji module", () => {
     expect(ok).toBe(false);
     expect(sent).toHaveLength(0);
   });
+
+  it("exposes the manual picker hotkey internals", () => {
+    // These are the names that __superhumanBotDebug.emoji.openPicker +
+    // the install path depend on. A broken refactor here would silently
+    // disable the hotkey, so guard against it.
+    expect(typeof internals.openEmojiPicker).toBe("function");
+    expect(typeof internals.closeEmojiPicker).toBe("function");
+    expect(typeof internals.handleEmojiPickerKeyDown).toBe("function");
+    expect(typeof internals.installEmojiPickerHotkey).toBe("function");
+    expect(internals.getPickerKeybind()).toBe("KeyZ");
+  });
+
+  it("opens and closes the picker overlay without throwing", () => {
+    // Picker mounts a <div id="of-superbot-emoji-picker"> into
+    // document.body. Verify the overlay lifecycle works end-to-end.
+    internals.closeEmojiPicker();
+    expect(document.getElementById("of-superbot-emoji-picker")).toBeNull();
+    internals.openEmojiPicker();
+    const el = document.getElementById("of-superbot-emoji-picker");
+    expect(el).not.toBeNull();
+    // Grid should contain one button per emoji.
+    const buttons = el!.querySelectorAll("button.of-ep-emoji");
+    expect(buttons.length).toBe(60);
+    internals.closeEmojiPicker();
+    expect(document.getElementById("of-superbot-emoji-picker")).toBeNull();
+  });
+
+  it("picker buttons send through emitEmoji + bump the counter", () => {
+    runtime.hooks.gameView = { ticks: () => 50 } as any;
+    runtime.world = {
+      tick: 50,
+      allianceGraph: { largestBlocShare: 0, coalitionThreat: false },
+      totals: { myShare: 0, crownShare: 0, alivePlayers: 1 },
+      threats: { crown: null, risingStars: [], nearestDanger: null },
+      archetype: "unknown",
+    };
+    internals.openEmojiPicker();
+    const el = document.getElementById("of-superbot-emoji-picker")!;
+    const buttons = el.querySelectorAll(
+      "button.of-ep-emoji",
+    ) as NodeListOf<HTMLButtonElement>;
+    const priorCount = runtime.state.emoji.totalEmojisSent;
+    buttons[15].click(); // 👋
+    expect(sent.at(-1)?.intent).toEqual({
+      type: "emoji",
+      recipient: "AllPlayers",
+      emoji: 15,
+    });
+    expect(runtime.state.emoji.totalEmojisSent).toBe(priorCount + 1);
+    // Clicking a button also closes the overlay.
+    expect(document.getElementById("of-superbot-emoji-picker")).toBeNull();
+  });
 });
