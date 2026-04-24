@@ -6809,12 +6809,17 @@
       .find((e) => !e.isFriendly);
     if (!target) return false;
 
-    const required = Math.max(
-      Math.ceil(target.troops * 1.3),
-      Math.floor(maxTroops * 0.25),
+    // Plan §2.3: use the saturation-anchored calculator so we never
+    // attack below the 1.667× loss-saturation point on a proactive
+    // strike. This replaces the old 1.3× "required" heuristic which
+    // sat in the loss-multiplier 1.x-1.5× penalty zone.
+    const required = calculateAttackTroops(
+      me,
+      target.player,
+      reserveRatio,
+      maxTroops,
     );
-    const available = Math.floor(me.troops() - maxTroops * reserveRatio);
-    if (available < required) return false;
+    if (required <= 0) return false;
 
     if (target.isAdjacent) {
       if (sendAttack(target.id, required)) {
@@ -6844,10 +6849,22 @@
       );
       return false;
     }
+    // Plan §2.3: abort the boat if the troop cap (35% of standing
+    // army) is below `required`. Sending a under-saturated boat into
+    // an enemy we *deliberately chose* to neutralize is worse than
+    // not going at all — we'd just feed them the troops.
+    const boatPayload = Math.min(required, Math.floor(me.troops() * 0.35));
+    if (boatPayload < required) {
+      decisionLog(
+        "rising-star boat skip " + target.name +
+          ": payload " + boatPayload + " < required " + required,
+      );
+      return false;
+    }
     if (
       sendBoat(
         landingTile,
-        Math.min(required, Math.floor(me.troops() * 0.35)),
+        boatPayload,
         { targetSmallID: target.smallID },
       )
     ) {
