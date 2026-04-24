@@ -6095,7 +6095,11 @@
     const silosReady = mySilos.filter(
       (u) => safeCall(() => u.missileReadinesss(), 0) > 0.25,
     ).length;
-    if (silosReady < 2) return false;
+    // Plan §2.7: synchronise 3 launches. Two silos against a SAM-2 cover
+    // lose both warheads to sequential interception (SAMCooldown=120 is
+    // well inside the flight time at default nuke speed). Three silos
+    // launched inside ~2 ticks guarantee a hole in the SAM wall.
+    if (silosReady < 3) return false;
 
     const atomCost = ATOM_GOLD_THRESHOLD;
     // Sort easiest-first: lowest level SAMs.
@@ -6149,19 +6153,24 @@
         }
         usableSilos.push(silo);
       }
-      if (usableSilos.length < Math.min(2, totalBombs)) continue;
+      // Plan §2.7: we need at least 3 usable silos for a proper salvo.
+      // Below that we abort — firing 1–2 atoms at a SAM-covered target
+      // just feeds the SAM's reload cycle.
+      const minSalvo = Math.min(3, totalBombs);
+      if (usableSilos.length < minSalvo) continue;
 
-      // Fire as many atom bombs as we have silos capable of it; each counts
-      // against the nuke cooldown. We stagger them via repeated sendBuild
-      // calls which the game will queue across ticks (major-intent cap will
-      // naturally space them out in stealth mode).
+      // Fire up to 4 atom bombs in the same tick. The stealth gate's
+      // per-kind `build-burst` cap (STEALTH_MAX_BUILDS_PER_SEC = 3)
+      // keeps the actual wire send within ~300 ms regardless — that's
+      // inside the SAM's reload window so the salvo behaves as a
+      // single overwhelmed wave from the defender's POV.
       let fired = 0;
       for (const silo of usableSilos.slice(0, Math.min(totalBombs, 4))) {
         if (sendBuild(UnitType.AtomBomb, targetTile, getRocketDirectionUp())) {
           fired += 1;
         }
       }
-      if (fired === 0) continue;
+      if (fired < minSalvo) continue;
 
       runtime.state.cooldowns.nuke = tick;
       reasonLog(
@@ -9577,9 +9586,13 @@
         const world = runtime.world;
         const me = world.me;
         if (!me) return { valid: false };
-        // Need at least 3 atoms' worth of gold banked so we can ripple
-        // enough warheads to overwhelm a SAM-2/3 wall. Plan §2.7.
-        if (me.gold < ATOM_GOLD_THRESHOLD * 3) return { valid: false };
+        // Plan §2.7: gold gate = 3× atom (the overwhelm salvo) +
+        // HYDRO_GOLD_THRESHOLD (one hydrogen reserved for the follow-up
+        // punch that lands through the cleared SAM hole). Without that
+        // reserve we waste the salvo — atoms alone don't kill the crown.
+        const overwhelmBudget =
+          ATOM_GOLD_THRESHOLD * 3 + HYDRO_GOLD_THRESHOLD;
+        if (me.gold < overwhelmBudget) return { valid: false };
         const crown = world.threats.crown;
         const topHostile = crown && !crown.isFriendly ? crown : null;
         if (!topHostile) return { valid: false };
@@ -12905,10 +12918,11 @@
         secondShare: 0.2,
       },
     });
-    // Plan §2.7: SAM_OVERWHELM now requires gold >= 3x ATOM and 3
-    // ready silos. A single-silo ripple vs SAM-2 loses both warheads
-    // to sequential reloads; 3 silos guarantee at least one lands.
-    scenario5a.me.gold = 3_000_000;
+    // Plan §2.7: SAM_OVERWHELM requires gold >= 3x ATOM + HYDRO reserve
+    // (3*750k + 5M = 7.25M) plus 3 ready silos. The hydrogen reserve
+    // guarantees we can punch through the cleared SAM hole; without it
+    // the salvo is wasted.
+    scenario5a.me.gold = 8_000_000;
     scenario5a.me.structures[UnitType.MissileSilo] = 3;
     scenario5a.threats.crown = {
       smallID: 2,
