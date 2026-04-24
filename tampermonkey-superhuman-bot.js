@@ -13684,6 +13684,9 @@
         perimeterToAreaRatio,
         corridorCount,
         gaussianEnemyClusterPenalty,
+        // Plan §8 acceptance-test helpers.
+        selectPrimaryGoal,
+        recordAllianceBreak,
         sendRawMessage,
         installLocalTransportBridge,
         handleServerMessage,

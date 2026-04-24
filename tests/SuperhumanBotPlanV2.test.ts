@@ -349,3 +349,267 @@ describe("openingDiplomacyBlast — one-shot, Human-only, proximity-gated", () =
     expect(runtime.state.openingBlast.fired).toBe(false);
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────
+// Plan §8 acceptance checklist — machine-checkable cases
+// ───────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a minimal world object matching the shape that selectPrimaryGoal
+ * and the various evaluate() functions expect. Only the fields each
+ * specific test cares about are filled; every helper should tolerate
+ * missing optional fields (safeCall + default guards already do).
+ */
+function buildWorld(overrides: any = {}) {
+  const base: any = {
+    tick: 1500,
+    me: {
+      smallID: 1,
+      name: "Me",
+      gold: 1_000_000,
+      tiles: 2000,
+      troops: 50_000,
+      maxTroops: 100_000,
+      troopRatio: 0.5,
+      incomingAttacks: [],
+      outgoingAttacks: [],
+      incomingTroops: 0,
+      outgoingTroops: 0,
+      structures: {
+        City: 4,
+        Factory: 1,
+        Port: 0,
+        "Defense Post": 2,
+        "Missile Silo": 0,
+        "SAM Launcher": 0,
+      },
+      structureLevels: {
+        City: 4,
+        Factory: 1,
+        Port: 0,
+        "Defense Post": 2,
+        "Missile Silo": 0,
+        "SAM Launcher": 0,
+      },
+    },
+    meSmallID: 1,
+    everyone: [],
+    bySmallID: new Map(),
+    history: new Map(),
+    totals: {
+      alivePlayers: 3,
+      humanCount: 1,
+      nationCount: 1,
+      botCount: 1,
+      totalLand: 10_000,
+      usableLand: 10_000,
+      crownShare: 0.15,
+      myShare: 0.15,
+      secondShare: 0.14,
+    },
+    rankings: { byTiles: [], byTroops: [], byTilesVelocity: [], byTroopsVelocity: [] },
+    allianceGraph: { edges: new Map(), cliques: [], largestBlocShare: 0, coalitionThreat: false },
+    threats: {
+      crownSmallID: null,
+      crown: null,
+      prevCrownSmallID: null,
+      risingStars: [],
+      softTargets: [],
+      collapsingTargets: [],
+      nearestDanger: null,
+      mirvRisk: false,
+      mirvCapable: [],
+      adjacentEnemies: [],
+      narrowWaterNeighbors: [],
+      activeInvaders: [],
+      brewingInvaders: [],
+      invasionTroopsInbound: 0,
+      inboundTroopTotal: 0,
+      overwhelmingNeighbor: null,
+    },
+    archetype: "CONTINENTAL",
+    archetypeLocked: null,
+    classifiedAt: 100,
+  };
+  return Object.assign(base, overrides);
+}
+
+function stubGameViewForPlanner(runtime: any, stubUnits: Map<any, any[]>) {
+  runtime.hooks.gameView = {
+    ticks: () => 1500,
+    config: () => ({
+      maxTroops: () => 100_000,
+      boatMaxNumber: () => 3,
+      isUnitDisabled: () => false,
+    }),
+    myPlayer: () => ({
+      isAlive: () => true,
+      units: (t: any) => stubUnits.get(t) || [],
+      smallID: () => 1,
+    }),
+  };
+}
+
+describe("Plan §8 — calculateAttackTroops acceptance", () => {
+  it("never returns 0 on a viable commit while we are at >= 50% troop ratio", () => {
+    // "Viable" per the new math = available (troops - reserve*cap) is at
+    // or above 1.0x the defender's troops for proactive strikes, OR
+    // we are retaliating and above 0.5x. This test builds cases that
+    // clear those gates to prove the pathological 0-return path from
+    // v2.8 is gone.
+    const runtime = loadUserscript();
+    const { calculateAttackTroops } = runtime.test.internals;
+    const me = (troops: number) => ({ troops: () => troops });
+    const cases: Array<[number, number, boolean, string]> = [
+      // [myTroops, enemyTroops, retaliating, label]
+      [80_000, 10_000, false, "1.667x ideal commit"],
+      [80_000, 30_000, false, "above strong"],
+      [80_000, 45_000, false, "just at strong edge"],
+      [50_000, 10_000, false, "50% of cap vs weak enemy"],
+      [60_000, 20_000, true, "retaliating above minViable"],
+      [70_000, 30_000, true, "retaliating, strong"],
+    ];
+    for (const [myTroops, enemyTroops, retaliating, label] of cases) {
+      const out = calculateAttackTroops(
+        me(myTroops),
+        { troops: () => enemyTroops },
+        0.35,
+        100_000,
+        { retaliating },
+      );
+      expect(out, label).toBeGreaterThan(0);
+    }
+  });
+
+  it("refuses a proactive strike where the old v2.8 calculator would have returned 0", () => {
+    // v2.8: `if (available < pressure [0.6x defender]) return 0`. The new
+    // calculator replaces this with the engine's saturation points.
+    // Regression case: 50_000 troops, reserve 0.35, available 15_000;
+    // enemy 30_000. Old calc returned 0 (pressure=18_000 > available);
+    // new calc correctly returns 0 because we are below strong.
+    // The test documents the intentional preservation of "refuse loser
+    // attacks" so nobody re-introduces a 0.6x pressure path later.
+    const runtime = loadUserscript();
+    const { calculateAttackTroops } = runtime.test.internals;
+    const out = calculateAttackTroops(
+      { troops: () => 50_000 },
+      { troops: () => 30_000 },
+      0.35,
+      100_000,
+    );
+    expect(out).toBe(0);
+  });
+});
+
+describe("Plan §8 — NUKE_CROWN trigger acceptance", () => {
+  it("selects NUKE_CROWN when crownShare >= 0.25 and crown has <= 2 SAMs", () => {
+    const runtime = loadUserscript();
+    const { selectPrimaryGoal, UnitType } = runtime.test.internals;
+    const world = buildWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.25,
+        myShare: 0.2,
+        secondShare: 0.2,
+      },
+    });
+    world.me.gold = 1_200_000; // above ATOM_GOLD_THRESHOLD
+    world.me.structures[UnitType.MissileSilo] = 1;
+    world.threats.crown = {
+      smallID: 2,
+      name: "Crown",
+      isFriendly: false,
+      tiles: 2500,
+      structureLevels: { [UnitType.SAMLauncher]: 1 },
+    };
+    world.threats.crownSmallID = 2;
+    runtime.world = world;
+
+    // Stub a ready silo so getMyUnitsOfType() sees one.
+    const stubSilo = {
+      isActive: () => true,
+      isUnderConstruction: () => false,
+      level: () => 1,
+      missileReadinesss: () => 1,
+      id: () => 42,
+      tile: () => 0,
+    };
+    stubGameViewForPlanner(runtime, new Map([[UnitType.MissileSilo, [stubSilo]]]));
+
+    // Clear any lingering forced goal from previous tests.
+    runtime.planner.forcedGoalId = null;
+    runtime.planner.forcedGoalExpiresMs = 0;
+
+    const selection = selectPrimaryGoal();
+    expect(selection, "should select a goal").not.toBeNull();
+    expect(selection.spec.id).toBe("NUKE_CROWN");
+  });
+
+  it("NUKE_CROWN does not fire when crownShare is below 0.25", () => {
+    const runtime = loadUserscript();
+    const { selectPrimaryGoal, UnitType } = runtime.test.internals;
+    const world = buildWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.24,
+        myShare: 0.2,
+        secondShare: 0.2,
+      },
+    });
+    world.me.gold = 1_200_000;
+    world.me.structures[UnitType.MissileSilo] = 1;
+    world.threats.crown = {
+      smallID: 2,
+      name: "Crown",
+      isFriendly: false,
+      tiles: 2400,
+      structureLevels: { [UnitType.SAMLauncher]: 1 },
+    };
+    world.threats.crownSmallID = 2;
+    runtime.world = world;
+    stubGameViewForPlanner(
+      runtime,
+      new Map([[UnitType.MissileSilo, [{ isActive: () => true, isUnderConstruction: () => false, level: () => 1, missileReadinesss: () => 1, id: () => 1, tile: () => 0 }]]]),
+    );
+    runtime.planner.forcedGoalId = null;
+    runtime.planner.forcedGoalExpiresMs = 0;
+
+    const selection = selectPrimaryGoal();
+    expect(selection && selection.spec.id).not.toBe("NUKE_CROWN");
+  });
+});
+
+describe("Plan §8 — traitor-window lock acceptance", () => {
+  it("recordAllianceBreak forces DEFENSIVE_TURTLE for ~30 seconds", () => {
+    const runtime = loadUserscript();
+    const { recordAllianceBreak } = runtime.test.internals;
+
+    runtime.world = buildWorld();
+    runtime.planner.forcedGoalId = null;
+    runtime.planner.forcedGoalExpiresMs = 0;
+    runtime.state.recentAllianceBreakTicks = [];
+    runtime.state.cooldowns.allianceBreak = -999;
+
+    const tBefore = Date.now();
+    recordAllianceBreak();
+    const tAfter = Date.now();
+
+    expect(runtime.planner.forcedGoalId).toBe("DEFENSIVE_TURTLE");
+    // Expiry should land ~30s after the call. Allow the test-run jitter
+    // of 30000 ± a few ms.
+    const expiresInMs = runtime.planner.forcedGoalExpiresMs - tAfter;
+    expect(expiresInMs).toBeGreaterThan(29_000);
+    expect(expiresInMs).toBeLessThanOrEqual(30_000 + (tAfter - tBefore));
+    expect(runtime.state.traitorLockActive).toBe(true);
+  });
+});
