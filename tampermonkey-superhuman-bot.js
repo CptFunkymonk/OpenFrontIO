@@ -5221,12 +5221,21 @@
     const counterTarget = chooseCounterTarget(me.incomingAttacks());
     const maxTroops = gameView.config().maxTroops(me);
     const reserveRatio = computeReserveRatio(me, maxTroops);
+    // Plan §2.3 reserve cap for the counter-target retaliation path:
+    // early-game players whose baseReserve is 0.55 would otherwise
+    // refuse to counter-attack. Cap at 0.5 × currentRatio so the
+    // counter-target fires even when we're small.
+    const currentRatioCombat = maxTroops > 0 ? me.troops() / maxTroops : 0;
+    const counterReserve = Math.min(
+      Math.max(0.08, currentRatioCombat * 0.5),
+      Math.max(0.08, reserveRatio - 0.08),
+    );
 
     if (counterTarget && counterTarget.isPlayer && counterTarget.isPlayer()) {
       const troops = calculateAttackTroops(
         me,
         counterTarget,
-        reserveRatio - 0.08,
+        counterReserve,
         maxTroops,
         { retaliating: true },
       );
