@@ -5513,7 +5513,27 @@
     }
 
     const candidateTiles = getOwnedCandidateTiles(me, 20);
-    const order = buildOrderForArchetype(runtime.world.archetype);
+    let order = buildOrderForArchetype(runtime.world.archetype);
+
+    // Plan §2.7 — silo pre-build pool. While saving for hydrogen bombs
+    // or MIRVs, we MUST already have 3 silos standing when we pull the
+    // trigger; otherwise the crown's SAMs intercept a lone warhead
+    // without a second wave behind it. Override the archetype order so
+    // the silo builds get priority once the goal system is in nuclear
+    // mode. `shouldBuildType` already caps the silo count (siloCap=3
+    // default, 4 on NUKE_RACE) so this does not runaway.
+    const nuclearGoal =
+      runtime.planner.activeGoalId === "SAVE_FOR_HYDRO" ||
+      runtime.planner.activeGoalId === "MIRV_LAST_RESORT" ||
+      runtime.planner.activeGoalId === "SAM_OVERWHELM";
+    if (nuclearGoal) {
+      const reordered = [UnitType.MissileSilo];
+      for (const t of order) {
+        if (t !== UnitType.MissileSilo) reordered.push(t);
+      }
+      order = reordered;
+    }
+
     for (const type of order) {
       if (!shouldBuildType(type, me, enemies)) continue;
       let tiles;
@@ -9446,7 +9466,9 @@
         const world = runtime.world;
         const me = world.me;
         if (!me) return { valid: false };
-        if (me.gold < ATOM_GOLD_THRESHOLD * 2) return { valid: false };
+        // Need at least 3 atoms' worth of gold banked so we can ripple
+        // enough warheads to overwhelm a SAM-2/3 wall. Plan §2.7.
+        if (me.gold < ATOM_GOLD_THRESHOLD * 3) return { valid: false };
         const crown = world.threats.crown;
         const topHostile = crown && !crown.isFriendly ? crown : null;
         if (!topHostile) return { valid: false };
@@ -9458,7 +9480,11 @@
         const mySilos = getMyUnitsOfType(UnitType.MissileSilo).filter(
           (u) => !safeCall(() => u.isUnderConstruction(), false),
         );
-        if (mySilos.length < 2) return { valid: false };
+        // Plan §2.7: 3-silo minimum. A single-SAM player reloads in 120
+        // ticks (12s); 2 silos can be intercepted in sequence. 3 silos
+        // guarantee ≥1 warhead lands unless the crown has SAM level 5+,
+        // in which case we shouldn't be nuking yet anyway.
+        if (mySilos.length < 3) return { valid: false };
         return {
           valid: true,
           priority: 80,
@@ -9477,16 +9503,31 @@
         const crown = world.threats.crown;
         if (!crown) return { valid: false };
         if (crown.isFriendly) return { valid: false };
-        if (world.totals.crownShare < 0.3) return { valid: false };
+        // Plan §2.7: strike window starts at 25% crownShare — the crown
+        // still has <2 SAMs at that point in typical matches. Waiting
+        // for 30% lets them SAM-5 up (samRange(5) ≈ 150, past hydro).
+        if (world.totals.crownShare < 0.25) return { valid: false };
         const silos = getMyUnitsOfType(UnitType.MissileSilo).filter(
           (u) => !safeCall(() => u.isUnderConstruction(), false),
         );
         if (silos.length === 0) return { valid: false };
         if (!canAffordApprox(me, ATOM_GOLD_THRESHOLD)) return { valid: false };
+
+        // Plan §2.7: dynamic priority that escalates with crownShare
+        // and with how under-SAMmed the target is. Pulls the trigger
+        // *before* a SAM wall hardens the crown against hydrogen bombs.
+        const crownSamLevels =
+          (crown.structureLevels && crown.structureLevels[UnitType.SAMLauncher]) || 0;
+        let priority = 84;
+        if (world.totals.crownShare >= 0.3) priority += 4;
+        if (world.totals.crownShare >= 0.4) priority += 4;
+        if (crownSamLevels < 2) priority += 6; // early, soft-crown bonus
         return {
           valid: true,
-          priority: 84,
-          note: `crown=${crown.name} share=${(world.totals.crownShare * 100).toFixed(0)}%`,
+          priority,
+          note:
+            `crown=${crown.name} share=${(world.totals.crownShare * 100).toFixed(0)}% ` +
+            `crownSAMs=${crownSamLevels}`,
         };
       },
       onAct: async () => false,
