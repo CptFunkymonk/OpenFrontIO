@@ -7253,15 +7253,26 @@
     const borderTiles = runtime.state.borderCache.tiles;
     if (borderTiles.length === 0) return false;
 
-    // Build a bias: tiles adjacent to our top adjacent **Human** enemy get
-    // tried first. We explicitly skip Nations/Bots — DefensePosts are for
-    // deterring real players, not tribes/AI that won't sustainably pressure
-    // our border anyway.
+    // Build a bias: tiles adjacent to our top DP-justifying enemy get
+    // tried first. Plan §2.5 extended DP unlock to strong Nations
+    // (troops > 1.25× ours) so mirror that logic here — otherwise we'd
+    // build DPs against Humans and leave an Impossible Nation border
+    // bare just because it wasn't Human.
+    const myTroops = safeCall(() => me.troops(), 1) || 1;
     const adjacent = runtime.world.threats.adjacentEnemies.find(
-      (e) => e && e.type === PlayerType.Human,
+      (e) => {
+        if (!e || e.isFriendly) return false;
+        if (e.type === PlayerType.Human) return true;
+        if (e.type === PlayerType.Nation && (e.troops || 0) > myTroops * 1.25) {
+          return true;
+        }
+        return false;
+      },
     );
     if (!adjacent) {
-      decisionLog("consolidate-front: skip DefensePost (no human on border)");
+      decisionLog(
+        "consolidate-front: skip DefensePost (no DP-justifying border)",
+      );
       return false;
     }
     // 1-deep interior candidates — step one neighbor inward from a border
