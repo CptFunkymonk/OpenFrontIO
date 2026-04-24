@@ -5853,6 +5853,20 @@
 
     plans.sort((a, b) => b.score - a.score);
     for (const plan of plans) {
+      // Plan §2.3: boat payload must clear the 1.0x speed-saturation
+      // point against the destination defender. Below that we pay a
+      // boat-transit cost to deliver a force that conquers slowly and
+      // takes elevated loss.
+      const enemyTroops = safeCall(() => plan.enemy.troops(), 0) || 0;
+      if (enemyTroops > 0 && plan.troops < enemyTroops) {
+        decisionLog(
+          "naval skip " +
+            safeCall(() => plan.enemy.displayName(), "enemy") +
+            ": payload " + plan.troops +
+            " below 1.0x defender (" + enemyTroops + ")",
+        );
+        continue;
+      }
       const success = sendBoat(plan.candidate, plan.troops, {
         targetSmallID: safeCall(() => plan.enemy.smallID(), null),
       });
