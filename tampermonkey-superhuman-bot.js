@@ -6556,7 +6556,12 @@
         ? calculateAttackTroops(
             myLiving,
             target.player,
-            computeReserveRatio(myLiving, maxTroops),
+            cappedReserveRatio(
+              myLiving,
+              maxTroops,
+              computeReserveRatio(myLiving, maxTroops),
+              0.08,
+            ),
             maxTroops,
           )
         : 0;
