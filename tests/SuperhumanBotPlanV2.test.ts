@@ -1048,6 +1048,35 @@ describe("Plan §5 — spawn scorer synthetic scenarios", () => {
   });
 });
 
+describe("Plan §2.3 — cappedReserveRatio helper", () => {
+  it("returns min(0.5 * currentRatio floor, desired)", () => {
+    const runtime = loadUserscript();
+    const { cappedReserveRatio } = runtime.test.internals;
+
+    // 20k / 100k = 0.2 ratio → cap = max(0.08, 0.1) = 0.10.
+    // desired = 0.45 → result = min(0.10, 0.45) = 0.10.
+    const small = cappedReserveRatio({ troops: () => 20_000 }, 100_000, 0.45, 0.08);
+    expect(small).toBe(0.1);
+
+    // 80k / 100k = 0.8 ratio → cap = 0.40. desired = 0.22 → 0.22.
+    const large = cappedReserveRatio({ troops: () => 80_000 }, 100_000, 0.22, 0.08);
+    expect(large).toBe(0.22);
+
+    // Floor takes effect when currentRatio * 0.5 < floor.
+    // 2k / 100k = 0.02 ratio → raw cap = 0.01, clamped by floor 0.08.
+    // desired = 0.05 → raw 0.05, clamped by floor 0.08.
+    // Result = min(0.08, 0.08) = 0.08.
+    const tiny = cappedReserveRatio({ troops: () => 2_000 }, 100_000, 0.05, 0.08);
+    expect(tiny).toBe(0.08);
+
+    // Lower floor for invasion defense (0.05).
+    // 2k / 100k = 0.02 ratio → raw cap 0.01, clamped by 0.05 → 0.05.
+    // desired 0.05 → 0.05.
+    const invasion = cappedReserveRatio({ troops: () => 2_000 }, 100_000, 0.05, 0.05);
+    expect(invasion).toBe(0.05);
+  });
+});
+
 describe("Plan §2.3 — early-game expansion acceptance", () => {
   it("calculateAttackTroops returns available for TN even at 20% troop ratio", async () => {
     // Previously early-game the baseline reserveRatio (0.55 at ratio<0.2)

@@ -4373,6 +4373,26 @@
     return clamp(reserve, 0.12, 0.72);
   }
 
+  /**
+   * Plan §2.3 reserve cap helper. `computeReserveRatio` returns up to
+   * 0.72 when we're below 20%% of the pop cap — but if our current
+   * troops are less than that fraction of the cap, applying it
+   * literally produces a negative `available` inside
+   * `calculateAttackTroops` and silently starves every offensive path.
+   *
+   * Takes the tighter of (desired legacy ratio, cap based on
+   * current-ratio * 0.5). The `floor` argument is the minimum the
+   * calling site is willing to accept (e.g. 0.05 for REPEL_INVASION,
+   * 0.08 elsewhere).
+   */
+  function cappedReserveRatio(player, maxTroops, desiredReserve, floor) {
+    const fallbackFloor = typeof floor === "number" ? floor : 0.08;
+    const currentRatio = maxTroops > 0 ? player.troops() / maxTroops : 0;
+    const cap = Math.max(fallbackFloor, currentRatio * 0.5);
+    const desired = Math.max(fallbackFloor, desiredReserve);
+    return Math.min(cap, desired);
+  }
+
   function getAdjacentEnemyInfo(borderTiles, me) {
     const gameView = getGameView();
     if (!gameView || !me) return [];
@@ -5168,18 +5188,11 @@
     // Up to a 10-point reduction when we own <5% of the map. Tapers off
     // linearly so established players don't over-spend on expansion.
     const aggressionBonus = clamp(0.1 * (0.2 - mapShare) / 0.2, 0, 0.1);
-    // Plan §2.3/§2.4: never reserve more troops than we actually have.
-    // Early-game `computeReserveRatio` returns 0.55 (> current 0.2),
-    // which would generate a negative `available` in
-    // calculateAttackTroops and silently block TN expansion exactly
-    // when it matters most. Cap the reserve at half of our current
-    // troop ratio so there's always a visible TN budget when we're
-    // small. The floor is still 0.08.
-    const currentRatio = maxTroops > 0 ? me.troops() / maxTroops : 0;
-    const maxReserveCap = Math.max(0.08, currentRatio * 0.5);
-    const reserveRatio = Math.min(
-      maxReserveCap,
-      Math.max(0.08, baseReserve - 0.08 - aggressionBonus),
+    const reserveRatio = cappedReserveRatio(
+      me,
+      maxTroops,
+      baseReserve - 0.08 - aggressionBonus,
+      0.08,
     );
     const troops = calculateAttackTroops(me, null, reserveRatio, maxTroops);
     if (troops <= 0) {
@@ -5221,14 +5234,11 @@
     const counterTarget = chooseCounterTarget(me.incomingAttacks());
     const maxTroops = gameView.config().maxTroops(me);
     const reserveRatio = computeReserveRatio(me, maxTroops);
-    // Plan §2.3 reserve cap for the counter-target retaliation path:
-    // early-game players whose baseReserve is 0.55 would otherwise
-    // refuse to counter-attack. Cap at 0.5 × currentRatio so the
-    // counter-target fires even when we're small.
-    const currentRatioCombat = maxTroops > 0 ? me.troops() / maxTroops : 0;
-    const counterReserve = Math.min(
-      Math.max(0.08, currentRatioCombat * 0.5),
-      Math.max(0.08, reserveRatio - 0.08),
+    const counterReserve = cappedReserveRatio(
+      me,
+      maxTroops,
+      reserveRatio - 0.08,
+      0.08,
     );
 
     if (counterTarget && counterTarget.isPlayer && counterTarget.isPlayer()) {
@@ -6794,15 +6804,11 @@
     if (!attackerEntry) return false;
 
     const maxTroops = gameView.config().maxTroops(me);
-    // Plan §2.3: retaliation should commit everything above a minimal
-    // floor. Cap reserveRatio by half our current troop ratio so an
-    // early-game player whose baseReserve is 0.55 doesn't silently
-    // fail to counter-attack. At 20k/100k we'd demand 0.1*max = 10k
-    // reserve \u2192 available = 10k \u2192 viable retaliatory push.
-    const currentRatioRet = maxTroops > 0 ? me.troops() / maxTroops : 0;
-    const reserveRatio = Math.min(
-      Math.max(0.08, currentRatioRet * 0.5),
-      Math.max(0.1, computeReserveRatio(me, maxTroops) - 0.1),
+    const reserveRatio = cappedReserveRatio(
+      me,
+      maxTroops,
+      computeReserveRatio(me, maxTroops) - 0.1,
+      0.1,
     );
     const troops = calculateAttackTroops(me, attacker, reserveRatio, maxTroops, {
       retaliating: true,
@@ -7038,13 +7044,11 @@
       // almost everything on the counter than let the incoming attack
       // stack our border. The AttackExecution combines vs-subtracts logic
       // means every troop we commit back directly eats their attack.
-      // Plan §2.3 reserve cap: never demand more reserve than half
-      // our current troop ratio so early-game invaders don't get a
-      // free pass because our baseReserve > current army size.
-      const currentRatioRepel = maxTroops > 0 ? me.troops() / maxTroops : 0;
-      const reserveRatio = Math.min(
-        Math.max(0.05, currentRatioRepel * 0.5),
-        Math.max(0.05, computeReserveRatio(me, maxTroops) - 0.22),
+      const reserveRatio = cappedReserveRatio(
+        me,
+        maxTroops,
+        computeReserveRatio(me, maxTroops) - 0.22,
+        0.05,
       );
       // Prefer the troops-per-hit size the server will actually deal;
       // calculateAttackTroops already clamps to deployable budget.
@@ -13980,6 +13984,8 @@
         // Plan §2.4 acceptance helpers.
         maybeExpand,
         maybeCombat,
+        cappedReserveRatio,
+        computeReserveRatio,
         sendRawMessage,
         installLocalTransportBridge,
         handleServerMessage,
