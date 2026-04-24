@@ -10948,13 +10948,23 @@
       case "MIRV_LAST_RESORT":
         handled = await runGoal_MirvLastResort(me);
         if (!handled) handled = await maybeNuke(me);
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "NUKE_CROWN":
         handled = await maybeNuke(me);
+        // If we couldn't launch (cooldown, no silos, no affordable
+        // target), still do economy/diplomacy/expand so the tick is
+        // never wasted waiting on cooldown.
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeDiplomacy(me);
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "SAM_OVERWHELM":
         handled = await runGoal_SamOverwhelm(me);
         if (!handled) handled = await maybeNuke(me);
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "REPEL_INVASION":
         handled = await runGoal_RepelInvasion(me, borderTiles, selectionContext);
