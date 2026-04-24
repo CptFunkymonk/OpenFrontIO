@@ -5266,6 +5266,12 @@
         if (archetype !== "ISLAND" && cities < cityTarget) return false;
         return count < Math.max(1, Math.floor(cities * factoryCoef));
       case UnitType.Port:
+        // Plan §2.9: aggressively build the first ports. Trade-ship gold
+        // compounds via `proximityBonusPortsNb(totalPorts) = clamp(totalPorts/3, 4, totalPorts)`
+        // — the marginal gold per port actually rises with how many we
+        // already own, so our first 3 ports easily out-earn a third city
+        // of equivalent cost. Force-unlock up to 3 ports when coastal.
+        if (hasCoast && count < 3) return true;
         return hasCoast && count < Math.max(1, Math.floor(cities * portCoef));
       case UnitType.DefensePost:
         return (
@@ -7737,6 +7743,78 @@
     }
 
     // 6. Nothing to do at the strategic level.
+    return false;
+  }
+
+  /**
+   * Plan §2.10 — Team-mode donation helper.
+   *
+   * In Team mode, propping up a struggling teammate is strictly positive:
+   * the team is scored as a unit, and a collapsing teammate is a free
+   * border for the enemy to roll. We donate a capped fraction of our
+   * surplus troops to the neediest teammate when they're in combat and
+   * well below their population cap.
+   *
+   * Safety caps:
+   *   - Only donate when we are above 60% of our own maxTroops (otherwise
+   *     we bleed our own defenses).
+   *   - Max 30% of our standing army per donation.
+   *   - 10-tick cooldown between donations (~1s).
+   *
+   * Returns true iff a donation intent was dispatched.
+   */
+  function maybeDonateToStrugglingTeammate(me) {
+    const gameView = getGameView();
+    if (!gameView) return false;
+    if (!isTeamMode(gameView)) return false;
+
+    const tick = gameView.ticks();
+    const cooldownUntil = runtime.state.cooldowns.diplomacy;
+    if (tick - cooldownUntil < 10) return false;
+
+    const maxTroops = gameView.config().maxTroops(me);
+    if (me.troops() < maxTroops * 0.6) return false;
+
+    const teammates = safeCall(() => getAllies(), []).filter((ally) => {
+      if (!ally) return false;
+      if (!safeCall(() => me.isOnSameTeam(ally), false)) return false;
+      const inCombat =
+        safeCall(() => ally.incomingAttacks().length > 0, false) ||
+        safeCall(() => ally.outgoingAttacks().length > 0, false);
+      return inCombat;
+    });
+    if (teammates.length === 0) return false;
+
+    // Pick the teammate with the lowest troops/maxTroops ratio — the
+    // weakest fighter on the team who's still in combat.
+    let neediest = null;
+    let lowestRatio = Infinity;
+    for (const ally of teammates) {
+      const allyMax = gameView.config().maxTroops(ally);
+      const ratio = ally.troops() / Math.max(allyMax, 1);
+      if (ratio < lowestRatio) {
+        lowestRatio = ratio;
+        neediest = ally;
+      }
+    }
+    if (!neediest || lowestRatio > 0.5) return false;
+
+    // Donate 25% of standing army, capped at 30%.
+    const donation = Math.floor(me.troops() * 0.25);
+    if (donation <= 0) return false;
+
+    if (sendDonateTroops(neediest.id(), donation)) {
+      runtime.state.cooldowns.diplomacy = tick;
+      runtime.state.lastAction =
+        "donating " + fmtTroops(donation) + " to " + neediest.displayName();
+      runtime.state.strategy = "team-support";
+      reasonLog(
+        "TEAM_DONATE",
+        `Propping up teammate ${neediest.displayName()} (${(lowestRatio * 100).toFixed(0)}% pop).`,
+        `${fmtTroops(donation)} donated`,
+      );
+      return true;
+    }
     return false;
   }
 
@@ -10582,6 +10660,9 @@
     // before they can coalesce into a bloc against us. Cheap no-op
     // after the first successful send.
     safeCall(() => openingDiplomacyBlast(me), null);
+
+    // Plan §2.10: team-mode donation. No-op outside team games.
+    safeCall(() => maybeDonateToStrugglingTeammate(me), null);
 
     // Emoji communication: react to the world we just modelled. Runs
     // after world/threats/snapshot so every detector sees a consistent
