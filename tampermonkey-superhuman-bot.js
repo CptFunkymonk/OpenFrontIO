@@ -11029,6 +11029,10 @@
         handled = await runGoal_NeutralizeRisingStar(me);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
+        // If all offensive paths against the rising star failed this
+        // tick, still grab adjacent TerraNullius — widens our cap
+        // for the eventual push without diluting the goal.
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "TERRA_NULLIUS_RUSH":
         handled = await maybeExpand(me, borderTiles);
