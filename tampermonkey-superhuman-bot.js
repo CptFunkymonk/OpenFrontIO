@@ -358,6 +358,18 @@
       // Pending alliance-accept attempts, smallID -> tick when we fired the
       // back-request. Prevents spamming the same partner every tick.
       recentAllianceAccepts: new Map(),
+      // Plan §2.2: opening-blast state. Set once on first post-spawn
+      // tick; tracked smallIDs we've already fired at so retries (e.g.
+      // rate-limited stealth gate) are bounded. Scoped by match.
+      openingBlast: {
+        fired: false,
+        firedTick: -1,
+        sentToSmallIDs: new Set(),
+      },
+      // Plan §2.8: traitor-window planner lock. Set when we betray an
+      // ally; cleared when the planner's forced goal expires. The
+      // actual expiration is driven by planner.forcedGoalExpiresMs.
+      traitorLockActive: false,
       // Naval safety bookkeeping.
       //
       // sentBoats: per-boat records we've dispatched. Each record captures
@@ -7254,6 +7266,22 @@
       (t) => t >= windowStart,
     );
     runtime.state.cooldowns.allianceBreak = tick;
+
+    // Plan §2.8 — Traitor-window hardening.
+    //
+    // DefaultConfig: traitorDuration = 30s, traitorDefenseDebuff = 0.5,
+    // traitorSpeedDebuff = 0.8. While flagged as a traitor our defense
+    // halves and outgoing attacks are 20% slower. Proactive attacks
+    // during the window are strictly worse than turtling — we just dumped
+    // troops on the break-attack and any retaliation melts us 2× faster.
+    //
+    // Force DEFENSIVE_TURTLE for the full 30s window. This covers EVERY
+    // alliance-break callsite (betray goal, helpless-ally goal-aware
+    // diplomacy, legacy diplomacy fallback) because they all funnel
+    // through recordAllianceBreak.
+    runtime.planner.forcedGoalId = "DEFENSIVE_TURTLE";
+    runtime.planner.forcedGoalExpiresMs = Date.now() + 30_000;
+    runtime.state.traitorLockActive = true;
   }
 
   /**
@@ -7689,6 +7717,129 @@
     }
 
     // 6. Nothing to do at the strategic level.
+    return false;
+  }
+
+  /**
+   * Plan §2.2 — Opening diplomacy blast.
+   *
+   * Fire a single round of alliance requests at every nearby Human the
+   * moment we finish spawning. Good human players set up their first
+   * 2-3 alliances in the first 30 seconds of post-spawn; if we delay,
+   * the crown-side bloc forms against us.
+   *
+   * Details:
+   *   - Eligible recipients: Humans only (Bots don't accept, Nations
+   *     have their own alliance system that ignores inbound requests).
+   *   - Proximity gate: within 2× `minDistanceBetweenPlayers` (=60 tiles)
+   *     — close enough that the shared border is imminent.
+   *   - We respect the stealth gate inside `sendAllianceRequest`; if a
+   *     particular request is rate-limited we mark it as "attempted"
+   *     anyway so we do not spam retries.
+   *   - Fires exactly once per match, tracked via
+   *     `runtime.state.openingBlast.fired`.
+   *
+   * Returns true iff at least one alliance-request intent was dispatched.
+   */
+  function openingDiplomacyBlast(me) {
+    const blastState = runtime.state.openingBlast;
+    if (!blastState || blastState.fired) return false;
+
+    const gameView = getGameView();
+    if (!gameView) return false;
+
+    // Gate on post-spawn liveness: we need a spawned self-player plus
+    // some border tiles so proximity computations are meaningful.
+    if (!safeCall(() => me.hasSpawned(), false)) return false;
+
+    const tick = gameView.ticks();
+    const minDist = safeCall(
+      () => gameView.config().minDistanceBetweenPlayers(),
+      30,
+    );
+    const reach = minDist * 2;
+
+    const mySpawn = safeCall(() => me.spawnTile(), null);
+    const allPlayers = safeCall(() => gameView.playerViews(), []);
+
+    // Collect candidates: alive Humans, not us, not already allied.
+    const candidates = [];
+    for (const p of allPlayers) {
+      if (!p) continue;
+      if (!safeCall(() => p.isAlive(), false)) continue;
+      if (p === me || safeCall(() => p.smallID(), -1) === runtime.world.meSmallID) continue;
+      if (safeCall(() => p.type(), null) !== PlayerType.Human) continue;
+      if (safeCall(() => me.isFriendly(p), false)) continue;
+      if (safeCall(() => me.isAlliedWith(p), false)) continue;
+
+      // Distance gate: spawnTile if known, else a sampled owned tile.
+      let dist = Infinity;
+      const theirSpawn = safeCall(() => p.spawnTile(), null);
+      if (mySpawn !== null && theirSpawn !== null) {
+        dist = gameView.manhattanDist(mySpawn, theirSpawn);
+      } else {
+        // Post-spawn some players no longer have spawnTile exposed;
+        // fall back to a sampled tile so we still capture the big ones.
+        const sampled = sampleTilesForOwner(p.smallID(), 1, {
+          requireLand: true,
+          maxSamples: 60,
+        });
+        if (sampled.length > 0 && mySpawn !== null) {
+          dist = gameView.manhattanDist(mySpawn, sampled[0]);
+        }
+      }
+      if (!Number.isFinite(dist) || dist > reach) continue;
+      candidates.push({ player: p, dist });
+    }
+
+    if (candidates.length === 0) {
+      // Nothing to reach this tick. Retry next tick; we only flip the
+      // `fired` flag once at least one request goes out (or the tick
+      // budget elapses — see cap below).
+      // Cap total retry window so we don't block other intents forever.
+      if (blastState.firedTick < 0) blastState.firedTick = tick;
+      if (tick - blastState.firedTick > 50) {
+        blastState.fired = true; // give up, move on
+      }
+      return false;
+    }
+
+    // Order: closest first. Closest neighbours become immediate border
+    // partners — securing *them* first defuses the most probable first
+    // attack on us.
+    candidates.sort((a, b) => a.dist - b.dist);
+
+    let dispatched = 0;
+    // Cap to 4 requests per blast so we don't stand out to the anti-
+    // spam heuristics of tightly-gated servers.
+    for (const c of candidates.slice(0, 4)) {
+      const smallID = safeCall(() => c.player.smallID(), -1);
+      if (smallID < 0) continue;
+      if (blastState.sentToSmallIDs.has(smallID)) continue;
+      const sent = sendAllianceRequest(safeCall(() => c.player.id(), null));
+      if (sent) {
+        dispatched += 1;
+        blastState.sentToSmallIDs.add(smallID);
+      }
+    }
+
+    if (dispatched > 0) {
+      reasonLog(
+        "OPENING_DIPLOMACY",
+        "Firing opening-round alliance requests to nearby Humans.",
+        `${dispatched} request(s) within ${reach} tiles`,
+      );
+      blastState.fired = true;
+      blastState.firedTick = tick;
+      return true;
+    }
+
+    // Dispatch failed (stealth gate, or all were rate-limited). Retry
+    // next tick; keep the `fired` flag off so the caller re-invokes us.
+    if (blastState.firedTick < 0) blastState.firedTick = tick;
+    if (tick - blastState.firedTick > 50) {
+      blastState.fired = true; // give up; 5 seconds is enough
+    }
     return false;
   }
 
@@ -10385,6 +10536,12 @@
     maybePeriodicIntelLog();
     updateSnapshot(me, borderTiles);
 
+    // Plan §2.2: opening diplomacy blast. Fires once per match the
+    // moment we are alive + spawned, locking in neighbour alliances
+    // before they can coalesce into a bloc against us. Cheap no-op
+    // after the first successful send.
+    safeCall(() => openingDiplomacyBlast(me), null);
+
     // Emoji communication: react to the world we just modelled. Runs
     // after world/threats/snapshot so every detector sees a consistent
     // view, and BEFORE goal planning so the per-tick emoji reflects the
@@ -10619,6 +10776,13 @@
       runtime.state.spawn.randomSpawnIntentSent = false;
       runtime.state.spawn.thinkUntilMs = 0;
       runtime.state.profileCache.clear();
+      // Plan §2.2: clear opening-blast state on fresh match.
+      if (runtime.state.openingBlast) {
+        runtime.state.openingBlast.fired = false;
+        runtime.state.openingBlast.firedTick = -1;
+        runtime.state.openingBlast.sentToSmallIDs = new Set();
+      }
+      runtime.state.traitorLockActive = false;
       // Clear world model + planner on fresh game so velocities start clean.
       runtime.world.history.clear();
       runtime.world.tick = 0;
