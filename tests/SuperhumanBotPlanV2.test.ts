@@ -139,6 +139,41 @@ describe("calculateAttackTroops — engine saturation anchoring", () => {
     );
     expect(troops).toBe(0);
   });
+
+  it("auto-derives retaliating from me.incomingAttacks() when opts is omitted", () => {
+    // Plan §2.3: "return `available` only when retaliating
+    // (`incomingAttacks > 0`)". The calculator should honour this even
+    // when the caller doesn't pass an explicit retaliating flag.
+    const runtime = loadUserscript();
+    const { calculateAttackTroops } = runtime.test.internals;
+
+    const beingAttacked = {
+      troops: () => 30_000,
+      incomingAttacks: () => [{ troops: () => 5_000 }],
+    };
+    const peaceful = {
+      troops: () => 30_000,
+      incomingAttacks: () => [],
+    };
+
+    // Enemy 50_000 troops. Available = 30_000 (reserve 0).
+    // 30_000 >= 25_000 minViable but < 50_000 strong.
+    const attackedOut = calculateAttackTroops(
+      beingAttacked,
+      { troops: () => 50_000 },
+      0,
+      100_000,
+    );
+    expect(attackedOut).toBe(30_000);
+
+    const peacefulOut = calculateAttackTroops(
+      peaceful,
+      { troops: () => 50_000 },
+      0,
+      100_000,
+    );
+    expect(peacefulOut).toBe(0);
+  });
 });
 
 describe("shouldBuildType(Port) — coastal force-unlock", () => {

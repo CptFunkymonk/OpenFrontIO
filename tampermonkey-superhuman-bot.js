@@ -4617,12 +4617,29 @@
    * @param enemy null for TerraNullius, or a PlayerView
    * @param reserveRatio fraction of maxTroops to keep as reserve
    * @param maxTroops `config.maxTroops(me)`
-   * @param opts.retaliating true iff we have inbound troops and the
-   *   attack is a defensive push; weakens the min-viable gate because
-   *   staying put just means we die.
+   * @param opts.retaliating true iff the call site knows this is a
+   *   defensive push. When omitted, we auto-derive it from `me`'s
+   *   inbound-attack state — plan wording: "return `available` only
+   *   when retaliating (`incomingAttacks > 0`)." This lets ambient
+   *   `maybeCombat` calls pick up retaliation semantics without every
+   *   caller having to plumb the flag through.
    */
   function calculateAttackTroops(me, enemy, reserveRatio, maxTroops, opts) {
-    const retaliating = Boolean(opts && opts.retaliating);
+    let retaliating = opts && "retaliating" in opts
+      ? Boolean(opts.retaliating)
+      : false;
+    // Self-derive from me.incomingAttacks() when the caller didn't
+    // explicitly pass the flag. Guards every hop (some stubs don't
+    // implement the method) via safeCall.
+    if (!(opts && "retaliating" in opts)) {
+      const inbound = safeCall(
+        () => (typeof me.incomingAttacks === "function"
+          ? me.incomingAttacks().length
+          : 0),
+        0,
+      );
+      if (inbound > 0) retaliating = true;
+    }
     const available = Math.floor(me.troops() - maxTroops * reserveRatio);
     if (available <= 5000) return 0;
 
