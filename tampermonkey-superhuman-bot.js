@@ -5982,18 +5982,28 @@
         continue;
       }
 
-      // Troop sizing: aim to beat the defender by ~1.5× (standard attack
-      // math) but keep it bounded relative to the narrow-hop reserve.
+      // Plan §2.3: aim for the 1.667× loss-saturation point
+      // (clamp(defT/atkT, 0.6, 2) floor). 1.5× was in the penalty
+      // zone — we'd pay ~10% more loss per tile for slower conquest.
+      // Keep the hop bounded by 35% of standing army so we don't
+      // denude our border for a river raid.
       let troops;
       if (entry.type === PlayerType.Bot) {
         troops = calcTribeAttackTroops(entry.troops, available);
       } else {
         const defender = Math.max(entry.troops, 1);
-        troops = clamp(
-          Math.ceil(defender * 1.5),
-          2000,
-          Math.min(available, Math.floor(me.troops() * 0.35)),
-        );
+        const hopCap = Math.min(available, Math.floor(me.troops() * 0.35));
+        const ideal = Math.ceil(defender * 1.667);
+        // If the hop cap can't clear 1.667×, skip — river raids that
+        // arrive under-saturated waste troops we need at home.
+        if (ideal > hopCap) {
+          decisionLog(
+            "river-cross skip " + neighbour.name +
+              ": hopCap " + hopCap + " < ideal " + ideal,
+          );
+          continue;
+        }
+        troops = clamp(ideal, 2000, hopCap);
       }
       if (troops <= 0) continue;
 
