@@ -4240,20 +4240,52 @@
     // burst-sample every call. Budget is bounded so we do not starve
     // the main loop on slow clients.
     //
-    // 40× the spawn-phase tick count keeps us above the server's
-    // sample density while capping well below 10k so the per-call
-    // cost stays under ~50ms.
+    // 20× the spawn-phase tick count keeps us above the server's
+    // sample density while capping at 6000 so the per-call cost
+    // stays bounded. Plan §6 risks: if the measured wall-time per
+    // call exceeds 10 ms we self-cap at 3000 on subsequent calls to
+    // keep the spawn-phase tick loop responsive.
     const spawnPhaseTicks = safeCall(
       () => gameView.config().numSpawnPhaseTurns(),
       300,
     );
-    const SAMPLES = Math.min(6000, Math.max(1500, spawnPhaseTicks * 20));
+    const SAMPLE_CAP = Math.min(6000, Math.max(1500, spawnPhaseTicks * 20));
+    const spawnPerf = runtime.state.spawn.perf || {
+      lastCallMs: 0,
+      degraded: false,
+      measuredAt: -1,
+    };
+    runtime.state.spawn.perf = spawnPerf;
+    const SAMPLES = spawnPerf.degraded ? Math.min(3000, SAMPLE_CAP) : SAMPLE_CAP;
+
+    const hasPerfNow =
+      typeof performance !== "undefined" &&
+      typeof performance.now === "function";
+    const t0 = hasPerfNow ? performance.now() : 0;
 
     const candidates = [];
     for (let i = 0; i < SAMPLES; i++) {
       const sampled = trySampleSpawnCandidate(gameView);
       if (!sampled) continue;
       candidates.push(sampled);
+    }
+
+    if (hasPerfNow) {
+      const dt = performance.now() - t0;
+      spawnPerf.lastCallMs = dt;
+      spawnPerf.measuredAt = safeCall(() => gameView.ticks(), -1);
+      // Plan §6 self-cap: anything over 10 ms is too long to do once
+      // per spawn attempt and still leave headroom for the game loop.
+      if (dt > 10 && !spawnPerf.degraded) {
+        spawnPerf.degraded = true;
+        decisionLog(
+          "spawn sampler: " +
+            dt.toFixed(1) +
+            "ms for " +
+            SAMPLES +
+            " samples — degrading to 3000 cap",
+        );
+      }
     }
 
     if (candidates.length === 0) return null;
@@ -10987,6 +11019,13 @@
       runtime.state.spawn.finalIndex = 0;
       runtime.state.spawn.randomSpawnIntentSent = false;
       runtime.state.spawn.thinkUntilMs = 0;
+      // Plan §6: fresh measurement budget per match so one slow match
+      // doesn't permanently degrade the sampler cap.
+      runtime.state.spawn.perf = {
+        lastCallMs: 0,
+        degraded: false,
+        measuredAt: -1,
+      };
       runtime.state.profileCache.clear();
       // Plan §2.2: clear opening-blast state on fresh match.
       if (runtime.state.openingBlast) {
