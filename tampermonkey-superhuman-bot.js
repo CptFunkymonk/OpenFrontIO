@@ -5521,6 +5521,25 @@
     const candidateTiles = getOwnedCandidateTiles(me, 20);
     let order = buildOrderForArchetype(runtime.world.archetype);
 
+    // Plan §2.9 — port-chain precedence. When we have coast and fewer
+    // than 3 ports standing, put Port ahead of *every* other structure
+    // (including City) for this pass. Rationale: trade-ship gold
+    // compounds via proximityBonusPortsNb, and a port pays its own
+    // 125k cost back faster than a 3rd city does while directly
+    // unlocking naval expansion. Only re-ordered when hasCoast is
+    // meaningful; landlocked archetypes are unaffected.
+    const hasCoast = runtime.state.borderCache.tiles.some((tile) =>
+      safeCall(() => getGameView().isOceanShore(tile), false),
+    );
+    const portCount = getUnitLevelCount(me, UnitType.Port);
+    if (hasCoast && portCount < 3) {
+      const reordered = [UnitType.Port];
+      for (const t of order) {
+        if (t !== UnitType.Port) reordered.push(t);
+      }
+      order = reordered;
+    }
+
     // Plan §2.7 — silo pre-build pool. While saving for hydrogen bombs
     // or MIRVs, we MUST already have 3 silos standing when we pull the
     // trigger; otherwise the crown's SAMs intercept a lone warhead
