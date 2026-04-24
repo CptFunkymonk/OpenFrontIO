@@ -1061,4 +1061,66 @@ describe("Plan §8 — traitor-window lock acceptance", () => {
     expect(expiresInMs).toBeLessThanOrEqual(30_000 + (tAfter - tBefore));
     expect(runtime.state.traitorLockActive).toBe(true);
   });
+
+  it("selectPrimaryGoal keeps returning DEFENSIVE_TURTLE while the lock is active", () => {
+    const runtime = loadUserscript();
+    const { selectPrimaryGoal, UnitType } = runtime.test.internals;
+
+    // Build a world state where both NUKE_CROWN (priority 84) and
+    // TERRA_NULLIUS_RUSH would ordinarily be valid. The forced lock
+    // must override all of them.
+    const world = buildWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.5,
+        myShare: 0.2,
+        secondShare: 0.2,
+      },
+    });
+    world.me.gold = 5_000_000;
+    world.threats.crown = {
+      smallID: 2,
+      name: "Crown",
+      isFriendly: false,
+      tiles: 5000,
+      structureLevels: { [UnitType.SAMLauncher]: 0 },
+    };
+    world.threats.crownSmallID = 2;
+    runtime.world = world;
+
+    // Set up the forced lock the way recordAllianceBreak would have.
+    runtime.planner.forcedGoalId = "DEFENSIVE_TURTLE";
+    runtime.planner.forcedGoalExpiresMs = Date.now() + 29_000;
+    runtime.state.traitorLockActive = true;
+
+    stubGameViewForPlanner(
+      runtime,
+      new Map([[UnitType.MissileSilo, [
+        {
+          isActive: () => true,
+          isUnderConstruction: () => false,
+          level: () => 1,
+          missileReadinesss: () => 1,
+          id: () => 42,
+          tile: () => 0,
+        },
+      ]]]),
+    );
+
+    const selection = selectPrimaryGoal();
+    expect(selection).not.toBeNull();
+    expect(selection.spec.id).toBe("DEFENSIVE_TURTLE");
+    expect(selection.forced).toBe(true);
+
+    // Once the lock expires, the regular evaluator wins again.
+    runtime.planner.forcedGoalExpiresMs = Date.now() - 1;
+    const after = selectPrimaryGoal();
+    expect(after).not.toBeNull();
+    expect(after.spec.id).not.toBe("DEFENSIVE_TURTLE");
+  });
 });
