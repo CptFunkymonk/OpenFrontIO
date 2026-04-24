@@ -7374,9 +7374,24 @@
         );
         continue;
       }
-      const troops = clamp(Math.floor(available * 0.3), 8000, 30000);
+      const boatPayload = clamp(Math.floor(available * 0.3), 8000, 30000);
+      // Plan §2.3: boat troop payload should clear the 1.0x speed-
+      // saturation point vs the target. Soft targets by definition are
+      // weaker than us, so the 30%-of-available formula usually clears
+      // — but guard anyway so a misclassified "soft" target with
+      // comparable troops doesn't receive an under-saturated shipment.
+      const targetTroops = target.troops || 0;
+      if (targetTroops > 0 && boatPayload < targetTroops) {
+        decisionLog(
+          "land-grab boat skip " +
+            target.name +
+            ": payload " + boatPayload +
+            " below 1.0x defender (" + targetTroops + ")",
+        );
+        continue;
+      }
       if (
-        sendBoat(candidate, troops, { targetSmallID: target.smallID })
+        sendBoat(candidate, boatPayload, { targetSmallID: target.smallID })
       ) {
         runtime.state.cooldowns.naval = tick;
         reasonLog(
