@@ -3614,7 +3614,11 @@
     const flood = floodScoreFrom(center, 600);
     const frontier = countUnownedLandNear(center, 40);
     const elev = elevationAverage(gameView, center, 10);
-    const coast = coastNearby(gameView, center, 4) ? 1 : 0;
+    // Plan §2.1.7: shore access within 8 tiles (was 4). Early ports
+    // drive gold via proximityBonusPortsNb, and an 8-tile radius
+    // captures most coastal plateaus without rewarding tiles that
+    // are *surrounded* by water.
+    const coast = coastNearby(gameView, center, 8) ? 1 : 0;
     const choke = isChokepointLike(gameView, center, 20) ? 1 : 0;
     const enemyPenalty = enemyProximityPenalty(gameView, center);
 
@@ -3645,7 +3649,9 @@
       flood * 3 +
       frontier * 5 +
       elev * 0.8 +
-      coast * 120 +
+      // Plan §2.1.7: coast weight bumped 120 → 150. Ports pay back
+      // their 125k cost in 5-10 trade-ship cycles and then compound.
+      coast * 150 +
       choke * 40 +
       // Plan §2.1.3/4/5: peninsula shape, narrow-neck count, and
       // Gaussian enemy-cluster distance. These three terms together
@@ -7378,6 +7384,15 @@
    * adjacentEnemies list. Disconnected actors are filtered out so we
    * don't turtle against a stalled AFK giant.
    */
+  // Plan §2.4: "focused" stall threshold. An adjacent hostile that is
+  // not currently attacking someone else is free to throw their whole
+  // army at us; we want to trigger the stall *earlier* in that case.
+  // Still anchored to engine math — at 2.0× the defender-bonus term
+  // within(defT/atkT, 0.6, 2) is 2.0 (saturated) already; dropping
+  // below 2.0 is where the multiplier first falls off. So 2.0× is the
+  // conservative edge for 'can they break me if they commit'.
+  const INVASION_STALL_FOCUSED_RATIO = 2.0;
+
   function computeOverwhelmingNeighbor(myEntry, adjacentEnemies) {
     if (!myEntry) return null;
     const myTroops = Number(myEntry.troops) || 0;
@@ -7386,7 +7401,8 @@
       return null;
     }
     let worst = null;
-    let worstRatio = INVASION_STALL_TROOP_RATIO;
+    let worstRatio = 0;
+    let worstThreshold = INVASION_STALL_TROOP_RATIO;
     for (const entry of adjacentEnemies) {
       if (!entry) continue;
       if (entry.isFriendly) continue;
@@ -7394,9 +7410,26 @@
       if (entry.type === PlayerType.Bot) continue;
       const theirTroops = Number(entry.troops) || 0;
       const ratio = theirTroops / myTroops;
-      if (ratio > worstRatio) {
+      // Plan §2.4: if THIS enemy is already committing troops to an
+      // outgoing attack against someone else, they can't fully focus
+      // on us right now, so keep the default 2.5× threshold. If they
+      // have no outgoing commitments, lower the threshold to 2.0×.
+      const outgoingTroops =
+        Number(entry.outgoingTroops) ||
+        (Array.isArray(entry.outgoingAttacks)
+          ? entry.outgoingAttacks.reduce(
+              (sum, a) => sum + (Number(safeCall(() => a.troops(), 0)) || 0),
+              0,
+            )
+          : 0);
+      const focused = outgoingTroops <= 0;
+      const threshold = focused
+        ? INVASION_STALL_FOCUSED_RATIO
+        : INVASION_STALL_TROOP_RATIO;
+      if (ratio > threshold && ratio > worstRatio) {
         worst = entry;
         worstRatio = ratio;
+        worstThreshold = threshold;
       }
     }
     if (!worst) return null;
@@ -7404,6 +7437,7 @@
     return {
       enemy: worst,
       ratio: worstRatio,
+      threshold: worstThreshold,
       // idealMinTroops: the troop floor we want to sit at so the defender
       // bonus stays saturated against this neighbour. Derived above —
       // defender >= 0.4 × attacker keeps within(..., 0.6, 2) pinned at 2.
@@ -7968,6 +8002,13 @@
         "OPENING_DIPLOMACY",
         "Firing opening-round alliance requests to nearby Humans.",
         `${dispatched} request(s) within ${reach} tiles`,
+      );
+      // Plan §2.2: broadcast 🤝 so we look like a chatty human making
+      // their opening move. Cheap, bypasses the stealth gate, and
+      // sits inside the per-emoji cooldown rules.
+      safeCall(
+        () => emitEmoji(25, ALL_PLAYERS_RECIPIENT, "opening diplomacy"),
+        null,
       );
       blastState.fired = true;
       blastState.firedTick = tick;
@@ -13589,6 +13630,7 @@
         computeOverwhelmingNeighbor,
         shouldStallForInvasionDefense,
         INVASION_STALL_TROOP_RATIO,
+        INVASION_STALL_FOCUSED_RATIO,
         NARROW_WATER_HOP_LIMIT,
         LOST_BOAT_BASE_COOLDOWN_TICKS,
         LOST_BOAT_MAX_COOLDOWN_TICKS,

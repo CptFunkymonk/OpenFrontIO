@@ -1464,52 +1464,102 @@ describe("tampermonkey-superhuman-bot invasion-defense stall", () => {
     return runtime.world;
   }
 
-  it("2.5x threshold matches the saturated-defender derivation", () => {
+  it("2.5x threshold matches the saturated-defender derivation when enemy is committed elsewhere", () => {
     const runtime = loadUserscript();
-    const { computeOverwhelmingNeighbor, INVASION_STALL_TROOP_RATIO, PlayerType } =
-      runtime.test.internals;
+    const {
+      computeOverwhelmingNeighbor,
+      INVASION_STALL_TROOP_RATIO,
+      INVASION_STALL_FOCUSED_RATIO,
+      PlayerType,
+    } = runtime.test.internals;
     expect(INVASION_STALL_TROOP_RATIO).toBe(2.5);
+    // Plan §2.4: 2.0× focused threshold fires when the enemy has no
+    // outgoing attacks (they can drop everything on us).
+    expect(INVASION_STALL_FOCUSED_RATIO).toBe(2.0);
 
     const me = { troops: 10_000 };
 
-    // 2.49× — just under the threshold → no stall.
-    const under = computeOverwhelmingNeighbor(me, [
+    // Committed enemy (outgoingTroops > 0): uses the 2.5× threshold.
+    // 2.49× → no stall.
+    const committedUnder = computeOverwhelmingNeighbor(me, [
       {
         smallID: 7,
         name: "Peer",
         type: PlayerType.Human,
         isFriendly: false,
         troops: 24_900,
+        outgoingTroops: 5_000,
       },
     ]);
-    expect(under).toBeNull();
+    expect(committedUnder).toBeNull();
 
-    // 2.5× exactly — boundary → no stall (strict >).
-    const boundary = computeOverwhelmingNeighbor(me, [
+    // Committed enemy at exactly 2.5× → no stall (strict >).
+    const committedBoundary = computeOverwhelmingNeighbor(me, [
       {
         smallID: 7,
         name: "Peer",
         type: PlayerType.Human,
         isFriendly: false,
         troops: 25_000,
+        outgoingTroops: 5_000,
       },
     ]);
-    expect(boundary).toBeNull();
+    expect(committedBoundary).toBeNull();
 
-    // 2.51× — now overwhelming.
-    const over = computeOverwhelmingNeighbor(me, [
+    // Committed enemy at 2.51× → overwhelming with the 2.5× threshold.
+    const committedOver = computeOverwhelmingNeighbor(me, [
       {
         smallID: 7,
         name: "Giant",
         type: PlayerType.Human,
         isFriendly: false,
         troops: 25_100,
+        outgoingTroops: 5_000,
       },
     ]);
-    expect(over).not.toBeNull();
-    expect(over.ratio).toBeCloseTo(2.51, 2);
-    // Ideal min troops = 0.4 × attacker.troops (defender saturation point).
-    expect(over.idealMinTroops).toBe(Math.ceil(25_100 * 0.4));
+    expect(committedOver).not.toBeNull();
+    expect(committedOver.ratio).toBeCloseTo(2.51, 2);
+    expect(committedOver.threshold).toBe(INVASION_STALL_TROOP_RATIO);
+    expect(committedOver.idealMinTroops).toBe(Math.ceil(25_100 * 0.4));
+  });
+
+  it("2.0x focused threshold fires when the enemy has no outgoing attacks", () => {
+    const runtime = loadUserscript();
+    const {
+      computeOverwhelmingNeighbor,
+      INVASION_STALL_FOCUSED_RATIO,
+      PlayerType,
+    } = runtime.test.internals;
+    const me = { troops: 10_000 };
+
+    // Focused enemy at 2.49× — fires at the focused threshold because
+    // they have no outgoing commitments.
+    const focusedOver = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 7,
+        name: "Focused",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 24_900,
+        outgoingTroops: 0,
+      },
+    ]);
+    expect(focusedOver).not.toBeNull();
+    expect(focusedOver.threshold).toBe(INVASION_STALL_FOCUSED_RATIO);
+    expect(focusedOver.ratio).toBeCloseTo(2.49, 2);
+
+    // Focused enemy at 1.99× — just below the focused threshold, no stall.
+    const focusedUnder = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 7,
+        name: "Focused",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 19_900,
+        outgoingTroops: 0,
+      },
+    ]);
+    expect(focusedUnder).toBeNull();
   });
 
   it("computeOverwhelmingNeighbor picks the worst ratio across multiple enemies", () => {
