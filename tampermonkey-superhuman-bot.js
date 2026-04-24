@@ -5405,12 +5405,27 @@
           cities >= dpCityGate &&
           count < Math.max(1, Math.floor(cities * dpCoef))
         );
-      case UnitType.MissileSilo:
-        return (
-          nukesEnabled &&
-          cities >= 2 &&
-          count < Math.min(siloCap, Math.max(1, Math.floor(cities * siloCoef)))
+      case UnitType.MissileSilo: {
+        if (!nukesEnabled) return false;
+        if (cities < 2) return false;
+        // Plan §2.7: pre-build a silo pool of 3 before we ever bank
+        // for a hydrogen or MIRV. Without the pool standing the nuke
+        // trigger pulls on a single warhead that SAMs swat. Once a
+        // hostile crown exists (crownShare >= THREAT_CROWN_THRESHOLD
+        // by the world model's own gate) we force-target 3 silos,
+        // subject to siloCap. Earlier, the archetype cadence can
+        // still grow the target past the floor via siloCoef.
+        const hostileCrownVisible = Boolean(
+          runtime.world &&
+            runtime.world.threats &&
+            runtime.world.threats.crown &&
+            !runtime.world.threats.crown.isFriendly,
         );
+        const cadenceTarget = Math.max(1, Math.floor(cities * siloCoef));
+        const floor = hostileCrownVisible ? 3 : 0;
+        const target = Math.min(siloCap, Math.max(cadenceTarget, floor));
+        return count < target;
+      }
       case UnitType.SAMLauncher:
         return cities >= 2 && count < Math.max(1, samTarget);
       default:

@@ -278,6 +278,67 @@ describe("shouldBuildType(Port) — coastal force-unlock", () => {
     expect(isTileNearHumanBorder(me, 1)).toBe(false);
   });
 
+  it("forces MissileSilo floor of 3 when a hostile crown is visible (Plan §2.7)", () => {
+    const runtime = loadUserscript();
+    const { shouldBuildType, UnitType } = runtime.test.internals;
+    stubGameView(runtime);
+
+    function primeWorld(withHostileCrown: boolean) {
+      runtime.world = {
+        ...runtime.world,
+        archetype: "CONTINENTAL",
+        totals: {
+          ...(runtime.world?.totals ?? {}),
+          myShare: 0.1,
+        },
+        threats: {
+          ...(runtime.world?.threats ?? {}),
+          adjacentEnemies: [],
+          crown: withHostileCrown
+            ? { name: "Crown", isFriendly: false }
+            : null,
+        },
+      };
+    }
+
+    const player = (siloCount: number) => ({
+      numTilesOwned: () => 8_000,
+      totalUnitLevels: (t: any) =>
+        t === UnitType.City
+          ? 5
+          : t === UnitType.MissileSilo
+            ? siloCount
+            : 0,
+      units: () => [],
+    });
+
+    // No hostile crown: cadence target = floor(5 * 0.22) = 1.
+    // So with 1 silo already we stop.
+    primeWorld(false);
+    expect(shouldBuildType(UnitType.MissileSilo, player(0), [])).toBe(true);
+    expect(shouldBuildType(UnitType.MissileSilo, player(1), [])).toBe(false);
+
+    // Hostile crown: forced floor of 3 kicks in.
+    primeWorld(true);
+    expect(shouldBuildType(UnitType.MissileSilo, player(1), [])).toBe(true);
+    expect(shouldBuildType(UnitType.MissileSilo, player(2), [])).toBe(true);
+    expect(shouldBuildType(UnitType.MissileSilo, player(3), [])).toBe(false);
+
+    // Even with many cities the siloCap (3 default) still holds.
+    const manyCities = (siloCount: number) => ({
+      numTilesOwned: () => 40_000,
+      totalUnitLevels: (t: any) =>
+        t === UnitType.City
+          ? 20
+          : t === UnitType.MissileSilo
+            ? siloCount
+            : 0,
+      units: () => [],
+    });
+    primeWorld(true);
+    expect(shouldBuildType(UnitType.MissileSilo, manyCities(3), [])).toBe(false);
+  });
+
   it("forces SAMLauncher floor of 2 once myShare >= 0.20 (Plan §2.5)", () => {
     const runtime = loadUserscript();
     const { shouldBuildType, UnitType } = runtime.test.internals;
