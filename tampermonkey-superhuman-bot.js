@@ -4477,27 +4477,73 @@
     return score;
   }
 
-  function calculateAttackTroops(me, enemy, reserveRatio, maxTroops) {
+  /**
+   * Decide how many troops to commit to an attack, anchored to the
+   * engine's exact saturation points (Plan §2.3, derived from
+   * DefaultConfig.attackLogic).
+   *
+   *   - For a PvP target:
+   *     - `clamp(defT/atkT, 0.6, 2)` saturates at atkT ≥ 1.667*defT →
+   *       this is the *minimum* loss-multiplier (0.6) — the "ideal" spot.
+   *     - `clamp(defT/(5*atkT), 0.2, 1.5)` saturates at atkT ≥ defT →
+   *       this is the maximum conquest-speed spot.
+   *     - Below ~0.5*defT the loss-multiplier caps at 2.0 and we just
+   *       melt without making ground, so we don't fire unprovoked.
+   *   - For a TerraNullius target the loss is a flat `mag/5` per tile
+   *     (independent of troop count) and the tiles-per-tick cost *drops*
+   *     with more troops, so there is never any reason to hold back.
+   *
+   * Returns an integer number of troops to send, or 0 if no attack is
+   * worth launching. The legacy `available <= 5000` gate is preserved
+   * as a hard floor — below that the engine's intent will merge into
+   * an existing attack anyway.
+   *
+   * @param me the PlayerView for the attacker
+   * @param enemy null for TerraNullius, or a PlayerView
+   * @param reserveRatio fraction of maxTroops to keep as reserve
+   * @param maxTroops `config.maxTroops(me)`
+   * @param opts.retaliating true iff we have inbound troops and the
+   *   attack is a defensive push; weakens the min-viable gate because
+   *   staying put just means we die.
+   */
+  function calculateAttackTroops(me, enemy, reserveRatio, maxTroops, opts) {
+    const retaliating = Boolean(opts && opts.retaliating);
     const available = Math.floor(me.troops() - maxTroops * reserveRatio);
     if (available <= 5000) return 0;
 
     const enemyTroops = enemy ? enemy.troops() : 0;
+
+    // --- TerraNullius: flat loss per tile, speed scales linearly with
+    // troops. Commit everything above the reserve. Never zero here.
     if (enemyTroops <= 0) {
-      return Math.max(6000, Math.floor(available * 0.38));
-    }
-
-    const ideal = Math.ceil(enemyTroops * 1.75);
-    const viable = Math.ceil(enemyTroops * 0.95);
-    const pressure = Math.ceil(enemyTroops * 0.6);
-
-    if (available >= ideal) {
-      return Math.min(available, Math.max(ideal, Math.floor(available * 0.78)));
-    }
-    if (available >= viable) {
       return available;
     }
-    if (available >= pressure) {
-      return Math.max(pressure, Math.floor(available * 0.92));
+
+    // Engine saturation points, not hand-tuned fudge ratios.
+    const idealRatio = 1.667; // loss multiplier bottoms at 0.6
+    const strongRatio = 1.0;  // tiles-per-tick cost bottoms at 0.2
+    const minViableRatio = 0.5; // below this, loss mult caps at 2.0
+
+    const ideal = Math.ceil(enemyTroops * idealRatio);
+    const strong = Math.ceil(enemyTroops * strongRatio);
+    const minViable = Math.ceil(enemyTroops * minViableRatio);
+
+    if (available >= ideal) {
+      // Send 85% of available (keeps a small buffer for follow-ups),
+      // but at least `ideal` so we stay past the saturation point.
+      return Math.max(ideal, Math.floor(available * 0.85));
+    }
+    if (available >= strong) {
+      // Past the speed-saturation point but below the loss-saturation
+      // point — still a good fight, commit everything above reserve.
+      return available;
+    }
+    if (available >= minViable) {
+      // Only attack if we're already being invaded; otherwise we pay
+      // up-to-2x loss multiplier for slow progress. Retaliation wins
+      // more ground than a fortify here because the defender's troops
+      // are already outside their territory, reducing defTroops/defTiles.
+      return retaliating ? available : 0;
     }
     return 0;
   }
@@ -4942,20 +4988,24 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.expand < 5) return false;
 
-    // Stall offense when a bordering neighbour can trivially roll us —
-    // we'd rather claim no new tiles than bleed troops on expansion while
-    // sitting below the defender-bonus saturation point. See
-    // INVASION_STALL_TROOP_RATIO for the derivation.
+    // Plan §2.4: do NOT stall terra-nullius expansion on the basis of an
+    // overwhelming neighbour. Attacking TerraNullius costs a flat
+    // `mag/5` per tile regardless of troop count, so grabbing empty
+    // land cannot "waste" troops the way a losing PvP push does.
+    // Previously this gate silently blocked expansion whenever an
+    // adjacent hostile was ≥ 2.5× our troops, letting them snowball
+    // while we hoarded on the border. We now let expansion run
+    // unconditionally and rely on reserveRatio to keep a defensive
+    // pool in reserve.
     if (shouldStallForInvasionDefense()) {
       const overwhelming = runtime.world.threats.overwhelmingNeighbor;
       decisionLog(
-        "expand: stalling — " +
-          (overwhelming.enemy.name || "neighbour") +
-          " has " +
+        "expand: overwhelming neighbour " +
+          (overwhelming.enemy.name || "?") +
+          " at " +
           overwhelming.ratio.toFixed(2) +
-          "x our troops",
+          "x — proceeding anyway (TN flat-loss)",
       );
-      return false;
     }
 
     const segments = getAdjacentExpansionSegments(borderTiles, me);
@@ -5028,6 +5078,7 @@
         counterTarget,
         reserveRatio - 0.08,
         maxTroops,
+        { retaliating: true },
       );
       if (troops > 0) {
         const success = sendAttack(counterTarget.id(), troops);
@@ -6432,7 +6483,9 @@
 
     const maxTroops = gameView.config().maxTroops(me);
     const reserveRatio = Math.max(0.1, computeReserveRatio(me, maxTroops) - 0.1);
-    const troops = calculateAttackTroops(me, attacker, reserveRatio, maxTroops);
+    const troops = calculateAttackTroops(me, attacker, reserveRatio, maxTroops, {
+      retaliating: true,
+    });
     if (troops <= 0) return false;
 
     // Adjacent -> land attack. Otherwise try a boat.
@@ -6658,6 +6711,7 @@
         invader.player,
         reserveRatio,
         maxTroops,
+        { retaliating: true },
       );
       if (troops > 0 && invader.isAdjacent) {
         if (sendAttack(invader.id, troops)) {
