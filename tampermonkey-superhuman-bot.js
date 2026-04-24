@@ -11023,6 +11023,8 @@
         handled = await runGoal_FarmTribe(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
+        // If we can't swing at the tribe this tick, still take TN.
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "EASY_NATION_GRAB":
         handled = await maybeCombat(me, borderTiles);
@@ -11056,9 +11058,13 @@
       case "DIPLOMACY_ISOLATE_CROWN":
         handled = await runGoal_Diplomacy(me);
         if (!handled) handled = await maybeDiplomacy(me);
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "WARSHIP_DEFENSE":
         handled = await runGoal_WarshipDefense(me);
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "SAVE_FOR_HYDRO":
         // Economy layer is gated via economyBanned(); still allow defensive
