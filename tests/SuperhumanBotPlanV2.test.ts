@@ -1048,6 +1048,271 @@ describe("Plan §5 — spawn scorer synthetic scenarios", () => {
   });
 });
 
+describe("Plan §2.4 — invasion stall acceptance", () => {
+  it("maybeExpand still dispatches a TN attack when shouldStallForInvasionDefense() is true", async () => {
+    const runtime = loadUserscript();
+    const { maybeExpand, shouldStallForInvasionDefense } =
+      runtime.test.internals;
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = true;
+    const sentIntents: any[] = [];
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = {
+      send: (object: any) => {
+        if (object && object.intent) sentIntents.push(object.intent);
+      },
+    };
+
+    // Prime overwhelming-neighbor so the stall flag is true.
+    runtime.world = {
+      ...runtime.world,
+      archetype: "CONTINENTAL",
+      me: {
+        smallID: 1,
+        tiles: 1000,
+        troops: 40_000,
+        maxTroops: 100_000,
+      },
+      meSmallID: 1,
+      totals: {
+        ...(runtime.world?.totals ?? {}),
+        alivePlayers: 2,
+        usableLand: 10_000,
+      },
+      threats: {
+        ...(runtime.world?.threats ?? {}),
+        adjacentEnemies: [],
+        overwhelmingNeighbor: {
+          enemy: { name: "Giant" },
+          ratio: 3.0,
+          threshold: 2.5,
+          idealMinTroops: 100_000,
+        },
+      },
+    };
+    expect(shouldStallForInvasionDefense()).toBe(true);
+
+    const me = {
+      smallID: () => 1,
+      troops: () => 40_000,
+      numTilesOwned: () => 1000,
+      isAlive: () => true,
+      incomingAttacks: () => [],
+      outgoingAttacks: () => [],
+      isFriendly: () => false,
+    };
+    // Minimal gameView covering the fields maybeExpand + its helpers
+    // touch. The segment search walks borderTiles → neighbors → land
+    // predicate; give it a single-segment layout so exactly one valid
+    // TN frontier exists.
+    runtime.hooks.gameView = {
+      ticks: () => 500,
+      myPlayer: () => me,
+      config: () => ({
+        maxTroops: () => 100_000,
+        boatMaxNumber: () => 3,
+        isUnitDisabled: () => false,
+      }),
+      numLandTiles: () => 10_000,
+      isLand: () => true,
+      isWater: () => false,
+      isOceanShore: () => false,
+      hasFallout: () => false,
+      // Border tile owner = me. Neighbor tile owner = 0 (terra nullius).
+      ownerID: (tile: number) => (tile === 1 ? 1 : 0),
+      neighbors: (tile: number) => (tile === 1 ? [42] : [1]),
+      manhattanDist: () => 1,
+      isValidCoord: () => true,
+      hasOwner: (tile: number) => tile === 1,
+      isBorder: (tile: number) => tile === 1,
+      playerBySmallID: () => null,
+      playerViews: () => [],
+    };
+    runtime.state.borderCache = { tick: 500, tiles: [1] };
+    runtime.state.cooldowns.expand = -999;
+
+    const handled = await maybeExpand(me, [1]);
+    expect(handled).toBe(true);
+    const tnAttack = sentIntents.find(
+      (i) => i.type === "attack" && i.targetID === null,
+    );
+    expect(tnAttack, "expected a TN attack intent (targetID=null)")
+      .toBeDefined();
+    // Troop count must be a positive integer — the exact value depends
+    // on computeReserveRatio / aggressionBonus, but it must never be 0.
+    expect(tnAttack.troops).toBeGreaterThan(0);
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = false;
+  });
+
+  it("maybeCombat skips adjacent PvP targets during an overwhelming-neighbor stall", async () => {
+    const runtime = loadUserscript();
+    const { maybeCombat, shouldStallForInvasionDefense, PlayerType } =
+      runtime.test.internals;
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = true;
+    const sentIntents: any[] = [];
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = {
+      send: (object: any) => {
+        if (object && object.intent) sentIntents.push(object.intent);
+      },
+    };
+
+    const enemy = {
+      smallID: () => 2,
+      id: () => "E2",
+      isPlayer: () => true,
+      isFriendly: () => false,
+      displayName: () => "Weakling",
+      troops: () => 10_000,
+      type: () => PlayerType.Human,
+    };
+    // Stall state + a weak adjacent enemy that would otherwise look
+    // very appealing to attack (troops 10k vs our 40k, ideal ratio).
+    runtime.world = {
+      ...runtime.world,
+      archetype: "CONTINENTAL",
+      me: {
+        smallID: 1,
+        tiles: 1000,
+        troops: 40_000,
+        maxTroops: 100_000,
+        incomingTroops: 0,
+        incomingAttacks: [],
+      },
+      meSmallID: 1,
+      bySmallID: new Map([[2, { smallID: 2, troops: 10_000 }]]),
+      totals: { alivePlayers: 3, usableLand: 10_000 },
+      threats: {
+        adjacentEnemies: [],
+        overwhelmingNeighbor: {
+          enemy: { name: "Giant", smallID: 3 },
+          ratio: 3.0,
+          threshold: 2.5,
+          idealMinTroops: 120_000,
+        },
+      },
+    };
+    expect(shouldStallForInvasionDefense()).toBe(true);
+
+    const me = {
+      smallID: () => 1,
+      troops: () => 40_000,
+      numTilesOwned: () => 1000,
+      isAlive: () => true,
+      incomingAttacks: () => [],
+      isFriendly: () => false,
+      isOnSameTeam: () => false,
+      displayName: () => "Me",
+    };
+    runtime.hooks.gameView = {
+      ticks: () => 500,
+      myPlayer: () => me,
+      config: () => ({
+        maxTroops: () => 100_000,
+        boatMaxNumber: () => 3,
+        isUnitDisabled: () => false,
+      }),
+      isLand: () => true,
+      // Border tile 1 has a neighbour (tile 42) owned by enemy 2 →
+      // getAdjacentEnemyInfo will return one candidate.
+      ownerID: (tile: number) => (tile === 42 ? 2 : tile === 1 ? 1 : 0),
+      neighbors: (tile: number) => (tile === 1 ? [42] : [1]),
+      playerBySmallID: (id: number) => (id === 2 ? enemy : null),
+      isBorder: () => false,
+    };
+    runtime.state.borderCache = { tick: 500, tiles: [1] };
+    runtime.state.cooldowns.combat = -999;
+
+    const handled = await maybeCombat(me, [1]);
+    expect(handled).toBe(false);
+    const attackIntent = sentIntents.find((i) => i.type === "attack");
+    expect(attackIntent, "stall must block proactive PvP attacks").toBeUndefined();
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = false;
+  });
+
+  it("maybeCombat refuses to fire during an overwhelming-neighbor stall", async () => {
+    const runtime = loadUserscript();
+    const { maybeCombat, shouldStallForInvasionDefense, PlayerType } =
+      runtime.test.internals;
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = true;
+    const sentIntents: any[] = [];
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = {
+      send: (object: any) => {
+        if (object && object.intent) sentIntents.push(object.intent);
+      },
+    };
+
+    runtime.world = {
+      ...runtime.world,
+      archetype: "CONTINENTAL",
+      me: {
+        smallID: 1,
+        tiles: 1000,
+        troops: 40_000,
+        maxTroops: 100_000,
+        incomingTroops: 0,
+        incomingAttacks: [],
+      },
+      meSmallID: 1,
+      bySmallID: new Map([
+        [2, { smallID: 2, troops: 50_000, type: PlayerType.Human }],
+      ]),
+      totals: { alivePlayers: 2, usableLand: 10_000 },
+      threats: {
+        adjacentEnemies: [],
+        overwhelmingNeighbor: {
+          enemy: { name: "Giant", smallID: 3 },
+          ratio: 3.0,
+          threshold: 2.5,
+          idealMinTroops: 120_000,
+        },
+      },
+    };
+    expect(shouldStallForInvasionDefense()).toBe(true);
+
+    const me = {
+      smallID: () => 1,
+      troops: () => 40_000,
+      numTilesOwned: () => 1000,
+      isAlive: () => true,
+      incomingAttacks: () => [],
+      isFriendly: () => false,
+      displayName: () => "Me",
+    };
+    // maybeCombat calls its early `chooseCounterTarget` path off of
+    // me.incomingAttacks(). Return an empty list so the function drops
+    // into the proactive branch — where the stall guard fires.
+    runtime.hooks.gameView = {
+      ticks: () => 500,
+      myPlayer: () => me,
+      config: () => ({
+        maxTroops: () => 100_000,
+        boatMaxNumber: () => 3,
+        isUnitDisabled: () => false,
+      }),
+      isLand: () => true,
+      ownerID: () => 0,
+      neighbors: () => [],
+      playerBySmallID: () => null,
+      isBorder: () => false,
+    };
+    runtime.state.borderCache = { tick: 500, tiles: [1] };
+    runtime.state.cooldowns.combat = -999;
+
+    const handled = await maybeCombat(me, [1]);
+    expect(handled).toBe(false);
+    const attackIntent = sentIntents.find((i) => i.type === "attack");
+    expect(attackIntent, "maybeCombat must not send offensive attacks").toBeUndefined();
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = false;
+  });
+});
+
 describe("Plan §8 — traitor-window lock acceptance", () => {
   it("recordAllianceBreak forces DEFENSIVE_TURTLE for ~30 seconds", () => {
     const runtime = loadUserscript();

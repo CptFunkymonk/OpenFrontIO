@@ -13930,6 +13930,9 @@
         // Plan §8 acceptance-test helpers.
         selectPrimaryGoal,
         recordAllianceBreak,
+        // Plan §2.4 acceptance helpers.
+        maybeExpand,
+        maybeCombat,
         sendRawMessage,
         installLocalTransportBridge,
         handleServerMessage,
