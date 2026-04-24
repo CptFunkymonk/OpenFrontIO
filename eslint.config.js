@@ -18,7 +18,6 @@ export default [
       "src/server/gatekeeper/**",
       "tests/pathfinding/playground/**",
       "tampermonkey-superhuman-bot.js",
-      "tampermonkey-emoji-broadcast.js",
     ],
   },
   { files: ["**/*.{js,mjs,cjs,ts}"] },

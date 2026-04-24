@@ -2,7 +2,7 @@
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
 // @version      2.8.0
-// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense, compact RL decision logger
+// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -132,6 +132,33 @@
   const RL_WORLD_SNAPSHOT_EVERY = 30;
   const RL_STEALTH_BLOCK_LOG_MS = 500;
   const RL_ADJ_OVERMATCH_RATIO = 1.25;
+
+  // Invasion-defense stall threshold.
+  //
+  // We can't keep letting a massive neighbour roll over us: if any hostile
+  // border-sharing actor has significantly more troops than we do, the
+  // right move is to hoard troops and fortify, not to bleed our reserve on
+  // offensive attacks that will just get the defender bonus stripped.
+  //
+  // Derivation from the engine's source code
+  // (src/core/configuration/DefaultConfig.ts):
+  //   - attackAmount commits  attacker.troops() / 5  per attack (Human / Nation).
+  //   - In attackLogic the attacker's per-tile loss multiplier scales with
+  //         within(defender.troops() / attackTroops, 0.6, 2)
+  //     The defensive side of that term saturates at 2 once
+  //         defender.troops() >= 2 * attackTroops.
+  //   - Substituting  attackTroops = attacker.troops() / 5  gives
+  //         defender.troops() >= 0.4 * attacker.troops()
+  //     i.e. the defender keeps the saturated bonus as long as
+  //         attacker.troops() <= 2.5 * our troops.
+  //
+  // So 0.4 × neighbour.troops() is the ideal minimum troop floor; any
+  // adjacent hostile with more than 2.5× our troops has enough mass to
+  // break through the saturated defender term. This also matches the
+  // Medium-difficulty threat rule in
+  // src/core/execution/nation/NationAllianceBehavior.ts
+  // (isAlliancePartnerThreat):  otherPlayer.troops() > this.player.troops() * 2.5.
+  const INVASION_STALL_TROOP_RATIO = 2.5;
   const RL_STORAGE_KEY_PREFIX = "superbotRL:";
   const RL_STORAGE_MAX_MATCHES = 3;
   // Compact export budget. The default dump target — 500 KB easily fits
@@ -443,6 +470,7 @@
         brewingInvaders: [],
         invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
+        overwhelmingNeighbor: null,
       },
       archetype: "unknown",
       archetypeLocked: null, // manual override from overlay
@@ -815,6 +843,7 @@
         RL_WORLD_SNAPSHOT_EVERY,
         RL_STEALTH_BLOCK_LOG_MS,
         RL_ADJ_OVERMATCH_RATIO,
+        INVASION_STALL_TROOP_RATIO,
       },
       buildPriority: BuildPriority.slice(),
       structureTypes: StructureTypes.slice(),
@@ -2963,6 +2992,320 @@
     emitEmoji(emojiIndex, ALL_PLAYERS_RECIPIENT, "goal→" + next);
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  //  Manual emoji broadcast picker (Z-key hotkey)
+  // ═══════════════════════════════════════════════════════════════════════
+  //
+  // The bot fires emojis automatically in response to game events, but a
+  // human running the script may also want to press a key and broadcast
+  // an emoji themselves. We expose a standalone picker overlay, bound by
+  // default to `Z`, that reuses the bot's existing transport + counter
+  // path (`emitEmoji`) so manual broadcasts show up in the overlay's
+  // `Emojis` stat and obey the same debug-namespace kill-switch.
+  //
+  // Configuration via localStorage:
+  //   emojiHotkey.keybind  → KeyboardEvent.code (default "KeyZ")
+  //   emojiHotkey.enabled  → "false" disables the hotkey entirely
+  //
+  // The picker is a plain DOM overlay; it lives outside any shadow DOM so
+  // we don't fight the game's lit components. The styles are scoped by
+  // the `#of-superbot-emoji-picker` id so they can't leak into the game.
+
+  const PICKER_OVERLAY_ID = "of-superbot-emoji-picker";
+  const PICKER_STYLE_ID = PICKER_OVERLAY_ID + "-styles";
+  const PICKER_Z_INDEX = 2147483600;
+
+  const pickerState = {
+    overlayEl: null,
+    toastEl: null,
+    toastTimeout: null,
+    keyListener: null,
+  };
+
+  function pickerReadSetting(key, fallback) {
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (raw === null || raw === undefined) return fallback;
+      return raw;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function getPickerKeybind() {
+    const raw = pickerReadSetting("emojiHotkey.keybind", "KeyZ");
+    if (typeof raw !== "string" || raw.length === 0) return "KeyZ";
+    return raw;
+  }
+
+  function isPickerEnabled() {
+    return pickerReadSetting("emojiHotkey.enabled", "true") !== "false";
+  }
+
+  function ensurePickerStyles() {
+    if (document.getElementById(PICKER_STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = PICKER_STYLE_ID;
+    style.textContent = `
+      #${PICKER_OVERLAY_ID} {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.35);
+        z-index: ${PICKER_Z_INDEX};
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-panel {
+        position: relative;
+        background: rgba(24, 24, 27, 0.96);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 14px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+        max-width: calc(100vw - 32px);
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        gap: 12px;
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-title {
+        color: #fafafa;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-subtitle {
+        color: rgba(250, 250, 250, 0.55);
+        font-size: 11px;
+        margin-left: 8px;
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-close {
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        border: none;
+        background: #3f3f46;
+        color: #fafafa;
+        font-size: 14px;
+        cursor: pointer;
+        line-height: 1;
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-close:hover { background: #ef4444; }
+      #${PICKER_OVERLAY_ID} .of-ep-grid {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 6px;
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-emoji {
+        width: 56px;
+        height: 56px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: #27272a;
+        color: #fafafa;
+        font-size: 30px;
+        line-height: 1;
+        cursor: pointer;
+        transition: transform 120ms ease, background 120ms ease;
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-emoji:hover {
+        background: #3f3f46;
+        transform: scale(1.08);
+      }
+      #${PICKER_OVERLAY_ID} .of-ep-emoji:active { transform: scale(0.96); }
+      #${PICKER_OVERLAY_ID} .of-ep-footer {
+        margin-top: 10px;
+        color: rgba(250, 250, 250, 0.5);
+        font-size: 11px;
+        text-align: center;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function renderPickerKeybindLabel() {
+    const raw = getPickerKeybind();
+    if (raw.startsWith("Key")) return raw.slice(3);
+    if (raw.startsWith("Digit")) return raw.slice(5);
+    return raw;
+  }
+
+  function closeEmojiPicker() {
+    if (pickerState.overlayEl && pickerState.overlayEl.parentNode) {
+      pickerState.overlayEl.parentNode.removeChild(pickerState.overlayEl);
+    }
+    pickerState.overlayEl = null;
+  }
+
+  function showPickerToast(text) {
+    if (!pickerState.toastEl) {
+      const toast = document.createElement("div");
+      toast.style.position = "fixed";
+      toast.style.left = "50%";
+      toast.style.bottom = "56px";
+      toast.style.transform = "translateX(-50%)";
+      toast.style.background = "rgba(24, 24, 27, 0.94)";
+      toast.style.color = "#fafafa";
+      toast.style.borderRadius = "999px";
+      toast.style.padding = "8px 14px";
+      toast.style.fontSize = "13px";
+      toast.style.border = "1px solid rgba(255, 255, 255, 0.08)";
+      toast.style.zIndex = String(PICKER_Z_INDEX + 1);
+      toast.style.pointerEvents = "none";
+      toast.style.opacity = "0";
+      toast.style.transition = "opacity 160ms ease";
+      toast.style.fontFamily =
+        "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
+      document.body.appendChild(toast);
+      pickerState.toastEl = toast;
+    }
+    pickerState.toastEl.textContent = text;
+    pickerState.toastEl.style.opacity = "1";
+    if (pickerState.toastTimeout) clearTimeout(pickerState.toastTimeout);
+    pickerState.toastTimeout = setTimeout(() => {
+      if (pickerState.toastEl) pickerState.toastEl.style.opacity = "0";
+    }, 1400);
+  }
+
+  function openEmojiPicker() {
+    ensurePickerStyles();
+    closeEmojiPicker();
+
+    const root = document.createElement("div");
+    root.id = PICKER_OVERLAY_ID;
+    root.addEventListener("click", (e) => {
+      if (e.target === root) closeEmojiPicker();
+    });
+
+    const panel = document.createElement("div");
+    panel.className = "of-ep-panel";
+    panel.addEventListener("contextmenu", (e) => e.preventDefault());
+    panel.addEventListener("click", (e) => e.stopPropagation());
+
+    const header = document.createElement("div");
+    header.className = "of-ep-header";
+
+    const titleWrap = document.createElement("div");
+    const title = document.createElement("span");
+    title.className = "of-ep-title";
+    title.textContent = "Broadcast Emoji";
+    const subtitle = document.createElement("span");
+    subtitle.className = "of-ep-subtitle";
+    subtitle.textContent = "visible to all players";
+    titleWrap.appendChild(title);
+    titleWrap.appendChild(subtitle);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "of-ep-close";
+    closeBtn.textContent = "\u2715";
+    closeBtn.addEventListener("click", closeEmojiPicker);
+
+    header.appendChild(titleWrap);
+    header.appendChild(closeBtn);
+
+    const grid = document.createElement("div");
+    grid.className = "of-ep-grid";
+    FLATTENED_EMOJIS.forEach((emoji, idx) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "of-ep-emoji";
+      btn.textContent = emoji;
+      btn.addEventListener("click", () => {
+        // Reuse the bot's own send path so the overlay counter + debug
+        // namespace stay in sync. We bypass the rule-cooldown gate by
+        // calling emitEmoji directly (a human pressing the hotkey is an
+        // explicit, non-rule-based action).
+        const wasEnabled = runtime.state.emoji.enabled;
+        runtime.state.emoji.enabled = true;
+        let ok = false;
+        try {
+          ok = emitEmoji(idx, ALL_PLAYERS_RECIPIENT, "manual hotkey");
+        } finally {
+          runtime.state.emoji.enabled = wasEnabled;
+        }
+        closeEmojiPicker();
+        showPickerToast(
+          (ok ? "Broadcast " : "Could not broadcast ") + emoji,
+        );
+      });
+      grid.appendChild(btn);
+    });
+
+    const footer = document.createElement("div");
+    footer.className = "of-ep-footer";
+    footer.textContent =
+      "Press " +
+      renderPickerKeybindLabel() +
+      " again or Esc to close. Broadcasts to all players.";
+
+    panel.appendChild(header);
+    panel.appendChild(grid);
+    panel.appendChild(footer);
+    root.appendChild(panel);
+
+    document.body.appendChild(root);
+    pickerState.overlayEl = root;
+  }
+
+  function isPickerTextInputTarget(target) {
+    if (!target || !(target instanceof Element)) return false;
+    const tag = target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (target.isContentEditable) return true;
+    return false;
+  }
+
+  function isLocalPlayerInActiveGame() {
+    const gameView = getGameView();
+    if (!gameView) return false;
+    let inSpawn = false;
+    try {
+      inSpawn =
+        typeof gameView.inSpawnPhase === "function"
+          ? gameView.inSpawnPhase()
+          : false;
+    } catch (_) {}
+    if (inSpawn) return false;
+    const me = getMyLivingPlayer();
+    return Boolean(me);
+  }
+
+  function handleEmojiPickerKeyDown(e) {
+    if (!isPickerEnabled()) return;
+    if (e.code === "Escape" && pickerState.overlayEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeEmojiPicker();
+      return;
+    }
+    if (e.code !== getPickerKeybind()) return;
+    if (e.repeat) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (isPickerTextInputTarget(e.target)) return;
+    if (pickerState.overlayEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeEmojiPicker();
+      return;
+    }
+    if (!isLocalPlayerInActiveGame()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openEmojiPicker();
+  }
+
+  function installEmojiPickerHotkey() {
+    if (pickerState.keyListener) return;
+    pickerState.keyListener = handleEmojiPickerKeyDown;
+    window.addEventListener("keydown", handleEmojiPickerKeyDown, true);
+  }
+
   function sampleTilesForOwner(ownerSmallID, limit, options) {
     const gameView = getGameView();
     if (!gameView) return [];
@@ -4447,6 +4790,22 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.expand < 5) return false;
 
+    // Stall offense when a bordering neighbour can trivially roll us —
+    // we'd rather claim no new tiles than bleed troops on expansion while
+    // sitting below the defender-bonus saturation point. See
+    // INVASION_STALL_TROOP_RATIO for the derivation.
+    if (shouldStallForInvasionDefense()) {
+      const overwhelming = runtime.world.threats.overwhelmingNeighbor;
+      decisionLog(
+        "expand: stalling — " +
+          (overwhelming.enemy.name || "neighbour") +
+          " has " +
+          overwhelming.ratio.toFixed(2) +
+          "x our troops",
+      );
+      return false;
+    }
+
     const segments = getAdjacentExpansionSegments(borderTiles, me);
     if (segments.length === 0) {
       decisionLog("expand: no terra nullius frontier");
@@ -4529,6 +4888,23 @@
           return true;
         }
       }
+    }
+
+    // Counter-target retaliation above already handled real defensive
+    // cases. The rest of this function is proactive "pick a neighbour and
+    // attack them"; skip it entirely if any bordering neighbour is big
+    // enough to invade us. Proactively attacking while overmatched costs
+    // us the saturated defender bonus and invites the follow-up push.
+    if (shouldStallForInvasionDefense()) {
+      const overwhelming = runtime.world.threats.overwhelmingNeighbor;
+      decisionLog(
+        "combat: stalling — " +
+          (overwhelming.enemy.name || "neighbour") +
+          " has " +
+          overwhelming.ratio.toFixed(2) +
+          "x our troops",
+      );
+      return false;
     }
 
     adjacentEnemies.sort((a, b) => {
@@ -4950,6 +5326,14 @@
       return false;
     }
 
+    // Shipping troops overseas while an overmatched land neighbour is
+    // staring at our border is exactly the invasion window we want to
+    // close. Hoard troops at home until the ratio is tenable.
+    if (shouldStallForInvasionDefense()) {
+      decisionLog("naval: stalling under overwhelming bordering neighbour");
+      return false;
+    }
+
     const currentBoats = getUnitEntityCount(me, UnitType.TransportShip);
     if (currentBoats >= gameView.config().boatMaxNumber()) {
       decisionLog("naval: transport cap reached");
@@ -5089,6 +5473,13 @@
       getUnitEntityCount(me, UnitType.TransportShip) >=
       gameView.config().boatMaxNumber()
     ) {
+      return false;
+    }
+
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "river-crossing: stalling under overwhelming bordering neighbour",
+      );
       return false;
     }
 
@@ -5615,6 +6006,7 @@
     if (!me) return false;
     const tick = runtime.world.tick;
     if (tick - runtime.state.cooldowns.betray < 60) return false;
+    if (shouldStallForInvasionDefense()) return false;
 
     // Safety re-check.
     const hostile = runtime.world.threats.adjacentEnemies.find(
@@ -5713,6 +6105,12 @@
     if (!gameView || !me) return false;
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.terrainRush < 12) return false;
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "terrain-rush: stalling under overwhelming bordering neighbour",
+      );
+      return false;
+    }
     const collapsing = runtime.world.threats.collapsingTargets || [];
     if (collapsing.length === 0) return false;
 
@@ -5820,6 +6218,10 @@
     if (!gameView || !me) return false;
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.combat < 10) return false;
+    if (shouldStallForInvasionDefense()) {
+      decisionLog("farm-tribe: stalling under overwhelming bordering neighbour");
+      return false;
+    }
 
     const adj = runtime.world.threats.adjacentEnemies || [];
     const tribe = adj.find((e) => e.tags && e.tags.has("TRIBE_FARM"));
@@ -5938,6 +6340,12 @@
     if (!gameView || !me) return false;
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.combat < 30) return false;
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "rising-star: stalling under overwhelming bordering neighbour",
+      );
+      return false;
+    }
     const rising = runtime.world.threats.risingStars;
     if (!rising || rising.length === 0) return false;
 
@@ -6398,6 +6806,13 @@
 
     if (isTooEarlyForNaval(gameView, me)) return false;
 
+    if (shouldStallForInvasionDefense()) {
+      decisionLog(
+        "naval-land-grab: stalling under overwhelming bordering neighbour",
+      );
+      return false;
+    }
+
     if (
       getUnitEntityCount(me, UnitType.TransportShip) >=
       gameView.config().boatMaxNumber()
@@ -6638,6 +7053,71 @@
    * Would be dangerous to break this alliance right now? True if we're under
    * real threat — traitor debuff would be punishing.
    */
+  /**
+   * Pick the worst "overwhelming bordering neighbour" — any adjacent hostile
+   * actor with troops > INVASION_STALL_TROOP_RATIO × our troops. Returns
+   * { enemy, ratio, idealMinTroops } for the highest-ratio offender, or
+   * null if no such neighbour exists.
+   *
+   * Only meaningful actors (Humans + Nations) count — bots are already
+   * handled by FARM_TRIBE and rarely sustain a real invasion. Friendlies
+   * are skipped by construction because they are not on the
+   * adjacentEnemies list. Disconnected actors are filtered out so we
+   * don't turtle against a stalled AFK giant.
+   */
+  function computeOverwhelmingNeighbor(myEntry, adjacentEnemies) {
+    if (!myEntry) return null;
+    const myTroops = Number(myEntry.troops) || 0;
+    if (myTroops < 1) return null;
+    if (!Array.isArray(adjacentEnemies) || adjacentEnemies.length === 0) {
+      return null;
+    }
+    let worst = null;
+    let worstRatio = INVASION_STALL_TROOP_RATIO;
+    for (const entry of adjacentEnemies) {
+      if (!entry) continue;
+      if (entry.isFriendly) continue;
+      if (entry.isDisconnected) continue;
+      if (entry.type === PlayerType.Bot) continue;
+      const theirTroops = Number(entry.troops) || 0;
+      const ratio = theirTroops / myTroops;
+      if (ratio > worstRatio) {
+        worst = entry;
+        worstRatio = ratio;
+      }
+    }
+    if (!worst) return null;
+    const theirTroops = Number(worst.troops) || 0;
+    return {
+      enemy: worst,
+      ratio: worstRatio,
+      // idealMinTroops: the troop floor we want to sit at so the defender
+      // bonus stays saturated against this neighbour. Derived above —
+      // defender >= 0.4 × attacker keeps within(..., 0.6, 2) pinned at 2.
+      idealMinTroops: Math.ceil(theirTroops * 0.4),
+    };
+  }
+
+  /**
+   * Should the bot stall every proactive/offensive attack this tick because
+   * a border-sharing neighbour can trivially roll us?
+   *
+   * We gate anything that would spend troops on expansion, tribe farming,
+   * rising-star neutralization, betray-and-attack, or terrain rushes.
+   * We specifically do NOT gate:
+   *   - RETALIATION / REPEL_INVASION — those are defensive, they use
+   *     opposing-attack cancellation (AttackExecution subtracts troops
+   *     between matching attacks) to burn down the invader.
+   *   - Fortification paths (DefensePost / SAM / alliance requests) which
+   *     are what PREEMPT_INVASION and REPEL_INVASION already run.
+   */
+  function shouldStallForInvasionDefense() {
+    const world = runtime.world;
+    if (!world) return false;
+    const overwhelming = world.threats && world.threats.overwhelmingNeighbor;
+    return Boolean(overwhelming);
+  }
+
   function isUnsafeToBreakAlliance(myEntry) {
     if (!myEntry) return true;
     const world = runtime.world;
@@ -7912,6 +8392,16 @@
 
     // Update crown w/ hysteresis tracking (see Phase 2 acceptance criterion).
     runtime.world.prevCrownSmallID = runtime.world.threats.crownSmallID;
+    // Overwhelming bordering neighbour — someone strong enough to trivially
+    // invade us (troops > INVASION_STALL_TROOP_RATIO × our troops). When
+    // this is set, offensive tactical goals stall and we hoard troops
+    // for defence. See `computeOverwhelmingNeighbor` for the full
+    // source-code derivation behind the 2.5× threshold.
+    const overwhelmingNeighbor = computeOverwhelmingNeighbor(
+      runtime.world.me,
+      adjacentEnemies,
+    );
+
     runtime.world.threats = {
       crownSmallID: crownEntry ? crownEntry.smallID : null,
       crown: crownEntry,
@@ -7928,6 +8418,7 @@
       brewingInvaders: brewingInvaders.slice(0, 5),
       invasionTroopsInbound,
       inboundTroopTotal,
+      overwhelmingNeighbor,
     };
   }
 
@@ -11713,6 +12204,7 @@
         brewingInvaders: [],
         invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
+        overwhelmingNeighbor: null,
       },
       archetype: "CONTINENTAL",
       archetypeLocked: null,
@@ -12167,6 +12659,102 @@
       "REPEL_INVASION",
     );
 
+    // Scenarios 16–19: invasion-defense stall.
+    //
+    // The engine's combat math (src/core/configuration/DefaultConfig.ts)
+    // gives the defender a saturated attack-loss multiplier when
+    //     defender.troops() >= 0.4 × attacker.troops().
+    // Equivalently, any adjacent hostile with more than 2.5× our troops
+    // can roll us. These scenarios exercise the helper we use to keep
+    // the bot from blowing its reserve on offense when that's true.
+    const overwhelmingMe = { troops: 40_000 };
+    const scenario16 = computeOverwhelmingNeighbor(overwhelmingMe, [
+      {
+        smallID: 201,
+        name: "Giant",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 120_000, // 3.0× our troops
+      },
+    ]);
+    results.push({
+      name:
+        "computeOverwhelmingNeighbor flags bordering human with 3× our troops",
+      expected: "3.00",
+      actual: scenario16 ? scenario16.ratio.toFixed(2) : "null",
+      pass: scenario16 !== null && scenario16.ratio >= 2.5,
+    });
+
+    const scenario17 = computeOverwhelmingNeighbor(overwhelmingMe, [
+      {
+        smallID: 202,
+        name: "Peer",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 80_000, // 2.0× our troops — below the 2.5× threshold
+      },
+    ]);
+    results.push({
+      name:
+        "computeOverwhelmingNeighbor returns null when neighbour is only 2× our troops",
+      expected: "null",
+      actual: scenario17 === null ? "null" : "set",
+      pass: scenario17 === null,
+    });
+
+    // Bots don't count — they are handled by FARM_TRIBE and aren't
+    // credible invaders even at 5× our troops.
+    const scenario18 = computeOverwhelmingNeighbor(overwhelmingMe, [
+      {
+        smallID: 203,
+        name: "Tribe",
+        type: PlayerType.Bot,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 200_000,
+      },
+    ]);
+    results.push({
+      name: "computeOverwhelmingNeighbor ignores bot neighbours",
+      expected: "null",
+      actual: scenario18 === null ? "null" : "set",
+      pass: scenario18 === null,
+    });
+
+    // shouldStallForInvasionDefense reads world.threats.overwhelmingNeighbor.
+    // Set it explicitly and verify the gate fires; clear it and verify it
+    // doesn't.
+    const stashedWorld16 = runtime.world;
+    const stallOn = buildTestWorld();
+    stallOn.threats.overwhelmingNeighbor = {
+      enemy: { name: "Giant" },
+      ratio: 3.1,
+      idealMinTroops: 160_000,
+    };
+    runtime.world = stallOn;
+    const stallFires = shouldStallForInvasionDefense();
+    runtime.world = stashedWorld16;
+    results.push({
+      name: "shouldStallForInvasionDefense: fires when overwhelmingNeighbor set",
+      expected: "true",
+      actual: String(stallFires),
+      pass: stallFires === true,
+    });
+
+    const stallOff = buildTestWorld();
+    runtime.world = stallOff;
+    const stallQuiet = shouldStallForInvasionDefense();
+    runtime.world = stashedWorld16;
+    results.push({
+      name:
+        "shouldStallForInvasionDefense: stays off when no overwhelming neighbour",
+      expected: "false",
+      actual: String(stallQuiet),
+      pass: stallQuiet === false,
+    });
+
     // Scenario 6: parabolic SAM check should mark fewer trajectories as
     // intercepted than the linear approximation when the SAM sits on the
     // straight line between silo and target but NOT under the parabolic
@@ -12309,6 +12897,22 @@
             recipient || ALL_PLAYERS_RECIPIENT,
             "manual",
           ),
+        // Open the manual picker programmatically. Respects the same
+        // "must be in an active game" gate as the hotkey.
+        openPicker: () => {
+          if (!isLocalPlayerInActiveGame()) return false;
+          openEmojiPicker();
+          return true;
+        },
+        closePicker: () => closeEmojiPicker(),
+        get keybind() {
+          return getPickerKeybind();
+        },
+        setKeybind: (code) => {
+          try {
+            window.localStorage.setItem("emojiHotkey.keybind", String(code));
+          } catch (_) {}
+        },
       },
     };
     // Dedicated RL namespace for the downstream analyst + devtools use.
@@ -12406,6 +13010,9 @@
         trackOutgoingBoat,
         reconcileBoatLosses,
         maybeRiverCrossing,
+        computeOverwhelmingNeighbor,
+        shouldStallForInvasionDefense,
+        INVASION_STALL_TROOP_RATIO,
         NARROW_WATER_HOP_LIMIT,
         LOST_BOAT_BASE_COOLDOWN_TICKS,
         LOST_BOAT_MAX_COOLDOWN_TICKS,
@@ -12451,11 +13058,21 @@
         emitEmoji,
         maybeEmitEmoji,
         emojiOnGoalSwitch,
+        // Manual picker (hotkey) internals.
+        openEmojiPicker,
+        closeEmojiPicker,
+        handleEmojiPickerKeyDown,
+        installEmojiPickerHotkey,
+        getPickerKeybind,
       },
     };
     installWebSocketHook();
     installWorkerHook();
     bootstrapOverlay();
+    // Manual emoji-picker hotkey — see "Manual emoji broadcast picker"
+    // module. Installed once at boot; keyup handler bails out in text
+    // inputs / main menu so it's safe to leave bound globally.
+    installEmojiPickerHotkey();
 
     setInterval(discoverRuntimeReferences, DISCOVERY_INTERVAL_MS);
     setInterval(loop, LOOP_INTERVAL_MS);
