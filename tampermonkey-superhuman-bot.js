@@ -4641,15 +4641,21 @@
       if (inbound > 0) retaliating = true;
     }
     const available = Math.floor(me.troops() - maxTroops * reserveRatio);
-    if (available <= 5000) return 0;
 
     const enemyTroops = enemy ? enemy.troops() : 0;
 
     // --- TerraNullius: flat loss per tile, speed scales linearly with
-    // troops. Commit everything above the reserve. Never zero here.
+    // troops. Commit everything above the reserve. Plan §2.3 wording
+    // is explicit: "return `available` (send everything)". We apply
+    // only a non-negative floor so we never ship a negative/zero
+    // payload into sendAttack.
     if (enemyTroops <= 0) {
-      return available;
+      return available > 0 ? available : 0;
     }
+
+    // PvP gate: below 5k against a player, the attack merges into
+    // existing ones anyway and the intent cost dominates the value.
+    if (available <= 5000) return 0;
 
     // Engine saturation points, not hand-tuned fudge ratios.
     const idealRatio = 1.667; // loss multiplier bottoms at 0.6

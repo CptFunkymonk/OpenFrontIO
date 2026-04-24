@@ -64,11 +64,21 @@ describe("calculateAttackTroops — engine saturation anchoring", () => {
     expect(troops).toBe(30_000);
   });
 
-  it("returns 0 when available is below the 5k hard floor", () => {
+  it("returns 0 for a PvP target when available is below the 5k hard floor", () => {
+    // Plan §2.3: TerraNullius commits `available` no matter how small.
+    // PvP keeps a 5k floor because smaller attacks are noise.
     const runtime = loadUserscript();
     const { calculateAttackTroops } = runtime.test.internals;
-    const troops = calculateAttackTroops(me(21_000), null, 0.2, 100_000);
-    expect(troops).toBe(0);
+    const pvp = calculateAttackTroops(
+      me(21_000),
+      { troops: () => 2_000 },
+      0.2,
+      100_000,
+    );
+    expect(pvp).toBe(0);
+    // TN with the same tiny budget commits the full 1_000 anyway.
+    const tn = calculateAttackTroops(me(21_000), null, 0.2, 100_000);
+    expect(tn).toBe(1_000);
   });
 
   it("sends ~85% above the 1.667x loss-saturation point", () => {
