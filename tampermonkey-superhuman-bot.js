@@ -8111,10 +8111,16 @@
       return false;
     }
 
-    // Order: closest first. Closest neighbours become immediate border
-    // partners — securing *them* first defuses the most probable first
-    // attack on us.
-    candidates.sort((a, b) => a.dist - b.dist);
+    // Plan §2.2 wording: "in order of (smallID, closeness)". Read as
+    // closest-first with smallID as the deterministic tiebreaker so
+    // the pick is reproducible tick-to-tick across JS engines (whose
+    // Array.sort is otherwise not stable for our shape).
+    candidates.sort((a, b) => {
+      if (a.dist !== b.dist) return a.dist - b.dist;
+      const aSmallID = safeCall(() => a.player.smallID(), 0);
+      const bSmallID = safeCall(() => b.player.smallID(), 0);
+      return aSmallID - bSmallID;
+    });
 
     let dispatched = 0;
     // Cap to 4 requests per blast so we don't stand out to the anti-
