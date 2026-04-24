@@ -10971,6 +10971,12 @@
         handled = await runGoal_DefensiveTurtle(me);
         if (!handled) handled = await maybeDiplomacy(me);
         if (!handled) handled = await maybeEconomy(me, getEnemies());
+        // Plan §2.8: traitor-window turtle still permits expansion
+        // into TerraNullius — attacking empty land is a flat-loss
+        // action that has no offensive-melee downside. This closes
+        // the gap where the 30s lock would stall our tile growth
+        // entirely even when open frontier was adjacent.
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "SAM_WALL_BUILDUP":
         handled = await runGoal_SamWallBuildup(me);
