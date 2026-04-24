@@ -5289,9 +5289,18 @@
       return bScore - aScore;
     });
 
+    // Plan §2.3 cap for the proactive combat path: mid-game players
+    // are fine with baseReserve, but early-game (currentRatio < 0.2)
+    // the 0.55 baseline forces 0 commits. Cap at 0.5 × currentRatio.
+    const proactiveReserve = cappedReserveRatio(
+      me,
+      maxTroops,
+      reserveRatio,
+      0.08,
+    );
     for (const info of adjacentEnemies) {
       const enemy = info.player;
-      const troops = calculateAttackTroops(me, enemy, reserveRatio, maxTroops);
+      const troops = calculateAttackTroops(me, enemy, proactiveReserve, maxTroops);
       if (troops <= 0) continue;
       if (getEnemyStrengthScore(enemy, me, info.borderContacts) < 6) continue;
 
