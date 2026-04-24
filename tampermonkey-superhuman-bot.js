@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.7.0
+// @version      2.8.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense, compact RL decision logger
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.7.0";
+  const BOT_VERSION = "2.8.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -147,6 +147,49 @@
   // notes (e.g. "collapsing=X attackers=3 drop=-50/m") get elided.
   const RL_COMPACT_STRING_CAP = 120;
   const RL_SCHEMA_VERSION = 1;
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  Emoji communication
+  // ═══════════════════════════════════════════════════════════════════════
+  //
+  // The bot behaves like a chatty human: it broadcasts (or targets) emojis
+  // in reaction to game events. Every tick we evaluate a list of trigger
+  // rules against the world model; the first rule whose condition fires
+  // (and whose per-emoji / global cooldown has elapsed) sends the emoji
+  // via the standard `{type:"intent",intent:{type:"emoji", …}}` message.
+  //
+  // The catalogue mirrors `flattenedEmojiTable` in `src/core/Util.ts` —
+  // the numeric index into this array is the wire-format emoji id the
+  // server expects. Keep this in sync if the game adds new emojis.
+  const FLATTENED_EMOJIS = [
+    "\u{1F600}", "\u{1F60A}", "\u{1F970}", "\u{1F607}", "\u{1F60E}",
+    "\u{1F61E}", "\u{1F97A}", "\u{1F62D}", "\u{1F631}", "\u{1F621}",
+    "\u{1F608}", "\u{1F921}", "\u{1F971}", "\u{1FAE1}", "\u{1F595}",
+    "\u{1F44B}", "\u{1F44F}", "\u270B", "\u{1F64F}", "\u{1F4AA}",
+    "\u{1F44D}", "\u{1F44E}", "\u{1FAF4}", "\u{1F90C}",
+    "\u{1F926}\u200D\u2642\uFE0F",
+    "\u{1F91D}", "\u{1F198}", "\u{1F54A}\uFE0F", "\u{1F3F3}\uFE0F", "\u23F3",
+    "\u{1F525}", "\u{1F4A5}", "\u{1F480}", "\u2622\uFE0F", "\u26A0\uFE0F",
+    "\u2196\uFE0F", "\u2B06\uFE0F", "\u2197\uFE0F", "\u{1F451}", "\u{1F947}",
+    "\u2B05\uFE0F", "\u{1F3AF}", "\u27A1\uFE0F", "\u{1F948}", "\u{1F949}",
+    "\u2199\uFE0F", "\u2B07\uFE0F", "\u2198\uFE0F", "\u2764\uFE0F", "\u{1F494}",
+    "\u{1F4B0}", "\u2693", "\u26F5", "\u{1F3E1}", "\u{1F6E1}\uFE0F",
+    "\u{1F3ED}", "\u{1F682}", "\u2753", "\u{1F414}", "\u{1F400}",
+  ];
+  const ALL_PLAYERS_RECIPIENT = "AllPlayers";
+
+  // Minimum ticks between *any* outgoing emoji — avoids looking like a
+  // spambot. The server enforces its own per-recipient cooldown via
+  // emojiMessageCooldown(); we pace more conservatively than that so we
+  // don't wedge against the server cap.
+  const EMOJI_GLOBAL_COOLDOWN_TICKS = 40; // ~4s at 10 ticks/s
+  // Per-trigger cooldown — a single rule can only fire once every N ticks
+  // regardless of how many times the condition re-fires. Keeps us from
+  // yelling "😈" once per tick after each nuke build_unit.
+  const EMOJI_PER_RULE_COOLDOWN_TICKS = 300; // ~30s
+  // How often each rule's condition is re-evaluated. Some detectors are
+  // expensive (e.g. scanning every visible nuke) so we sample sparsely.
+  const EMOJI_SCAN_EVERY_TICKS = 5;
 
   const UnitType = Object.freeze({
     TransportShip: "Transport",
@@ -299,6 +342,44 @@
       sentBoats: new Map(),
       lostBoatBySmallID: new Map(),
       routeCooldowns: new Map(),
+      // Emoji communication bookkeeping (see FLATTENED_EMOJIS).
+      //
+      // enabled: master switch, flipped via devtools.
+      // lastEmojiTick: last tick any emoji was sent (global cooldown).
+      // perEmojiLastTick: emojiIndex → last tick that specific emoji fired.
+      // totalEmojisSent: monotonic counter surfaced in the overlay.
+      // peakTiles / rankedLastTick / etc.: event-memory fields used by
+      //   individual triggers to detect *transitions* (e.g. "we JUST
+      //   became the crown") rather than steady states.
+      emoji: {
+        enabled: true,
+        lastEmojiTick: -999,
+        perEmojiLastTick: new Map(),
+        totalEmojisSent: 0,
+        lastScanTick: -999,
+        // Transition memory.
+        wasCrown: false,
+        seenGoldMilestone10M: false,
+        seenFirstPort: false,
+        seenFirstCity: false,
+        seenFirstFactory: false,
+        seenFirstDP: false,
+        seenFirstSpawn: false,
+        crownSmallID: null,
+        lastAllyCount: 0,
+        lastTroops: 0,
+        peakTroops: 0,
+        lastTiles: 0,
+        peakTiles: 0,
+        lastIncomingAttackCount: 0,
+        lastOutgoingNukeCount: 0,
+        lastIncomingNukeOnMe: false,
+        prevTargetedBy: new Set(),
+        prevAllyIDs: new Set(),
+        lastGoalId: null,
+        lastIdleSince: -999,
+        lastMatchEndAt: -1,
+      },
     },
     overlay: {
       root: null,
@@ -1583,6 +1664,1303 @@
 
   function sendTargetPlayer(target) {
     return sendIntent({ type: "targetPlayer", target });
+  }
+
+  /**
+   * Send an `emoji` intent. `recipient` is either a concrete player ID
+   * string (from `player.id()`) or the sentinel `"AllPlayers"`. We bypass
+   * the stealth gate used by major intents — emojis don't affect the
+   * world, and a human player spams them freely.
+   */
+  function sendEmojiIntent(recipient, emojiIndex) {
+    if (!Number.isInteger(emojiIndex)) return false;
+    if (emojiIndex < 0 || emojiIndex >= FLATTENED_EMOJIS.length) return false;
+    if (!recipient) return false;
+    return sendRawMessage({
+      type: "intent",
+      intent: {
+        type: "emoji",
+        recipient,
+        emoji: emojiIndex,
+      },
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  Emoji communication module
+  // ═══════════════════════════════════════════════════════════════════════
+  //
+  // The bot acts like a chatty-but-not-spammy human: it reacts to game
+  // events with emojis. The design is three layers:
+  //
+  //   1. `EMOJI_RULES` — an ordered list of detector functions. Each rule
+  //      inspects the current world model, the local player entry, and a
+  //      per-state memory object, and either returns null (no fire) or
+  //      {emoji, recipient, reason}. Rules earlier in the list win ties.
+  //      Every emoji index 0..59 is covered by at least one rule so the
+  //      bot uses the *entire* palette across a match.
+  //
+  //   2. `maybeEmitEmoji()` — the per-tick driver. Applies global +
+  //      per-rule cooldowns, picks the first firing rule, sends the
+  //      emoji, bumps counters, and updates transition-memory.
+  //
+  //   3. Hooks — `maybeEmitEmoji()` is called from runModulesForTick()
+  //      after the world model is built, and `emojiOnGoalSwitch()` is
+  //      invoked from adoptGoal() to surface goal transitions
+  //      regardless of cooldown (we always want a "we're going
+  //      all-in now" reaction when the plan flips).
+
+  /**
+   * Per-rule cooldown check. Returns true if this emoji hasn't fired in
+   * the last `EMOJI_PER_RULE_COOLDOWN_TICKS` ticks.
+   */
+  function emojiRuleReady(emojiIndex, tick) {
+    const last = runtime.state.emoji.perEmojiLastTick.get(emojiIndex);
+    if (last === undefined) return true;
+    return tick - last >= EMOJI_PER_RULE_COOLDOWN_TICKS;
+  }
+
+  /**
+   * Dispatch an emoji. Caller asserts the cooldown / cadence gating is
+   * done — this function does *not* re-check global cooldown so we can
+   * bypass it in high-signal callsites like goal switches.
+   */
+  function emitEmoji(emojiIndex, recipient, reason) {
+    if (!runtime.state.emoji.enabled) return false;
+    const ok = sendEmojiIntent(recipient, emojiIndex);
+    if (!ok) return false;
+    const tick = safeCall(
+      () => runtime.hooks.gameView && runtime.hooks.gameView.ticks(),
+      0,
+    );
+    const emo = FLATTENED_EMOJIS[emojiIndex] || "?";
+    runtime.state.emoji.lastEmojiTick = tick;
+    runtime.state.emoji.perEmojiLastTick.set(emojiIndex, tick);
+    runtime.state.emoji.totalEmojisSent += 1;
+    const recipLabel =
+      recipient === ALL_PLAYERS_RECIPIENT
+        ? "all"
+        : (() => {
+            const entry = findEntryByPlayerID(recipient);
+            return entry ? entry.name : "p:" + String(recipient).slice(0, 6);
+          })();
+    decisionLog(
+      "emoji " + emo + " → " + recipLabel + " (" + (reason || "n/a") + ")",
+    );
+    return true;
+  }
+
+  function findEntryByPlayerID(id) {
+    const world = runtime.world;
+    if (!world || !world.everyone) return null;
+    for (const entry of world.everyone) {
+      if (entry.id === id) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * Returns a snapshot of the set of players who have targeted us via
+   * the `targetPlayer` intent. Uses each living player's .targets() list
+   * to detect who currently considers us a target.
+   */
+  function playersTargetingMe(me) {
+    const set = new Set();
+    const world = runtime.world;
+    if (!world || !world.everyone || !me) return set;
+    for (const entry of world.everyone) {
+      if (!entry || entry.isMe || !entry.player) continue;
+      const targets = safeCall(() => entry.player.targets(), null);
+      if (!targets || targets.length === 0) continue;
+      for (const tp of targets) {
+        if (tp && safeCall(() => tp.smallID(), null) === me.smallID) {
+          set.add(entry.smallID);
+          break;
+        }
+      }
+    }
+    return set;
+  }
+
+  /**
+   * Count currently visible nukes/warheads whose `.targetTile()` falls on
+   * one of our tiles. Used as the 😱 trigger.
+   */
+  function incomingNukeLandsOnMe(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    for (const type of NukeTypes) {
+      const nukes = safeCall(() => gameView.units(type), []);
+      for (const nuke of nukes) {
+        if (!safeCall(() => nuke.isActive(), false)) continue;
+        const dst = safeCall(() => nuke.targetTile(), null);
+        if (!dst) continue;
+        const owner = safeCall(() => gameView.owner(dst), null);
+        if (
+          owner &&
+          safeCall(() => owner.isPlayer(), false) &&
+          safeCall(() => owner.id(), null) === safeCall(() => me.id(), "")
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Pick the strongest hostile neighbour to address in a direct-target
+   * emoji. Falls back to broadcast when nothing qualifies.
+   */
+  function pickDominantHostile() {
+    const world = runtime.world;
+    if (!world || !world.threats) return null;
+    const adj = world.threats.adjacentEnemies || [];
+    for (const e of adj) {
+      if (e && !e.isFriendly) return e;
+    }
+    if (world.threats.crown && !world.threats.crown.isFriendly) {
+      return world.threats.crown;
+    }
+    return null;
+  }
+
+  /**
+   * Pick the strongest ally (most troops) to direct ally-facing emojis
+   * at. Returns null if we have none.
+   */
+  function pickStrongestAlly() {
+    const world = runtime.world;
+    if (!world) return null;
+    const allies = (world.everyone || []).filter((p) => p && p.isAlly && !p.isMe);
+    if (allies.length === 0) return null;
+    allies.sort((a, b) => (b.troops || 0) - (a.troops || 0));
+    return allies[0];
+  }
+
+  /**
+   * Figure out which compass-direction border is seeing the most
+   * hostile incoming-troop pressure. Returns "NW"/"N"/"NE"/"W"/"E"/
+   * "SW"/"S"/"SE" or null.
+   */
+  function busiestBorderOctant(me) {
+    const world = runtime.world;
+    const gameView = getGameView();
+    if (!world || !gameView || !me) return null;
+    const incoming = safeCall(() => me.incomingAttacks(), []);
+    if (!incoming || incoming.length === 0) return null;
+    const myTiles = safeCall(() => me.tiles(), null);
+    let cx = 0;
+    let cy = 0;
+    let n = 0;
+    if (myTiles && typeof myTiles[Symbol.iterator] === "function") {
+      for (const t of myTiles) {
+        const x = safeCall(() => gameView.x(t), null);
+        const y = safeCall(() => gameView.y(t), null);
+        if (x !== null && y !== null) {
+          cx += x;
+          cy += y;
+          n += 1;
+          if (n > 64) break;
+        }
+      }
+    }
+    if (n === 0) return null;
+    cx /= n;
+    cy /= n;
+    const buckets = {
+      N: 0, NE: 0, E: 0, SE: 0, S: 0, SW: 0, W: 0, NW: 0,
+    };
+    for (const atk of incoming) {
+      const troops = Number(safeCall(() => atk.troops, 0)) || 0;
+      if (troops <= 0) continue;
+      const attackerSmall = safeCall(
+        () => atk.attacker && atk.attacker.smallID(),
+        null,
+      );
+      if (attackerSmall === null) continue;
+      const entry = runtime.world.bySmallID.get(attackerSmall);
+      if (!entry || !entry.player) continue;
+      const tiles = safeCall(() => entry.player.tiles(), null);
+      if (!tiles) continue;
+      let ax = 0;
+      let ay = 0;
+      let an = 0;
+      for (const t of tiles) {
+        const x = safeCall(() => gameView.x(t), null);
+        const y = safeCall(() => gameView.y(t), null);
+        if (x !== null && y !== null) {
+          ax += x;
+          ay += y;
+          an += 1;
+          if (an > 32) break;
+        }
+      }
+      if (an === 0) continue;
+      const dx = ax / an - cx;
+      const dy = ay / an - cy;
+      // In OpenFront, y grows *downwards*, so negative dy = north.
+      const theta = Math.atan2(-dy, dx) * (180 / Math.PI);
+      let dir;
+      if (theta >= -22.5 && theta < 22.5) dir = "E";
+      else if (theta >= 22.5 && theta < 67.5) dir = "NE";
+      else if (theta >= 67.5 && theta < 112.5) dir = "N";
+      else if (theta >= 112.5 && theta < 157.5) dir = "NW";
+      else if (theta >= -67.5 && theta < -22.5) dir = "SE";
+      else if (theta >= -112.5 && theta < -67.5) dir = "S";
+      else if (theta >= -157.5 && theta < -112.5) dir = "SW";
+      else dir = "W";
+      buckets[dir] += troops;
+    }
+    let best = null;
+    let bestVal = 0;
+    for (const [dir, val] of Object.entries(buckets)) {
+      if (val > bestVal) {
+        bestVal = val;
+        best = dir;
+      }
+    }
+    return best;
+  }
+
+  const OCTANT_EMOJI_INDEX = {
+    NW: 35, // ↖️
+    N: 36,  // ⬆️
+    NE: 37, // ↗️
+    W: 40,  // ⬅️
+    E: 42,  // ➡️
+    SW: 45, // ↙️
+    S: 46,  // ⬇️
+    SE: 47, // ↘️
+  };
+
+  /**
+   * Finish-place emoji (🥇 / 🥈 / 🥉) decided by our final rank at
+   * match end. Returns { emoji, reason } or null when we're out of
+   * the podium.
+   */
+  function finishPlaceEmoji(me) {
+    const world = runtime.world;
+    if (!world || !me) return null;
+    const ranked = (world.everyone || [])
+      .filter((e) => e && e.hasSpawned)
+      .sort((a, b) => (b.tiles || 0) - (a.tiles || 0));
+    const myIdx = ranked.findIndex((e) => e.isMe);
+    if (myIdx < 0) return null;
+    if (myIdx === 0) return { emoji: 39, reason: "finished 1st" };
+    if (myIdx === 1) return { emoji: 43, reason: "finished 2nd" };
+    if (myIdx === 2) return { emoji: 44, reason: "finished 3rd" };
+    return null;
+  }
+
+  /**
+   * Detect whether the active goal changed since the last tick. Returns
+   * { prev, next } or null. Separate from adoptGoal's internal tracking
+   * so we can surface per-tick transitions from the tick loop.
+   */
+  function consumeGoalTransition() {
+    const current = runtime.planner.activeGoalId;
+    const prev = runtime.state.emoji.lastGoalId;
+    if (prev === current) return null;
+    runtime.state.emoji.lastGoalId = current;
+    if (prev === null && current === null) return null;
+    return { prev, next: current };
+  }
+
+  const GOAL_EMOJI = {
+    REPEL_INVASION: 19,         // 💪
+    CONSOLIDATE_FRONT: 17,      // ✋
+    PREEMPT_INVASION: 34,       // ⚠️
+    DEFENSIVE_TURTLE: 54,       // 🛡️
+    SAM_WALL_BUILDUP: 54,       // 🛡️
+    SAM_OVERWHELM: 31,          // 💥
+    NUKE_CROWN: 30,             // 🔥
+    MIRV_LAST_RESORT: 33,       // ☢️
+    SAVE_FOR_HYDRO: 29,         // ⏳
+    FARM_TRIBE: 58,             // 🐔
+    EASY_NATION_GRAB: 41,       // 🎯
+    TERRAIN_RUSH: 31,           // 💥
+    NEUTRALIZE_RISING_STAR: 41, // 🎯
+    NAVAL_LAND_GRAB: 52,        // ⛵
+    DIPLOMACY_ISOLATE_CROWN: 27, // 🕊️
+    BETRAY_ALLY: 10,            // 😈
+    WARSHIP_DEFENSE: 52,        // ⛵
+    IDLE: 12,                   // 🥱
+  };
+
+  /**
+   * Rule list. Each rule returns either null (skipped) or
+   * { emoji, recipient, reason } when its condition is active this tick.
+   * Rules earlier in the list win when several would fire simultaneously
+   * (e.g. dying > attacked > broadcast).
+   *
+   * Every emoji index 0..59 appears in at least one rule so the bot
+   * uses the complete palette across a match. The mapping below
+   * documents what each emoji *means* when this bot sends it.
+   */
+  const EMOJI_RULES = [
+    // ---- imminent-death / emergencies (highest priority) ----
+    {
+      id: "incoming_nuke",
+      // 😱 — a nuke / warhead is targeting our territory right now.
+      evaluate: (ctx) => {
+        if (!incomingNukeLandsOnMe(ctx.me)) return null;
+        return { emoji: 8, recipient: ALL_PLAYERS_RECIPIENT, reason: "nuke incoming" };
+      },
+    },
+    {
+      id: "about_to_die",
+      // 🏳️ — we're almost gone. Broadcast surrender.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (me.tiles > 20 && me.troops > 3000) return null;
+        if (me.tiles === 0) return null; // we're already dead
+        return { emoji: 28, recipient: ALL_PLAYERS_RECIPIENT, reason: "near elimination" };
+      },
+    },
+    {
+      id: "sos_under_pressure",
+      // 🆘 — severe incoming > troops; plea for help.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        const pressure = me.incomingTroops / Math.max(1, me.troops);
+        if (pressure < 0.8) return null;
+        return { emoji: 26, recipient: ALL_PLAYERS_RECIPIENT, reason: "SOS pressure" };
+      },
+    },
+    // ---- reactive anger / being wronged ----
+    {
+      id: "someone_targeted_me",
+      // 🖕 — a specific player just started targeting us.
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        const now = playersTargetingMe(ctx.me);
+        const prev = runtime.state.emoji.prevTargetedBy;
+        const newbies = [...now].filter((s) => !prev.has(s));
+        runtime.state.emoji.prevTargetedBy = now;
+        if (newbies.length === 0) return null;
+        const entry = runtime.world.bySmallID.get(newbies[0]);
+        if (!entry || !entry.id) return null;
+        return {
+          emoji: 14,
+          recipient: entry.id,
+          reason: "targeted by " + entry.name,
+        };
+      },
+    },
+    {
+      id: "was_targeted_broadcast",
+      // 😭 — we noticed we're being targeted (broadcast follow-up to the
+      // direct 🖕, since the game doesn't show the direct one to others).
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        const now = playersTargetingMe(ctx.me);
+        if (now.size === 0) return null;
+        return { emoji: 7, recipient: ALL_PLAYERS_RECIPIENT, reason: "being targeted" };
+      },
+    },
+    {
+      id: "ally_broke_on_us",
+      // 😡 — someone broke an alliance with us since last tick.
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        const world = runtime.world;
+        const prev = runtime.state.emoji.prevAllyIDs;
+        const current = new Set();
+        for (const e of world.everyone) {
+          if (e && e.isAlly && !e.isMe && e.id) current.add(e.id);
+        }
+        const lost = [...prev].filter((id) => !current.has(id));
+        runtime.state.emoji.prevAllyIDs = current;
+        if (lost.length === 0) return null;
+        const lostEntry = findEntryByPlayerID(lost[0]);
+        if (!lostEntry) return null;
+        const myTroops = ctx.worldMe ? ctx.worldMe.troops : 0;
+        const theirTroops = lostEntry.troops || 0;
+        // Coward? Only if they're meaningfully weaker and bailed on us.
+        if (myTroops > 0 && theirTroops < myTroops * 0.6) {
+          return {
+            emoji: 59, // 🐀
+            recipient: lostEntry.id,
+            reason: "coward abandoned us: " + lostEntry.name,
+          };
+        }
+        return {
+          emoji: 9, // 😡
+          recipient: lostEntry.id,
+          reason: "alliance broken by " + lostEntry.name,
+        };
+      },
+    },
+    {
+      id: "attack_failed",
+      // 🤦‍♂️ — we tried to grind a neighbour but the incoming is bigger
+      // than the outgoing, so our attack is getting eaten alive.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (me.outgoingTroops < 4000) return null;
+        if (me.incomingTroops <= me.outgoingTroops) return null;
+        return {
+          emoji: 24,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "outgoing eaten by incoming",
+        };
+      },
+    },
+    // ---- kills / milestones that deserve a taunt ----
+    {
+      id: "enemy_eliminated",
+      // 💀 — a hostile just got wiped (tiles → 0).
+      evaluate: (ctx) => {
+        const prev = ctx.prevSnapshot || {};
+        const world = runtime.world;
+        for (const entry of world.everyone) {
+          if (!entry || entry.isMe || entry.isFriendly) continue;
+          const wasAlive = prev[entry.smallID] && prev[entry.smallID].tiles > 0;
+          const dead = entry.tiles === 0;
+          if (wasAlive && dead) {
+            return {
+              emoji: 32,
+              recipient: ALL_PLAYERS_RECIPIENT,
+              reason: "eliminated " + entry.name,
+            };
+          }
+        }
+        return null;
+      },
+    },
+    {
+      id: "became_crown",
+      // 😎 — we JUST became the #1 player.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const crown = world.threats.crown;
+        if (!crown || !crown.isMe) return null;
+        if (runtime.state.emoji.wasCrown) return null;
+        runtime.state.emoji.wasCrown = true;
+        return { emoji: 4, recipient: ALL_PLAYERS_RECIPIENT, reason: "we are crown" };
+      },
+    },
+    {
+      id: "lost_crown",
+      // 👑 — someone else took the crown from us. Acknowledge it.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const crown = world.threats.crown;
+        const wasCrown = runtime.state.emoji.wasCrown;
+        if (!crown) return null;
+        if (crown.isMe) return null;
+        if (!wasCrown && runtime.state.emoji.crownSmallID === crown.smallID) {
+          return null;
+        }
+        const prev = runtime.state.emoji.crownSmallID;
+        runtime.state.emoji.crownSmallID = crown.smallID;
+        if (prev === null) return null;
+        if (prev === crown.smallID) return null;
+        runtime.state.emoji.wasCrown = false;
+        return {
+          emoji: 38,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "crown changed to " + crown.name,
+        };
+      },
+    },
+    // ---- diplomacy reactions ----
+    {
+      id: "new_ally",
+      // 👋 — alliance formed with someone (count went up).
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const allies = world.everyone.filter((p) => p && p.isAlly && !p.isMe);
+        const newAllies = allies.filter(
+          (a) => !runtime.state.emoji.prevAllyIDs.has(a.id),
+        );
+        if (newAllies.length === 0) return null;
+        const newest = newAllies[0];
+        return {
+          emoji: 15,
+          recipient: newest.id,
+          reason: "new ally: " + newest.name,
+        };
+      },
+    },
+    {
+      id: "friendly_greet",
+      // 😊 — periodic greet at the start of a fresh alliance pair. Fires
+      // once the allied relationship is a few ticks old so we don't
+      // double up with 👋.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const ally = pickStrongestAlly();
+        if (!ally) return null;
+        const tick = world.tick;
+        if (tick < 60) return null;
+        return { emoji: 1, recipient: ally.id, reason: "friendly check-in" };
+      },
+    },
+    {
+      id: "mutual_alliance_broadcast",
+      // 🤝 — public "we have a diplomatic pact" broadcast. Only when
+      // we've had at least one ally for a while.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const allyCount = world.everyone.filter(
+          (p) => p && p.isAlly && !p.isMe,
+        ).length;
+        if (allyCount < 1) return null;
+        if (world.tick < 300) return null;
+        return {
+          emoji: 25,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "we have " + allyCount + " ally",
+        };
+      },
+    },
+    {
+      id: "heart_clanmate",
+      // ❤️ — send love to a clanmate ally.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const clanmate = world.everyone.find(
+          (p) => p && p.isAlly && p.isClanmate && !p.isMe,
+        );
+        if (!clanmate) return null;
+        return {
+          emoji: 48,
+          recipient: clanmate.id,
+          reason: "clanmate " + clanmate.name,
+        };
+      },
+    },
+    {
+      id: "broke_alliance_rat",
+      // 😇 — we broke an alliance ourselves (traitor briefly). Public
+      // "it wasn't personal" to the ex-ally's nation.
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        if (!safeCall(() => ctx.me.isTraitor(), false)) return null;
+        const ticksLeft = safeCall(() => ctx.me.getTraitorRemainingTicks(), 0);
+        if (ticksLeft < 30) return null;
+        return {
+          emoji: 3,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "traitor window",
+        };
+      },
+    },
+    {
+      id: "dove_peace",
+      // 🕊️ — we want to de-escalate: goal is isolate-crown / we just
+      // ended a trade embargo with someone.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        if (runtime.planner.activeGoalId !== "DIPLOMACY_ISOLATE_CROWN") {
+          return null;
+        }
+        const crown = world.threats.crown;
+        if (!crown || crown.isMe) return null;
+        return {
+          emoji: 27,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "isolate the crown",
+        };
+      },
+    },
+    {
+      id: "alliance_expired",
+      // 💔 — natural alliance expiry (not "broke"). Rough heuristic:
+      // we had the ally but they're no longer an ally and we haven't
+      // gone traitor.
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        const isTraitor = safeCall(() => ctx.me.isTraitor(), false);
+        if (isTraitor) return null;
+        const prev = runtime.state.emoji.prevAllyIDs;
+        const current = new Set();
+        for (const e of runtime.world.everyone) {
+          if (e && e.isAlly && !e.isMe && e.id) current.add(e.id);
+        }
+        const lost = [...prev].filter((id) => !current.has(id));
+        if (lost.length === 0) return null;
+        return {
+          emoji: 49,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "alliance expired",
+        };
+      },
+    },
+    // ---- donations / resource flow ----
+    {
+      id: "donate_gold_thanks",
+      // 🫴 — we just sent gold to an ally. Sending 🫴 makes it clear
+      // we're the giver (and reminds the ally we help them).
+      evaluate: (ctx) => {
+        const snap = ctx.prevSelfSnapshot;
+        if (!snap) return null;
+        // Heuristic: our gold *dropped* while an ally's gold rose
+        // > 100k in the last sample.
+        const delta = (ctx.worldMe?.gold || 0) - snap.gold;
+        if (delta >= -250_000) return null;
+        const ally = pickStrongestAlly();
+        if (!ally) return null;
+        return {
+          emoji: 22,
+          recipient: ally.id,
+          reason: "shared gold with " + ally.name,
+        };
+      },
+    },
+    {
+      id: "donate_troops",
+      // 🤌 — we sent troops to an ally (huge incoming drop + ally
+      // gained troops).
+      evaluate: (ctx) => {
+        const snap = ctx.prevSelfSnapshot;
+        if (!snap) return null;
+        const delta = (ctx.worldMe?.troops || 0) - snap.troops;
+        if (delta >= -8000) return null;
+        const ally = pickStrongestAlly();
+        if (!ally) return null;
+        return {
+          emoji: 23,
+          recipient: ally.id,
+          reason: "sent troops to " + ally.name,
+        };
+      },
+    },
+    {
+      id: "gratitude_for_gift",
+      // 🥰 — someone gifted us (our gold jumped without a sale). We
+      // thank whoever is our strongest ally right now.
+      evaluate: (ctx) => {
+        const snap = ctx.prevSelfSnapshot;
+        if (!snap) return null;
+        const delta = (ctx.worldMe?.gold || 0) - snap.gold;
+        if (delta < 500_000) return null;
+        const ally = pickStrongestAlly();
+        if (!ally) return null;
+        return {
+          emoji: 2,
+          recipient: ally.id,
+          reason: "gift received",
+        };
+      },
+    },
+    // ---- offense reactions ----
+    {
+      id: "nuke_launched",
+      // 😈 — we just built a nuke (outgoing nuke count went up).
+      evaluate: (ctx) => {
+        const me = ctx.me;
+        if (!me) return null;
+        let nukeCount = 0;
+        for (const t of NukeTypes) {
+          nukeCount += safeCall(() => me.units(t).length, 0);
+        }
+        const prev = runtime.state.emoji.lastOutgoingNukeCount;
+        runtime.state.emoji.lastOutgoingNukeCount = nukeCount;
+        if (nukeCount <= prev) return null;
+        const target = pickDominantHostile();
+        if (target && target.id) {
+          return {
+            emoji: 10,
+            recipient: target.id,
+            reason: "nuke sent at " + target.name,
+          };
+        }
+        return { emoji: 10, recipient: ALL_PLAYERS_RECIPIENT, reason: "nuke sent" };
+      },
+    },
+    {
+      id: "bully_laugh",
+      // 🤡 — after a big capture (our tiles jumped significantly),
+      // tease the nearest hostile.
+      evaluate: (ctx) => {
+        const snap = ctx.prevSelfSnapshot;
+        if (!snap) return null;
+        const delta = (ctx.worldMe?.tiles || 0) - snap.tiles;
+        if (delta < 400) return null;
+        const target = pickDominantHostile();
+        if (!target || !target.id) return null;
+        return {
+          emoji: 11,
+          recipient: target.id,
+          reason: "captured +" + delta + " tiles",
+        };
+      },
+    },
+    {
+      id: "targeted_intent",
+      // 🎯 — we just used targetPlayer on someone (new target in our
+      // outgoing targets list).
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        const targets = safeCall(() => ctx.me.targets(), []) || [];
+        if (targets.length === 0) return null;
+        const target = targets[0];
+        const tid = safeCall(() => target.id(), null);
+        if (!tid) return null;
+        const tickSince = safeCall(
+          () => (targets[0].targetedAtTick ? targets[0].targetedAtTick : null),
+          null,
+        );
+        // Cooldown-aware: fire at most once per target per emoji
+        // cooldown. This rule's per-rule cooldown means we won't spam
+        // even if targets() stays populated.
+        void tickSince;
+        const entry = findEntryByPlayerID(tid);
+        if (!entry) return null;
+        return {
+          emoji: 41,
+          recipient: tid,
+          reason: "targeting " + entry.name,
+        };
+      },
+    },
+    {
+      id: "applause_ally_nuke",
+      // 👏 — an ally just launched a nuke (their nuke count up).
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        for (const ally of world.everyone) {
+          if (!ally || ally.isMe || !ally.isAlly) continue;
+          const aPlayer = ally.player;
+          if (!aPlayer) continue;
+          let nukeCount = 0;
+          for (const t of NukeTypes) {
+            nukeCount += safeCall(() => aPlayer.units(t).length, 0);
+          }
+          const key = "ally_nuke_" + ally.smallID;
+          const prev = runtime.state.emoji.perEmojiLastTick.get(key) || 0;
+          // We (ab)use perEmojiLastTick as a generic memory store since
+          // the ally-specific delta isn't worth a new state field.
+          if (nukeCount > prev) {
+            runtime.state.emoji.perEmojiLastTick.set(key, nukeCount);
+            if (prev > 0 && nukeCount > prev) {
+              return {
+                emoji: 16,
+                recipient: ally.id,
+                reason: "ally " + ally.name + " nuked",
+              };
+            }
+          }
+        }
+        return null;
+      },
+    },
+    // ---- border-direction pressure ----
+    {
+      id: "border_pressure_octant",
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        const oct = busiestBorderOctant(ctx.me);
+        if (!oct) return null;
+        const emoji = OCTANT_EMOJI_INDEX[oct];
+        if (emoji === undefined) return null;
+        return {
+          emoji,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "heavy push from " + oct,
+        };
+      },
+    },
+    // ---- economy / build milestones ----
+    {
+      id: "gold_rich",
+      // 💰 — first crossed 10M gold.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (runtime.state.emoji.seenGoldMilestone10M) return null;
+        if (me.gold < 10_000_000) return null;
+        runtime.state.emoji.seenGoldMilestone10M = true;
+        return {
+          emoji: 50,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "first 10M gold",
+        };
+      },
+    },
+    {
+      id: "first_port",
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (runtime.state.emoji.seenFirstPort) return null;
+        if ((me.structures[UnitType.Port] || 0) === 0) return null;
+        runtime.state.emoji.seenFirstPort = true;
+        return { emoji: 51, recipient: ALL_PLAYERS_RECIPIENT, reason: "first port" };
+      },
+    },
+    {
+      id: "first_city",
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (runtime.state.emoji.seenFirstCity) return null;
+        if ((me.structures[UnitType.City] || 0) === 0) return null;
+        runtime.state.emoji.seenFirstCity = true;
+        return { emoji: 53, recipient: ALL_PLAYERS_RECIPIENT, reason: "first city" };
+      },
+    },
+    {
+      id: "first_factory",
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (runtime.state.emoji.seenFirstFactory) return null;
+        if ((me.structures[UnitType.Factory] || 0) === 0) return null;
+        runtime.state.emoji.seenFirstFactory = true;
+        return {
+          emoji: 55,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "first factory",
+        };
+      },
+    },
+    {
+      id: "first_train",
+      evaluate: (ctx) => {
+        const gameView = getGameView();
+        if (!gameView) return null;
+        const me = ctx.me;
+        if (!me) return null;
+        const trains = safeCall(() => me.units(UnitType.Train).length, 0);
+        if (trains === 0) return null;
+        // Only fire once per match via the per-rule cooldown + a sticky
+        // snapshot flag.
+        if (runtime.state.emoji._sawFirstTrain) return null;
+        runtime.state.emoji._sawFirstTrain = true;
+        return { emoji: 56, recipient: ALL_PLAYERS_RECIPIENT, reason: "first train" };
+      },
+    },
+    {
+      id: "first_defensepost",
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (runtime.state.emoji.seenFirstDP) return null;
+        if ((me.structures[UnitType.DefensePost] || 0) === 0) return null;
+        runtime.state.emoji.seenFirstDP = true;
+        return { emoji: 54, recipient: ALL_PLAYERS_RECIPIENT, reason: "first defense post" };
+      },
+    },
+    // ---- fallback flavour ----
+    {
+      id: "muscle_flex",
+      // 💪 — we're very strong (top share) and nothing else fired. Flex.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        if (!ctx.me) return null;
+        if (world.totals.myShare < 0.25) return null;
+        return {
+          emoji: 19,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "flexing at " + (world.totals.myShare * 100).toFixed(0) + "% share",
+        };
+      },
+    },
+    {
+      id: "thumbs_up_allies",
+      // 👍 — cheer for an ally who's doing well (growing fastest among
+      // allies).
+      evaluate: (ctx) => {
+        const ally = (runtime.world.everyone || [])
+          .filter((p) => p && p.isAlly && !p.isMe)
+          .sort((a, b) => (b.tilesPerMin || 0) - (a.tilesPerMin || 0))[0];
+        if (!ally) return null;
+        if ((ally.tilesPerMin || 0) <= 0) return null;
+        return {
+          emoji: 20,
+          recipient: ally.id,
+          reason: "cheering " + ally.name,
+        };
+      },
+    },
+    {
+      id: "thumbs_down_enemies",
+      // 👎 — disapproval broadcast toward the dominant hostile.
+      evaluate: (ctx) => {
+        const target = pickDominantHostile();
+        if (!target || !target.id) return null;
+        if (target.isFriendly) return null;
+        if (target.troops < (ctx.worldMe?.troops || 0) * 0.5) return null;
+        return {
+          emoji: 21,
+          recipient: target.id,
+          reason: "disapproval at " + target.name,
+        };
+      },
+    },
+    {
+      id: "pleading",
+      // 🙏 — plea: we want an alliance but can't get one (incoming
+      // alliance requests are empty and we have fewer tiles than most).
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (world.totals.myShare >= 0.15) return null;
+        const anyAlly = world.everyone.some((p) => p && p.isAlly && !p.isMe);
+        if (anyAlly) return null;
+        const friend = world.everyone
+          .filter((p) => p && !p.isMe && !p.isEnemy)
+          .sort((a, b) => (b.troops || 0) - (a.troops || 0))[0];
+        if (!friend) return null;
+        return {
+          emoji: 18,
+          recipient: friend.id,
+          reason: "plea for ally " + friend.name,
+        };
+      },
+    },
+    {
+      id: "salute_victory",
+      // 🫡 — match end, we survived and rank matters (fires from
+      // handleMatchEnd via the goal-switch path, but also as a safety
+      // if we're the lone survivor mid-match).
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (world.totals.alivePlayers !== 1) return null;
+        return { emoji: 13, recipient: ALL_PLAYERS_RECIPIENT, reason: "last player standing" };
+      },
+    },
+    {
+      id: "open_palm_stop",
+      // ✋ — "STOP attacking me" broadcast when we've been under heavy
+      // pressure for a while.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        const pressure = me.incomingTroops / Math.max(1, me.troops);
+        if (pressure < 0.35) return null;
+        return {
+          emoji: 17,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "STOP pressure " + (pressure * 100).toFixed(0) + "%",
+        };
+      },
+    },
+    {
+      id: "bored",
+      // 🥱 — idle for 200+ ticks with nothing happening.
+      evaluate: (ctx) => {
+        if (runtime.planner.activeGoalId !== "IDLE") return null;
+        const world = runtime.world;
+        if (runtime.state.emoji.lastIdleSince < 0) {
+          runtime.state.emoji.lastIdleSince = world.tick;
+        }
+        if (world.tick - runtime.state.emoji.lastIdleSince < 200) return null;
+        runtime.state.emoji.lastIdleSince = world.tick;
+        return { emoji: 12, recipient: ALL_PLAYERS_RECIPIENT, reason: "bored" };
+      },
+    },
+    {
+      id: "hourglass_save",
+      // ⏳ — "give me time, I'm cooking."
+      evaluate: (ctx) => {
+        if (runtime.planner.activeGoalId !== "SAVE_FOR_HYDRO") return null;
+        return { emoji: 29, recipient: ALL_PLAYERS_RECIPIENT, reason: "saving for hydro" };
+      },
+    },
+    {
+      id: "warning_brewing",
+      // ⚠️ — warn a brewing invader that we see them.
+      evaluate: (ctx) => {
+        const brewing = (runtime.world.threats.brewingInvaders || [])[0];
+        if (!brewing) return null;
+        if (!brewing.id) return null;
+        return {
+          emoji: 34,
+          recipient: brewing.id,
+          reason: "warning brewing " + brewing.name,
+        };
+      },
+    },
+    {
+      id: "chicken_taunt",
+      // 🐔 — the dominant hostile is stronger than us but hasn't
+      // attacked — chicken.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        const target = pickDominantHostile();
+        if (!target) return null;
+        if (target.troops < me.troops * 1.3) return null;
+        if ((me.incomingTroops || 0) > 1000) return null;
+        if (runtime.world.tick < 500) return null;
+        return {
+          emoji: 58,
+          recipient: target.id,
+          reason: "chicken " + target.name,
+        };
+      },
+    },
+    {
+      id: "question_confused",
+      // ❓ — targeted by someone we don't border. Confused.
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        const targeters = playersTargetingMe(ctx.me);
+        if (targeters.size === 0) return null;
+        const adjIds = new Set(
+          (runtime.world.threats.adjacentEnemies || []).map((e) => e.smallID),
+        );
+        for (const sid of targeters) {
+          if (!adjIds.has(sid)) {
+            const entry = runtime.world.bySmallID.get(sid);
+            if (entry && entry.id) {
+              return {
+                emoji: 57,
+                recipient: entry.id,
+                reason: "random targeter " + entry.name,
+              };
+            }
+          }
+        }
+        return null;
+      },
+    },
+    {
+      id: "celebration_start",
+      // 😀 — first tick we're alive: friendly opening smile.
+      evaluate: (ctx) => {
+        if (!ctx.me) return null;
+        if (runtime.state.emoji.seenFirstSpawn) return null;
+        runtime.state.emoji.seenFirstSpawn = true;
+        return { emoji: 0, recipient: ALL_PLAYERS_RECIPIENT, reason: "hello world" };
+      },
+    },
+    {
+      id: "territory_shrinking",
+      // 😞 — we lost >20% of our territory over the last 400 ticks.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        const emoji = runtime.state.emoji;
+        if (emoji.peakTiles < 200) return null;
+        if (me.tiles >= emoji.peakTiles * 0.8) return null;
+        return {
+          emoji: 5,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "shrinking " + me.tiles + " / peak " + emoji.peakTiles,
+        };
+      },
+    },
+    {
+      id: "pleading_low_troops",
+      // 🥺 — troops ratio low and we have at least one ally.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (me.troopRatio > 0.2) return null;
+        const ally = pickStrongestAlly();
+        if (!ally) return null;
+        return { emoji: 6, recipient: ally.id, reason: "low troops plea" };
+      },
+    },
+    {
+      id: "mirv_public",
+      // ☢️ — radioactive warning broadcast when MIRV goal is active.
+      evaluate: (ctx) => {
+        if (runtime.planner.activeGoalId !== "MIRV_LAST_RESORT") return null;
+        return { emoji: 33, recipient: ALL_PLAYERS_RECIPIENT, reason: "MIRV incoming" };
+      },
+    },
+    {
+      id: "explosion_combat",
+      // 💥 — goal includes combat and we just sent an attack intent.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if ((me.outgoingAttacks || []).length < 2) return null;
+        return {
+          emoji: 31,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "multi-front attack",
+        };
+      },
+    },
+    {
+      id: "boat_away",
+      // ⛵ — we have at least one transport ship in flight.
+      evaluate: (ctx) => {
+        const me = ctx.me;
+        if (!me) return null;
+        const ships = safeCall(() => me.units(UnitType.TransportShip).length, 0);
+        if (ships === 0) return null;
+        return { emoji: 52, recipient: ALL_PLAYERS_RECIPIENT, reason: "boats out" };
+      },
+    },
+    {
+      id: "anchor_coastal",
+      // ⚓ — we have a port on the coast and a bordering enemy has one
+      // too. Acknowledge the naval standoff.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if ((me.structures[UnitType.Port] || 0) === 0) return null;
+        const adj = runtime.world.threats.adjacentEnemies || [];
+        const naval = adj.find(
+          (e) => e && (e.structures || {})[UnitType.Port] > 0,
+        );
+        if (!naval) return null;
+        return { emoji: 51, recipient: naval.id, reason: "naval standoff " + naval.name };
+      },
+    },
+    {
+      id: "pinch_small",
+      // 🤌 — secondary mapping: late-match ultra-precise attack; rare.
+      evaluate: (ctx) => {
+        const world = runtime.world;
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (world.totals.myShare < 0.08) return null;
+        if (world.totals.myShare > 0.12) return null;
+        return {
+          emoji: 23,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "small-but-dangerous",
+        };
+      },
+    },
+    {
+      id: "two_hands_offering",
+      // 🫴 — we have gold to spare and no enemy within 2x our troops.
+      evaluate: (ctx) => {
+        const me = ctx.worldMe;
+        if (!me) return null;
+        if (me.gold < 3_000_000) return null;
+        const hostile = pickDominantHostile();
+        if (hostile && hostile.troops > me.troops * 1.5) return null;
+        return {
+          emoji: 22,
+          recipient: ALL_PLAYERS_RECIPIENT,
+          reason: "offering gold (passive)",
+        };
+      },
+    },
+  ];
+
+  /**
+   * Capture a tiny snapshot of every other player's tiles/troops so we
+   * can detect per-tick transitions (eliminations, big swings) without
+   * scanning the world twice.
+   */
+  function capturePlayerSnapshot() {
+    const out = {};
+    const world = runtime.world;
+    if (!world) return out;
+    for (const entry of world.everyone || []) {
+      if (!entry) continue;
+      out[entry.smallID] = {
+        tiles: entry.tiles || 0,
+        troops: entry.troops || 0,
+      };
+    }
+    return out;
+  }
+
+  /**
+   * Per-tick emoji decision. Evaluates every rule in priority order;
+   * fires at most one emoji that satisfies (a) its own per-rule
+   * cooldown and (b) the global pacing cooldown.
+   */
+  function maybeEmitEmoji(me) {
+    if (!runtime.enabled) return false;
+    if (!runtime.state.emoji.enabled) return false;
+    if (!me) return false;
+    const world = runtime.world;
+    if (!world || !world.me) return false;
+    const tick = world.tick;
+
+    // Keep peak-tile memory updated regardless of cooldowns so the
+    // "shrinking" rule has a baseline once cooldowns clear.
+    if (world.me.tiles > runtime.state.emoji.peakTiles) {
+      runtime.state.emoji.peakTiles = world.me.tiles;
+    }
+    if (world.me.troops > runtime.state.emoji.peakTroops) {
+      runtime.state.emoji.peakTroops = world.me.troops;
+    }
+
+    if (tick - runtime.state.emoji.lastEmojiTick < EMOJI_GLOBAL_COOLDOWN_TICKS) {
+      return false;
+    }
+    if (tick - runtime.state.emoji.lastScanTick < EMOJI_SCAN_EVERY_TICKS) {
+      return false;
+    }
+    runtime.state.emoji.lastScanTick = tick;
+
+    const ctx = {
+      me,
+      worldMe: world.me,
+      prevSnapshot: runtime.state.emoji._prevPlayers || {},
+      prevSelfSnapshot: runtime.state.emoji._prevSelf || null,
+    };
+
+    for (const rule of EMOJI_RULES) {
+      let result = null;
+      try {
+        result = rule.evaluate(ctx);
+      } catch (err) {
+        // Detectors should never throw — but if one does, skip and keep going.
+        continue;
+      }
+      if (!result) continue;
+      if (
+        !Number.isInteger(result.emoji) ||
+        result.emoji < 0 ||
+        result.emoji >= FLATTENED_EMOJIS.length
+      ) {
+        continue;
+      }
+      if (!emojiRuleReady(result.emoji, tick)) continue;
+      if (!result.recipient) continue;
+      const fired = emitEmoji(result.emoji, result.recipient, result.reason || rule.id);
+      if (fired) {
+        // Update post-fire snapshot state.
+        runtime.state.emoji._prevPlayers = capturePlayerSnapshot();
+        runtime.state.emoji._prevSelf = {
+          tiles: world.me.tiles,
+          troops: world.me.troops,
+          gold: world.me.gold,
+        };
+        return true;
+      }
+    }
+
+    // No rule fired — still refresh per-tick memory so the next tick's
+    // detectors see up-to-date "prev" state.
+    runtime.state.emoji._prevPlayers = capturePlayerSnapshot();
+    runtime.state.emoji._prevSelf = {
+      tiles: world.me.tiles,
+      troops: world.me.troops,
+      gold: world.me.gold,
+    };
+    return false;
+  }
+
+  /**
+   * Fire a goal-switch emoji (if configured). Bypasses the global
+   * cooldown because a goal change is a discrete, high-signal event
+   * that deserves an instant reaction, but still respects per-emoji
+   * cooldown so we don't spam the same ⚠️ / ✋ / 💪 every 3s.
+   */
+  function emojiOnGoalSwitch(prev, next) {
+    if (!runtime.state.emoji.enabled) return;
+    const emojiIndex = GOAL_EMOJI[next];
+    if (emojiIndex === undefined) return;
+    const tick = safeCall(
+      () => runtime.hooks.gameView && runtime.hooks.gameView.ticks(),
+      0,
+    );
+    if (!emojiRuleReady(emojiIndex, tick)) return;
+    emitEmoji(emojiIndex, ALL_PLAYERS_RECIPIENT, "goal→" + next);
   }
 
   function sampleTilesForOwner(ownerSmallID, limit, options) {
@@ -5739,6 +7117,7 @@
       boats: getUnitEntityCount(me, UnitType.TransportShip),
       intentsSent: runtime.state.intentsSent,
       intentsConfirmed: runtime.state.intentsConfirmed,
+      emojisSent: runtime.state.emoji.totalEmojisSent,
     };
   }
 
@@ -7765,6 +9144,9 @@
       planner.activeGoalCreatedTick = tick;
       planner.activeGoalExpiresTick = tick + selection.spec.horizonTicks;
       planner.lastSwitchTick = tick;
+      // Emoji: announce the plan flip. Bypasses the global cooldown but
+      // still respects per-emoji cooldown via emojiOnGoalSwitch().
+      safeCall(() => emojiOnGoalSwitch(previous, selection.spec.id), null);
       // Track adoption history for match-end suspicion heuristics.
       if (runtime.rl && runtime.rl.tracking) {
         runtime.rl.tracking.goalsEverAdopted.add(selection.spec.id);
@@ -8194,6 +9576,21 @@
     });
     rlLog("match_end", summary);
 
+    // Emoji: podium reactions at match end. We fire the best-ranked
+    // emoji (🥇 / 🥈 / 🥉 or 🫡 for "survived") one last time before
+    // the socket drops. These bypass the emoji global cooldown the
+    // same way goal-switch emojis do.
+    safeCall(() => {
+      const me = getMyPlayer();
+      if (!me) return;
+      const place = finishPlaceEmoji(runtime.world.me);
+      if (place) {
+        emitEmoji(place.emoji, ALL_PLAYERS_RECIPIENT, place.reason);
+      } else if (runtime.world.me && runtime.world.me.tiles > 0) {
+        emitEmoji(13, ALL_PLAYERS_RECIPIENT, "salute at end");
+      }
+    }, null);
+
     // Best-effort persist. Never throw from here; localStorage is optional.
     safeCall(() => persistRlToStorage(), null);
   }
@@ -8265,6 +9662,12 @@
     classifyMapIfNeeded(me);
     maybePeriodicIntelLog();
     updateSnapshot(me, borderTiles);
+
+    // Emoji communication: react to the world we just modelled. Runs
+    // after world/threats/snapshot so every detector sees a consistent
+    // view, and BEFORE goal planning so the per-tick emoji reflects the
+    // *pre-decision* state ("I'm being attacked" before "I respond").
+    safeCall(() => maybeEmitEmoji(me), null);
 
     // RL decision logger: sample world/delta/threats and drain outcomes.
     // Runs BEFORE planner so we can emit "state at tick T" and then pair
@@ -9988,6 +11391,7 @@
               { label: "Border Tiles", value: String(stats.borderTiles) },
               { label: "Outgoing", value: String(stats.outgoingAttacks) },
               { label: "Incoming", value: String(stats.incomingAttacks) },
+              { label: "Emojis", value: String(stats.emojisSent || 0) },
             ]
           : [{ label: "Status", value: "no live player data" }],
       );
@@ -10880,6 +12284,32 @@
       debugFlags: runtime.debugFlags,
       rlDump: () => dumpRlJson(),
       rlDownload: () => downloadRlJson(),
+      // Emoji communication controls (see EMOJI_RULES + maybeEmitEmoji).
+      emoji: {
+        get enabled() {
+          return runtime.state.emoji.enabled;
+        },
+        set enabled(v) {
+          runtime.state.emoji.enabled = Boolean(v);
+        },
+        get totalSent() {
+          return runtime.state.emoji.totalEmojisSent;
+        },
+        get stats() {
+          return {
+            total: runtime.state.emoji.totalEmojisSent,
+            enabled: runtime.state.emoji.enabled,
+            perEmoji: Object.fromEntries(runtime.state.emoji.perEmojiLastTick),
+            lastEmojiTick: runtime.state.emoji.lastEmojiTick,
+          };
+        },
+        fire: (emojiIndex, recipient) =>
+          emitEmoji(
+            emojiIndex,
+            recipient || ALL_PLAYERS_RECIPIENT,
+            "manual",
+          ),
+      },
     };
     // Dedicated RL namespace for the downstream analyst + devtools use.
     // Safe to read/write from the console; `enable` / `disable` flip the
@@ -11010,6 +12440,17 @@
         maybeEmitPlannerDecision,
         rlLogIntentSent,
         rlLogIntentBlocked,
+        // Emoji module exports.
+        FLATTENED_EMOJIS,
+        EMOJI_RULES,
+        GOAL_EMOJI,
+        ALL_PLAYERS_RECIPIENT,
+        EMOJI_GLOBAL_COOLDOWN_TICKS,
+        EMOJI_PER_RULE_COOLDOWN_TICKS,
+        sendEmojiIntent,
+        emitEmoji,
+        maybeEmitEmoji,
+        emojiOnGoalSwitch,
       },
     };
     installWebSocketHook();
