@@ -10971,6 +10971,10 @@
         // defense/economy so we keep building cities + SAMs while waiting.
         if (!handled) handled = await maybeEconomy(me, getEnemies());
         if (!handled) handled = await maybeDiplomacy(me);
+        // Still expand into TerraNullius behind our prep work — more
+        // tiles means more population cap going into the expected
+        // invasion, which widens the maxTroops cushion.
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "DEFENSIVE_TURTLE":
         handled = await runGoal_DefensiveTurtle(me);
@@ -10986,6 +10990,11 @@
       case "SAM_WALL_BUILDUP":
         handled = await runGoal_SamWallBuildup(me);
         if (!handled) handled = await maybeDiplomacy(me);
+        // SAM construction is gold-rate-limited (up to 3M gold each).
+        // While waiting for the next SAM we should still grab any open
+        // TerraNullius adjacent to us — free land + free income with
+        // no opportunity cost (the SAM build doesn't need troops).
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "BETRAY_ALLY":
         handled = await runGoal_BetrayAlly(selectionContext);
@@ -11042,6 +11051,10 @@
         // builds to pass through maybeEconomy.
         handled = await maybeEconomy(me, getEnemies());
         if (!handled) handled = await maybeDiplomacy(me);
+        // We're banking gold, not troops. TerraNullius expansion
+        // commits troops but has flat mag/5 loss per tile and
+        // doesn't touch gold at all — strictly better than idling.
+        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "DEFENSE_NETWORK":
       case "IDLE":
