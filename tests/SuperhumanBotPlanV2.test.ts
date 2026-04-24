@@ -777,6 +777,128 @@ describe("Plan §8 — NUKE_CROWN trigger acceptance", () => {
   });
 });
 
+describe("Plan §2.10 — team-mode donation acceptance", () => {
+  it("donates to a struggling teammate with <0.25 ratio while we have surplus", () => {
+    const runtime = loadUserscript();
+    const { maybeDonateToStrugglingTeammate } = runtime.test.internals;
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = true;
+
+    // Observability: capture every intent we dispatch via the local
+    // bridge so we can assert the donate_troops intent was sent.
+    const donations: any[] = [];
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = {
+      send: (object: any) => {
+        if (object && object.intent && object.intent.type === "donate_troops") {
+          donations.push(object.intent);
+        }
+      },
+    };
+
+    // Stub me: 50% of max, above reserveRatio (0.35 → reserve 35k),
+    // so surplus = 50_000 - 35_000 = 15_000. 30% of 50_000 = 15_000.
+    // Expect donation of exactly 15_000 (= min(surplus, 0.3 * troops)).
+    const teammateEntry = {
+      isAlive: () => true,
+      smallID: () => 2,
+      isOnSameTeam: () => true,
+      incomingAttacks: () => [{ troops: () => 100 }],
+      outgoingAttacks: () => [],
+      troops: () => 15_000, // 0.15 of maxTroops 100k → below 0.25
+      id: () => "TEAM",
+      displayName: () => "Teammate",
+    };
+    const me = {
+      isAlive: () => true,
+      smallID: () => 1,
+      id: () => "ME",
+      troops: () => 50_000,
+      isFriendly: () => true,
+      isOnSameTeam: () => true,
+      displayName: () => "Me",
+    };
+    runtime.hooks.gameView = {
+      ticks: () => 100,
+      myPlayer: () => me,
+      playerViews: () => [me, teammateEntry],
+      config: () => ({
+        gameConfig: () => ({ gameMode: "Team" }),
+        maxTroops: () => 100_000,
+        isUnitDisabled: () => false,
+      }),
+    };
+    runtime.state.cooldowns.diplomacy = -999;
+
+    // world.me is checked implicitly via getMyLivingPlayer -> gameView.
+    // The helper uses me.isFriendly(ally), so the filter passes.
+    const fired = maybeDonateToStrugglingTeammate(me);
+    expect(fired).toBe(true);
+    expect(donations.length).toBe(1);
+    expect(donations[0]).toMatchObject({
+      type: "donate_troops",
+      recipient: "TEAM",
+    });
+    // 30% of 50_000 = 15_000. Surplus was also 15_000. Donation = 15_000.
+    expect(donations[0].troops).toBe(15_000);
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = false;
+  });
+
+  it("refuses to donate if no teammate is below the 0.25 ratio", () => {
+    const runtime = loadUserscript();
+    const { maybeDonateToStrugglingTeammate } = runtime.test.internals;
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = true;
+    const donations: any[] = [];
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = {
+      send: (object: any) => {
+        if (object && object.intent && object.intent.type === "donate_troops") {
+          donations.push(object.intent);
+        }
+      },
+    };
+
+    const healthyTeammate = {
+      isAlive: () => true,
+      smallID: () => 2,
+      isOnSameTeam: () => true,
+      incomingAttacks: () => [{ troops: () => 100 }],
+      outgoingAttacks: () => [],
+      troops: () => 40_000, // 0.4 of max — above 0.25 floor
+      id: () => "TEAM",
+      displayName: () => "Healthy",
+    };
+    const me = {
+      isAlive: () => true,
+      smallID: () => 1,
+      id: () => "ME",
+      troops: () => 50_000,
+      isFriendly: () => true,
+      isOnSameTeam: () => true,
+      displayName: () => "Me",
+    };
+    runtime.hooks.gameView = {
+      ticks: () => 100,
+      myPlayer: () => me,
+      playerViews: () => [me, healthyTeammate],
+      config: () => ({
+        gameConfig: () => ({ gameMode: "Team" }),
+        maxTroops: () => 100_000,
+        isUnitDisabled: () => false,
+      }),
+    };
+    runtime.state.cooldowns.diplomacy = -999;
+
+    const fired = maybeDonateToStrugglingTeammate(me);
+    expect(fired).toBe(false);
+    expect(donations.length).toBe(0);
+
+    (globalThis as any).window.__SUPERBOT_TEST_MODE = false;
+  });
+});
+
 describe("Plan §5 — spawn scorer synthetic scenarios", () => {
   // Build a tiny fake gameView that represents a 9×9 grid. Tiles with
   // id < landCount are land; everything else is water. circleSearch
