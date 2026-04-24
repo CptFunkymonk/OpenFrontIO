@@ -7507,10 +7507,14 @@
       if (entry.type === PlayerType.Bot) continue;
       const theirTroops = Number(entry.troops) || 0;
       const ratio = theirTroops / myTroops;
-      // Plan §2.4: if THIS enemy is already committing troops to an
-      // outgoing attack against someone else, they can't fully focus
-      // on us right now, so keep the default 2.5× threshold. If they
-      // have no outgoing commitments, lower the threshold to 2.0×.
+      // Plan §2.4: "focused" means the enemy can dump everything on us.
+      // Two ways they're NOT focused:
+      //   (a) they have outgoing troops attacking someone else, or
+      //   (b) they have inbound attacks from third parties, pinning
+      //       their own reserve on defense.
+      // Either case keeps the default 2.5× stall threshold. Otherwise
+      // we use the tighter 2.0× "focused" threshold because they're
+      // free to roll their whole army at us.
       const outgoingTroops =
         Number(entry.outgoingTroops) ||
         (Array.isArray(entry.outgoingAttacks)
@@ -7519,7 +7523,15 @@
               0,
             )
           : 0);
-      const focused = outgoingTroops <= 0;
+      const incomingTroops =
+        Number(entry.incomingTroops) ||
+        (Array.isArray(entry.incomingAttacks)
+          ? entry.incomingAttacks.reduce(
+              (sum, a) => sum + (Number(safeCall(() => a.troops(), 0)) || 0),
+              0,
+            )
+          : 0);
+      const focused = outgoingTroops <= 0 && incomingTroops <= 0;
       const threshold = focused
         ? INVASION_STALL_FOCUSED_RATIO
         : INVASION_STALL_TROOP_RATIO;

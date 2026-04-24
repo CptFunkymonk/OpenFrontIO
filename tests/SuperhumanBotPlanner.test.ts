@@ -1533,7 +1533,8 @@ describe("tampermonkey-superhuman-bot invasion-defense stall", () => {
     const me = { troops: 10_000 };
 
     // Focused enemy at 2.49× — fires at the focused threshold because
-    // they have no outgoing commitments.
+    // they have no outgoing commitments and nobody else is pinning
+    // them defensively.
     const focusedOver = computeOverwhelmingNeighbor(me, [
       {
         smallID: 7,
@@ -1542,6 +1543,7 @@ describe("tampermonkey-superhuman-bot invasion-defense stall", () => {
         isFriendly: false,
         troops: 24_900,
         outgoingTroops: 0,
+        incomingTroops: 0,
       },
     ]);
     expect(focusedOver).not.toBeNull();
@@ -1557,9 +1559,51 @@ describe("tampermonkey-superhuman-bot invasion-defense stall", () => {
         isFriendly: false,
         troops: 19_900,
         outgoingTroops: 0,
+        incomingTroops: 0,
       },
     ]);
     expect(focusedUnder).toBeNull();
+  });
+
+  it("2.5x default threshold applies when the enemy is pinned by incoming attacks from others", () => {
+    const runtime = loadUserscript();
+    const {
+      computeOverwhelmingNeighbor,
+      INVASION_STALL_TROOP_RATIO,
+      PlayerType,
+    } = runtime.test.internals;
+    const me = { troops: 10_000 };
+
+    // 2.49× enemy but they're being attacked by a third party →
+    // they can't fully commit against us, so the 2.5× default holds
+    // (and 2.49× is under the default → no stall).
+    const pinned = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 7,
+        name: "Pinned",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 24_900,
+        outgoingTroops: 0,
+        incomingTroops: 30_000, // third-party pressure
+      },
+    ]);
+    expect(pinned).toBeNull();
+
+    // Same pinned enemy at 2.51× — now over the default threshold.
+    const pinnedOver = computeOverwhelmingNeighbor(me, [
+      {
+        smallID: 7,
+        name: "Pinned",
+        type: PlayerType.Human,
+        isFriendly: false,
+        troops: 25_100,
+        outgoingTroops: 0,
+        incomingTroops: 30_000,
+      },
+    ]);
+    expect(pinnedOver).not.toBeNull();
+    expect(pinnedOver.threshold).toBe(INVASION_STALL_TROOP_RATIO);
   });
 
   it("computeOverwhelmingNeighbor picks the worst ratio across multiple enemies", () => {
