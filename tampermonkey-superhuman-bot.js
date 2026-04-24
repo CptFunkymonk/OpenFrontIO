@@ -5624,18 +5624,19 @@
     const candidateTiles = getOwnedCandidateTiles(me, 20);
     let order = buildOrderForArchetype(runtime.world.archetype);
 
-    // Plan §2.9 — port-chain precedence. When we have coast and fewer
-    // than 3 ports standing, put Port ahead of *every* other structure
-    // (including City) for this pass. Rationale: trade-ship gold
-    // compounds via proximityBonusPortsNb, and a port pays its own
-    // 125k cost back faster than a 3rd city does while directly
-    // unlocking naval expansion. Only re-ordered when hasCoast is
-    // meaningful; landlocked archetypes are unaffected.
+    // Plan §2.9 — port-chain precedence. Plan wording: "prioritise
+    // ports even over the 3rd city." Cities 1 and 2 still come first
+    // (each city dumps +250k onto maxTroops, which is more than the
+    // marginal gold per tick we'd get from a port early on). Past the
+    // 2nd city the next 125k is better spent on a port: trade-ship
+    // gold compounds via proximityBonusPortsNb, and a port pays back
+    // its own cost faster than a 3rd city of equivalent price.
     const hasCoast = runtime.state.borderCache.tiles.some((tile) =>
       safeCall(() => getGameView().isOceanShore(tile), false),
     );
     const portCount = getUnitLevelCount(me, UnitType.Port);
-    if (hasCoast && portCount < 3) {
+    const cityCount = getUnitLevelCount(me, UnitType.City);
+    if (hasCoast && portCount < 3 && cityCount >= 2) {
       const reordered = [UnitType.Port];
       for (const t of order) {
         if (t !== UnitType.Port) reordered.push(t);
