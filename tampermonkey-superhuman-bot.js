@@ -6469,7 +6469,27 @@
 
     if (!sendBreakAlliance(target.id)) return false;
     recordAllianceBreak();
-    const troops = Math.floor(me.troops * 0.6);
+    // Plan §2.3: use the engine-anchored calculator. The betrayal
+    // target is HELPLESS (troops < 35% of ours per
+    // HELPLESS_TROOP_ADVANTAGE) so calculateAttackTroops will almost
+    // always return the ideal 85% commit. We still fall back to the
+    // original 60%-of-me heuristic if the calculator declines so
+    // we don't waste the alliance break.
+    const gameView = getGameView();
+    const myLiving = getMyLivingPlayer();
+    const maxTroops = gameView && myLiving
+      ? gameView.config().maxTroops(myLiving)
+      : 0;
+    const saturated =
+      myLiving && maxTroops > 0
+        ? calculateAttackTroops(
+            myLiving,
+            target.player,
+            computeReserveRatio(myLiving, maxTroops),
+            maxTroops,
+          )
+        : 0;
+    const troops = saturated > 0 ? saturated : Math.floor(me.troops * 0.6);
     if (troops > 0) sendAttack(target.id, troops);
     runtime.state.cooldowns.betray = tick;
     runtime.state.cooldowns.combat = tick;
