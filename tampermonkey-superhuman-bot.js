@@ -9889,7 +9889,12 @@
         const me = world.me;
         if (!me) return { valid: false };
         const share = world.totals.myShare;
-        if (share < 0.25 || share > 0.3) return { valid: false };
+        // Plan §2.5: we need 2 SAMs BY the time we reach 25%. Start
+        // the dedicated wall-buildup goal at 0.20 so a full 30s SAM
+        // construction fits inside the 0.20-0.25 window. Shut the
+        // goal off at 0.35 (was 0.30) since the crown-era turtle/
+        // DEFENSE_NETWORK goals take over past that.
+        if (share < 0.2 || share > 0.35) return { valid: false };
         const cityCount = me.structures[UnitType.City] || 0;
         const samCount = me.structureLevels[UnitType.SAMLauncher] || 0;
         const targetSams = Math.max(2, Math.floor(cityCount * 0.5));
