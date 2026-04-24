@@ -9563,9 +9563,12 @@
         // guarantee ≥1 warhead lands unless the crown has SAM level 5+,
         // in which case we shouldn't be nuking yet anyway.
         if (mySilos.length < 3) return { valid: false };
+        // Plan §2.7: elevated above base NUKE_CROWN (84) so that when
+        // the crown already has SAMs up, the multi-warhead ripple wins
+        // over a lone atom that the SAM will just swat.
         return {
           valid: true,
-          priority: 80,
+          priority: 85,
           note: "overwhelm " + enemySams.length + " SAMs on " + topHostile.name,
         };
       },
@@ -12869,8 +12872,11 @@
         secondShare: 0.2,
       },
     });
-    scenario5a.me.gold = 2_000_000;
-    scenario5a.me.structures[UnitType.MissileSilo] = 2;
+    // Plan §2.7: SAM_OVERWHELM now requires gold >= 3x ATOM and 3
+    // ready silos. A single-silo ripple vs SAM-2 loses both warheads
+    // to sequential reloads; 3 silos guarantee at least one lands.
+    scenario5a.me.gold = 3_000_000;
+    scenario5a.me.structures[UnitType.MissileSilo] = 3;
     scenario5a.threats.crown = {
       smallID: 2,
       name: "Crown",
@@ -12888,12 +12894,12 @@
       },
     };
     scenario5a.threats.crownSmallID = 2;
-    // Need 2 ready silos to pass the gate.
+    // Plan §2.7: 3 ready silos to pass the gate.
     step(
       "SAM_OVERWHELM triggers with silos+gold+enemy SAMs",
       scenario5a,
       "SAM_OVERWHELM",
-      2,
+      3,
     );
 
     // Scenario 5: coalition dominant + MIRV gold -> MIRV_LAST_RESORT.
@@ -13061,8 +13067,14 @@
       pass: preBudget === false && postBudget === true,
     });
     // Reset the mutated state so we don't leak into later tests.
+    // recordAllianceBreak() also arms the traitor-window planner lock
+    // (Plan §2.8) which would otherwise force every subsequent
+    // scenario's selection to DEFENSIVE_TURTLE.
     runtime.state.recentAllianceBreakTicks = [];
     runtime.state.cooldowns.allianceBreak = -999;
+    runtime.planner.forcedGoalId = null;
+    runtime.planner.forcedGoalExpiresMs = 0;
+    runtime.state.traitorLockActive = false;
 
     // Scenario 12: unsafe-to-break when under heavy attack.
     const scenario12 = buildTestWorld();
@@ -13537,6 +13549,13 @@
         isTileNearHumanBorder,
         filterHumanBorderTiles,
         shouldBuildType,
+        // Plan §2.3 / §2.2 / §2.10 helpers exposed for unit tests.
+        calculateAttackTroops,
+        openingDiplomacyBlast,
+        maybeDonateToStrugglingTeammate,
+        perimeterToAreaRatio,
+        corridorCount,
+        gaussianEnemyClusterPenalty,
         sendRawMessage,
         installLocalTransportBridge,
         handleServerMessage,

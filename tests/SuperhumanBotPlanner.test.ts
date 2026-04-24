@@ -274,13 +274,15 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     expect(portIdx).toBeLessThan(dpIdx);
   });
 
-  it("builds more cities at higher tile counts (1 city per ~2500 tiles)", () => {
+  it("builds more cities at higher tile counts (1 city per ~1800 tiles, floor 4)", () => {
     const runtime = loadUserscript();
     const { shouldBuildType, UnitType } = runtime.test.internals;
     installEmptyGameView(runtime);
     setWorldAdjacent(runtime, []);
 
-    // 5000 tiles -> expect target of at least 3 cities.
+    // Plan §2.5: cityTarget = max(4, floor(tiles/1800)). Below the floor
+    // of 4, the target is always 4, so any player with < 4 cities at
+    // any tile count wants another city.
     const player = me({
       numTilesOwned: () => 5000,
       totalUnitLevels: (t: any) => (t === UnitType.City ? 2 : 0),
@@ -288,7 +290,8 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     });
     expect(shouldBuildType(UnitType.City, player, [])).toBe(true);
 
-    // 10_000 tiles with 3 cities -> still need more (target floor(10000/2500)=4).
+    // 10_000 tiles with 3 cities -> still need more (target
+    // max(4, floor(10000/1800)) = 5).
     const bigPlayer = me({
       numTilesOwned: () => 10_000,
       totalUnitLevels: (t: any) => (t === UnitType.City ? 3 : 0),
@@ -296,13 +299,22 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     });
     expect(shouldBuildType(UnitType.City, bigPlayer, [])).toBe(true);
 
-    // 10_000 tiles with 4 cities -> target met.
+    // 10_000 tiles with 5 cities -> target met (target = 5).
     const metPlayer = me({
       numTilesOwned: () => 10_000,
-      totalUnitLevels: (t: any) => (t === UnitType.City ? 4 : 0),
+      totalUnitLevels: (t: any) => (t === UnitType.City ? 5 : 0),
       units: () => [],
     });
     expect(shouldBuildType(UnitType.City, metPlayer, [])).toBe(false);
+
+    // 3500 tiles, floor kicks in: target = max(4, floor(3500/1800)) = 4.
+    // With 4 cities at 3500 tiles we should be done.
+    const floorMetPlayer = me({
+      numTilesOwned: () => 3500,
+      totalUnitLevels: (t: any) => (t === UnitType.City ? 4 : 0),
+      units: () => [],
+    });
+    expect(shouldBuildType(UnitType.City, floorMetPlayer, [])).toBe(false);
   });
 
   it("blocks DefensePost builds when no adjacent Human is around, even with enemies present", () => {
