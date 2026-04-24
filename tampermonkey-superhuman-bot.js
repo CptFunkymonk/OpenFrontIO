@@ -8239,9 +8239,15 @@
     });
 
     let dispatched = 0;
-    // Cap to 4 requests per blast so we don't stand out to the anti-
-    // spam heuristics of tightly-gated servers.
-    for (const c of candidates.slice(0, 4)) {
+    // Cap to ALLIANCE_CAP + 1 = 3 requests per blast. Rationale:
+    //   - ALLIANCE_CAP (2) is the effective mid-game alliance target
+    //     we plan for; accepting more just forces break/churn.
+    //   - Adding +1 covers the common case where one of the nearest
+    //     humans ignores the request, so a backup still exists.
+    //   - 3 is low enough to stay under the anti-spam heuristics of
+    //     tightly-gated servers.
+    const blastCap = ALLIANCE_CAP + 1;
+    for (const c of candidates.slice(0, blastCap)) {
       const smallID = safeCall(() => c.player.smallID(), -1);
       if (smallID < 0) continue;
       if (blastState.sentToSmallIDs.has(smallID)) continue;
