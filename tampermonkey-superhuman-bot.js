@@ -5351,13 +5351,19 @@
     );
     const dpUnlock = adjacentHuman || adjacentStrongNation;
 
-    // Plan §2.5: force at least 2 SAMs once we pass 25% map share,
-    // regardless of archetype coefficient. Coalition insurance against
-    // late-game nuke strikes; SAM range grows with level and level-1
-    // already covers 70 tiles.
+    // Plan §2.5: force at least 2 SAMs by the time we reach 25% map
+    // share, regardless of archetype coefficient. Coalition insurance
+    // against late-game nuke strikes; SAM range grows with level and
+    // level-1 already covers 70 tiles.
+    //
+    // A SAM takes 30s of construction (SAM_CONSTRUCTION_TICKS = 300)
+    // and costs up to 3M gold. Starting the floor at 20% share gives
+    // us ~5% of map share of breathing room to queue two launchers
+    // before the nuke window opens; waiting for 25% to even ATTEMPT
+    // the build means we are chronically late with SAM cover.
     const myShare =
       (runtime.world.totals && runtime.world.totals.myShare) || 0;
-    const samMin = myShare >= 0.25 ? 2 : 0;
+    const samMin = myShare >= 0.2 ? 2 : 0;
     const samTarget = Math.max(samMin, Math.floor(cities * samCoef));
 
     switch (type) {

@@ -203,6 +203,58 @@ describe("shouldBuildType(Port) — coastal force-unlock", () => {
     expect(shouldBuildType(UnitType.Port, player3, [])).toBe(false);
   });
 
+  it("forces SAMLauncher floor of 2 once myShare >= 0.20 (Plan §2.5)", () => {
+    const runtime = loadUserscript();
+    const { shouldBuildType, UnitType } = runtime.test.internals;
+    stubGameView(runtime);
+
+    // Helper to prime world.totals.myShare for the scorer.
+    function primeShare(share: number) {
+      runtime.world = {
+        ...runtime.world,
+        archetype: "CONTINENTAL",
+        totals: {
+          ...(runtime.world?.totals ?? {}),
+          myShare: share,
+        },
+        threats: {
+          ...(runtime.world?.threats ?? {}),
+          adjacentEnemies: [],
+        },
+      };
+    }
+
+    const player = (samCount: number) => ({
+      numTilesOwned: () => 5_000,
+      totalUnitLevels: (t: any) =>
+        t === UnitType.City
+          ? 4
+          : t === UnitType.SAMLauncher
+            ? samCount
+            : 0,
+      units: () => [],
+    });
+
+    // Below the floor threshold: only archetype coef applies.
+    // CONTINENTAL samCoef = 0.25, 4 cities → floor(4 * 0.25) = 1.
+    // So with samCount=0 we should want one; at 1 we stop.
+    primeShare(0.1);
+    expect(shouldBuildType(UnitType.SAMLauncher, player(0), [])).toBe(true);
+    expect(shouldBuildType(UnitType.SAMLauncher, player(1), [])).toBe(false);
+
+    // At myShare >= 0.20 the forced floor of 2 kicks in even though
+    // the archetype coef says we'd stop at 1.
+    primeShare(0.2);
+    expect(shouldBuildType(UnitType.SAMLauncher, player(1), [])).toBe(true);
+    expect(shouldBuildType(UnitType.SAMLauncher, player(2), [])).toBe(false);
+
+    // Well past the floor — still capped at 2 when archetype coef
+    // would allow only 1.
+    primeShare(0.35);
+    expect(shouldBuildType(UnitType.SAMLauncher, player(1), [])).toBe(true);
+    expect(shouldBuildType(UnitType.SAMLauncher, player(2), [])).toBe(false);
+  });
+
   it("does not unlock Port when we have no coastline", () => {
     const runtime = loadUserscript();
     const { shouldBuildType, UnitType } = runtime.test.internals;
