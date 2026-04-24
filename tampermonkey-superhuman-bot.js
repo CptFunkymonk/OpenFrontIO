@@ -6785,7 +6785,16 @@
     if (!attackerEntry) return false;
 
     const maxTroops = gameView.config().maxTroops(me);
-    const reserveRatio = Math.max(0.1, computeReserveRatio(me, maxTroops) - 0.1);
+    // Plan §2.3: retaliation should commit everything above a minimal
+    // floor. Cap reserveRatio by half our current troop ratio so an
+    // early-game player whose baseReserve is 0.55 doesn't silently
+    // fail to counter-attack. At 20k/100k we'd demand 0.1*max = 10k
+    // reserve \u2192 available = 10k \u2192 viable retaliatory push.
+    const currentRatioRet = maxTroops > 0 ? me.troops() / maxTroops : 0;
+    const reserveRatio = Math.min(
+      Math.max(0.08, currentRatioRet * 0.5),
+      Math.max(0.1, computeReserveRatio(me, maxTroops) - 0.1),
+    );
     const troops = calculateAttackTroops(me, attacker, reserveRatio, maxTroops, {
       retaliating: true,
     });
@@ -7020,9 +7029,13 @@
       // almost everything on the counter than let the incoming attack
       // stack our border. The AttackExecution combines vs-subtracts logic
       // means every troop we commit back directly eats their attack.
-      const reserveRatio = Math.max(
-        0.05,
-        computeReserveRatio(me, maxTroops) - 0.22,
+      // Plan §2.3 reserve cap: never demand more reserve than half
+      // our current troop ratio so early-game invaders don't get a
+      // free pass because our baseReserve > current army size.
+      const currentRatioRepel = maxTroops > 0 ? me.troops() / maxTroops : 0;
+      const reserveRatio = Math.min(
+        Math.max(0.05, currentRatioRepel * 0.5),
+        Math.max(0.05, computeReserveRatio(me, maxTroops) - 0.22),
       );
       // Prefer the troops-per-hit size the server will actually deal;
       // calculateAttackTroops already clamps to deployable budget.
