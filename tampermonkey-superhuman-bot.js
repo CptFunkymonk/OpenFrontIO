@@ -5499,6 +5499,10 @@
     const gameView = getGameView();
     if (!gameView || !me) return false;
     const mySmallID = me.smallID();
+    // Plan §2.5: Nations also justify DPs when they are
+    // significantly stronger than us. 1.25x mirrors the threshold
+    // in shouldBuildType for consistency.
+    const myTroops = safeCall(() => me.troops(), 1) || 1;
 
     const seen = new Set();
     for (const neighbor of gameView.circleSearch(tile, radius)) {
@@ -5508,9 +5512,13 @@
       seen.add(ownerID);
       const owner = safeCall(() => gameView.playerBySmallID(ownerID), null);
       if (!owner || !safeCall(() => owner.isPlayer(), false)) continue;
-      if (safeCall(() => owner.type(), null) !== PlayerType.Human) continue;
       if (safeCall(() => me.isFriendly(owner), false)) continue;
-      return true;
+      const ownerType = safeCall(() => owner.type(), null);
+      if (ownerType === PlayerType.Human) return true;
+      if (ownerType === PlayerType.Nation) {
+        const theirTroops = safeCall(() => owner.troops(), 0) || 0;
+        if (theirTroops > myTroops * 1.25) return true;
+      }
     }
     return false;
   }

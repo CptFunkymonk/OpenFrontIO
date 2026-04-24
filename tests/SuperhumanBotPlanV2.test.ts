@@ -238,6 +238,46 @@ describe("shouldBuildType(Port) — coastal force-unlock", () => {
     expect(shouldBuildType(UnitType.Port, player3, [])).toBe(false);
   });
 
+  it("allows DP placement against a strong Nation border (Plan §2.5)", () => {
+    // isTileNearHumanBorder used to be human-only; Plan §2.5 extended
+    // DP unlock to strong Nations (troops > 1.25x ours). The border
+    // filter must match or the DP build never finds a legal tile.
+    const runtime = loadUserscript();
+    const { internals } = runtime.test;
+    const { isTileNearHumanBorder, PlayerType } = internals;
+
+    // Fake gameView: ownerID of tile 1 == 2, owner = strong Nation.
+    const ownerStub = {
+      isPlayer: () => true,
+      type: () => PlayerType.Nation,
+      troops: () => 150_000,
+    };
+    runtime.hooks.gameView = {
+      ticks: () => 100,
+      myPlayer: () => null,
+      circleSearch: (_tile: number, _r: number) => [1],
+      ownerID: () => 2,
+      playerBySmallID: () => ownerStub,
+    };
+
+    const me = {
+      smallID: () => 1,
+      troops: () => 50_000, // Nation has 3x us → qualifies
+      isFriendly: () => false,
+    };
+    expect(isTileNearHumanBorder(me, 1)).toBe(true);
+
+    // Same Nation with only 1x our troops — no DP justification.
+    const weakOwner = { ...ownerStub, troops: () => 50_000 };
+    runtime.hooks.gameView.playerBySmallID = () => weakOwner;
+    expect(isTileNearHumanBorder(me, 1)).toBe(false);
+
+    // Strong Bot: still rejected, only Nations/Humans qualify.
+    const botOwner = { ...ownerStub, type: () => PlayerType.Bot };
+    runtime.hooks.gameView.playerBySmallID = () => botOwner;
+    expect(isTileNearHumanBorder(me, 1)).toBe(false);
+  });
+
   it("forces SAMLauncher floor of 2 once myShare >= 0.20 (Plan §2.5)", () => {
     const runtime = loadUserscript();
     const { shouldBuildType, UnitType } = runtime.test.internals;
