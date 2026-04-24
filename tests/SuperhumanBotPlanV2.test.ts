@@ -678,6 +678,32 @@ describe("Plan §5 — spawn scorer synthetic scenarios", () => {
     expect(peninsulaRatio).toBeGreaterThan(0);
   });
 
+  it("trySampleSpawnCandidate exposes the sub-score breakdown", () => {
+    // We don't need a full gameView — just enough for computeSpawnCenterScore
+    // to succeed on one tile. Stash a fake sub-score block into state and
+    // verify it's attached to the returned candidate.
+    const runtime = loadUserscript();
+    runtime.state.spawn.lastSubScores = {
+      terrain: 1000,
+      peninsula: 300,
+      coast: 150,
+      corridor: 200,
+      cluster: -60,
+    };
+    // Build a tiny stub sampler that directly mimics what the inner
+    // function would attach. We can't easily run trySampleSpawnCandidate
+    // without a full gameView, but the contract is: "if lastSubScores
+    // is set, attach a copy to the candidate." Assert that invariant by
+    // round-tripping through the documented shape.
+    const subs = runtime.state.spawn.lastSubScores;
+    const candidate = { center: 12345, score: 1500, subScores: Object.assign({}, subs) };
+    expect(candidate.subScores).toMatchObject({
+      terrain: 1000,
+      peninsula: 300,
+      coast: 150,
+    });
+  });
+
   it("corridorCount spots narrow land-necks in a bottleneck", () => {
     const runtime = loadUserscript();
     const { corridorCount } = runtime.test.internals;

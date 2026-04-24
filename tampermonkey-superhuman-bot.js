@@ -1609,12 +1609,23 @@
     if (sorted) {
       for (let i = 0; i < Math.min(10, sorted.length); i++) {
         const cand = sorted[i];
-        top.push({
+        const entry = {
           tile: cand.center,
           x: safeCall(() => gv.x(cand.center), null),
           y: safeCall(() => gv.y(cand.center), null),
           score: Number((cand.score || 0).toFixed(2)),
-        });
+        };
+        // Plan §2.1 acceptance: include per-feature sub-score
+        // breakdown for the top candidates so the analyst can see
+        // which component drove each pick.
+        if (cand.subScores) {
+          const rounded = {};
+          for (const key of Object.keys(cand.subScores)) {
+            rounded[key] = Number((cand.subScores[key] || 0).toFixed(2));
+          }
+          entry.subScores = rounded;
+        }
+        top.push(entry);
       }
     }
     rlLog("spawn_decision", {
@@ -1623,6 +1634,29 @@
       topCandidates: top,
       candidateCount: sorted ? sorted.length : 0,
     });
+    // Also surface a one-line console summary so devs without the RL
+    // dump can eyeball the pick reason at a glance.
+    if (top.length > 0 && top[0]) {
+      const chosen = top[0];
+      const subs = chosen.subScores || {};
+      const driver = Object.entries(subs)
+        .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+        .slice(0, 3)
+        .map(([k, v]) => k + "=" + (v >= 0 ? "+" : "") + v)
+        .join(" ");
+      botLog(
+        "spawn pick (" +
+          mode +
+          ") (" +
+          chosen.x +
+          "," +
+          chosen.y +
+          ") score " +
+          chosen.score +
+          " | top: " +
+          driver,
+      );
+    }
   }
 
   function sendAttack(targetID, troops) {
@@ -3644,26 +3678,51 @@
 
     const terrainPoints =
       plains * 1000 + highland * 100 + mountain + spawnTiles.length;
-    const strategic =
-      localOpen * 2 +
-      flood * 3 +
-      frontier * 5 +
-      elev * 0.8 +
+    // Plan §2.1 acceptance: break out each term so the analyst can see
+    // *why* a spawn was picked. Each field is the signed final
+    // contribution (positive = bonus, negative = penalty). Stashed on
+    // runtime.state.spawn.lastSubScores so trySampleSpawnCandidate can
+    // attach it to the candidate record without changing the function
+    // return shape (the score is still a single number).
+    const subScores = {
+      terrain: terrainPoints * 1.5,
+      localOpen: localOpen * 2,
+      flood: flood * 3,
+      frontier: frontier * 5,
+      elev: elev * 0.8,
       // Plan §2.1.7: coast weight bumped 120 → 150. Ports pay back
       // their 125k cost in 5-10 trade-ship cycles and then compound.
-      coast * 150 +
-      choke * 40 +
+      coast: coast * 150,
+      choke: choke * 40,
       // Plan §2.1.3/4/5: peninsula shape, narrow-neck count, and
       // Gaussian enemy-cluster distance. These three terms together
       // account for the bulk of "pick the defensible coastal spot".
-      peninsulaScore * 300 +
-      corridorScore * 200 -
-      clusterPenalty * 600 -
-      ownedPenalty -
-      oceanPenalty -
-      enemyPenalty * 4 -
-      falloutNearby * 300;
-    return terrainPoints * 1.5 + strategic;
+      peninsula: peninsulaScore * 300,
+      corridor: corridorScore * 200,
+      cluster: -clusterPenalty * 600,
+      owned: -ownedPenalty,
+      ocean: -oceanPenalty,
+      enemyProx: -enemyPenalty * 4,
+      fallout: -falloutNearby * 300,
+    };
+    const strategic =
+      subScores.localOpen +
+      subScores.flood +
+      subScores.frontier +
+      subScores.elev +
+      subScores.coast +
+      subScores.choke +
+      subScores.peninsula +
+      subScores.corridor +
+      subScores.cluster +
+      subScores.owned +
+      subScores.ocean +
+      subScores.enemyProx +
+      subScores.fallout;
+    if (runtime.state && runtime.state.spawn) {
+      runtime.state.spawn.lastSubScores = subScores;
+    }
+    return subScores.terrain + strategic;
   }
 
   function trySampleSpawnCandidate(gameView) {
@@ -3673,7 +3732,13 @@
     const center = gameView.ref(x, y);
     const score = computeSpawnCenterScore(gameView, center);
     if (score === null) return null;
-    return { center, score };
+    // Plan §2.1 acceptance: capture the sub-score breakdown alongside
+    // the aggregate so rlLogSpawnDecision can surface it.
+    const lastSubs = runtime.state.spawn.lastSubScores;
+    const subScores = lastSubs
+      ? Object.assign({}, lastSubs)
+      : null;
+    return { center, score, subScores };
   }
 
   function rememberSpawnCandidate(entry) {
