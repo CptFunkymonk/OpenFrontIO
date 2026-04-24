@@ -5207,32 +5207,57 @@
     const siloCoef = archetype === "NUKE_RACE" ? 0.3 : 0.22;
     const siloCap = archetype === "NUKE_RACE" ? 4 : 3;
 
-    // Aggressive city cadence — one city per ~2500 owned tiles (was 3500),
-    // minimum of 3 so we don't get stuck with 2 cities forever. Cities
-    // drive maxTroops (population cap), so bumping this directly helps us
-    // keep pace on population.
-    const cityTarget = Math.max(3, Math.floor(me.numTilesOwned() / 2500));
+    // Plan §2.5: city-first cadence. Cities are the #1 lever for
+    // maxTroops growth: +1 L1 city = +250k population cap, which
+    // dominates the `2*(tiles^0.6 * 1000 + 50000)` term past ~4k tiles.
+    // Target floor raised from 3 to 4 so we always plan for a 4th
+    // city once affordable; divisor tightened from 2500 to 1800 so
+    // we scale city count with the map share faster.
+    const cityTarget = Math.max(4, Math.floor(me.numTilesOwned() / 1800));
     // Don't start building DefensePosts until our city count has caught
     // up to the cadence target. Defends cities first, bunkers second.
     const dpCityGate = Math.max(2, Math.floor(cityTarget * 0.66));
-    // Require at least one *Human* adjacent enemy for DPs to unlock.
-    // Nations / Bots (tribes) don't pressure the border in a way that
-    // DefensePosts meaningfully counter, and in our tests bunkering those
-    // borders drains gold that should be building cities.
-    const adjacentHuman = (runtime.world.threats.adjacentEnemies || []).some(
+    // Plan §2.5: DPs unlock against any adjacent Human OR against an
+    // adjacent Nation that is significantly stronger than us (e.g.
+    // Impossible-difficulty nations). Previously DPs were Human-only
+    // and Impossible Nations steamrolled us because the border never
+    // got the defensePostDefenseBonus (5x mag, 3x speed).
+    const adj = runtime.world.threats.adjacentEnemies || [];
+    const myTroops = safeCall(() => me.troops(), 1) || 1;
+    const adjacentHuman = adj.some(
       (e) => e && e.type === PlayerType.Human && !e.isFriendly,
     );
+    const adjacentStrongNation = adj.some(
+      (e) =>
+        e &&
+        e.type === PlayerType.Nation &&
+        !e.isFriendly &&
+        (e.troops || 0) > myTroops * 1.25,
+    );
+    const dpUnlock = adjacentHuman || adjacentStrongNation;
+
+    // Plan §2.5: force at least 2 SAMs once we pass 25% map share,
+    // regardless of archetype coefficient. Coalition insurance against
+    // late-game nuke strikes; SAM range grows with level and level-1
+    // already covers 70 tiles.
+    const myShare =
+      (runtime.world.totals && runtime.world.totals.myShare) || 0;
+    const samMin = myShare >= 0.25 ? 2 : 0;
+    const samTarget = Math.max(samMin, Math.floor(cities * samCoef));
 
     switch (type) {
       case UnitType.City:
         return count < cityTarget;
       case UnitType.Factory:
+        // Gate factories behind hitting the city target in non-ISLAND
+        // archetypes. On ISLAND we need the gold stream early.
+        if (archetype !== "ISLAND" && cities < cityTarget) return false;
         return count < Math.max(1, Math.floor(cities * factoryCoef));
       case UnitType.Port:
         return hasCoast && count < Math.max(1, Math.floor(cities * portCoef));
       case UnitType.DefensePost:
         return (
-          adjacentHuman &&
+          dpUnlock &&
           cities >= dpCityGate &&
           count < Math.max(1, Math.floor(cities * dpCoef))
         );
@@ -5243,7 +5268,7 @@
           count < Math.min(siloCap, Math.max(1, Math.floor(cities * siloCoef)))
         );
       case UnitType.SAMLauncher:
-        return cities >= 2 && count < Math.max(1, Math.floor(cities * samCoef));
+        return cities >= 2 && count < Math.max(1, samTarget);
       default:
         return false;
     }
