@@ -10948,23 +10948,17 @@
       case "MIRV_LAST_RESORT":
         handled = await runGoal_MirvLastResort(me);
         if (!handled) handled = await maybeNuke(me);
-        if (!handled) handled = await maybeEconomy(me, getEnemies());
-        if (!handled) handled = await maybeExpand(me, borderTiles);
+        // Legacy fallback chain runs econ/combat/expand when handled
+        // stays false, so no need to re-dispatch here.
         break;
       case "NUKE_CROWN":
         handled = await maybeNuke(me);
-        // If we couldn't launch (cooldown, no silos, no affordable
-        // target), still do economy/diplomacy/expand so the tick is
-        // never wasted waiting on cooldown.
-        if (!handled) handled = await maybeEconomy(me, getEnemies());
-        if (!handled) handled = await maybeDiplomacy(me);
-        if (!handled) handled = await maybeExpand(me, borderTiles);
+        // Legacy fallback chain below handles econ/expand if we
+        // couldn't launch on this tick.
         break;
       case "SAM_OVERWHELM":
         handled = await runGoal_SamOverwhelm(me);
         if (!handled) handled = await maybeNuke(me);
-        if (!handled) handled = await maybeEconomy(me, getEnemies());
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "REPEL_INVASION":
         handled = await runGoal_RepelInvasion(me, borderTiles, selectionContext);
@@ -10981,30 +10975,26 @@
         // defense/economy so we keep building cities + SAMs while waiting.
         if (!handled) handled = await maybeEconomy(me, getEnemies());
         if (!handled) handled = await maybeDiplomacy(me);
-        // Still expand into TerraNullius behind our prep work — more
-        // tiles means more population cap going into the expected
-        // invasion, which widens the maxTroops cushion.
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "DEFENSIVE_TURTLE":
         handled = await runGoal_DefensiveTurtle(me);
         if (!handled) handled = await maybeDiplomacy(me);
         if (!handled) handled = await maybeEconomy(me, getEnemies());
-        // Plan §2.8: traitor-window turtle still permits expansion
-        // into TerraNullius — attacking empty land is a flat-loss
-        // action that has no offensive-melee downside. This closes
-        // the gap where the 30s lock would stall our tile growth
-        // entirely even when open frontier was adjacent.
+        // Plan §2.8: traitor-window turtle still permits TerraNullius
+        // expansion — the 30s traitor speed debuff doesn't change
+        // the flat mag/5 loss-per-tile math. Call maybeExpand
+        // directly here and mark handled so we do NOT fall through
+        // to the legacy pipeline's maybeCombat (which would send
+        // offensive PvP attacks during the traitor window — exactly
+        // what §2.8 forbids).
         if (!handled) handled = await maybeExpand(me, borderTiles);
+        // Force handled=true unconditionally so the legacy fallback
+        // can never fire offensive combat during the traitor lock.
+        handled = true;
         break;
       case "SAM_WALL_BUILDUP":
         handled = await runGoal_SamWallBuildup(me);
         if (!handled) handled = await maybeDiplomacy(me);
-        // SAM construction is gold-rate-limited (up to 3M gold each).
-        // While waiting for the next SAM we should still grab any open
-        // TerraNullius adjacent to us — free land + free income with
-        // no opportunity cost (the SAM build doesn't need troops).
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "BETRAY_ALLY":
         handled = await runGoal_BetrayAlly(selectionContext);
@@ -11023,8 +11013,6 @@
         handled = await runGoal_FarmTribe(me, borderTiles);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
-        // If we can't swing at the tribe this tick, still take TN.
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "EASY_NATION_GRAB":
         handled = await maybeCombat(me, borderTiles);
@@ -11041,10 +11029,6 @@
         handled = await runGoal_NeutralizeRisingStar(me);
         if (!handled) handled = await maybeCombat(me, borderTiles);
         if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
-        // If all offensive paths against the rising star failed this
-        // tick, still grab adjacent TerraNullius — widens our cap
-        // for the eventual push without diluting the goal.
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "TERRA_NULLIUS_RUSH":
         handled = await maybeExpand(me, borderTiles);
@@ -11058,23 +11042,15 @@
       case "DIPLOMACY_ISOLATE_CROWN":
         handled = await runGoal_Diplomacy(me);
         if (!handled) handled = await maybeDiplomacy(me);
-        if (!handled) handled = await maybeEconomy(me, getEnemies());
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "WARSHIP_DEFENSE":
         handled = await runGoal_WarshipDefense(me);
-        if (!handled) handled = await maybeEconomy(me, getEnemies());
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "SAVE_FOR_HYDRO":
         // Economy layer is gated via economyBanned(); still allow defensive
         // builds to pass through maybeEconomy.
         handled = await maybeEconomy(me, getEnemies());
         if (!handled) handled = await maybeDiplomacy(me);
-        // We're banking gold, not troops. TerraNullius expansion
-        // commits troops but has flat mag/5 loss per tile and
-        // doesn't touch gold at all — strictly better than idling.
-        if (!handled) handled = await maybeExpand(me, borderTiles);
         break;
       case "DEFENSE_NETWORK":
       case "IDLE":
