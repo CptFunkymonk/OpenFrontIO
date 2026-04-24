@@ -7792,7 +7792,14 @@
     if (tick - cooldownUntil < 10) return false;
 
     const maxTroops = gameView.config().maxTroops(me);
-    if (me.troops() < maxTroops * 0.6) return false;
+
+    // Plan §2.10: we need surplus above our own reserve ratio before we
+    // can afford to prop up a teammate. Use the same `computeReserveRatio`
+    // that powers combat so the two systems agree on what "spare" means.
+    const myReserveRatio = computeReserveRatio(me, maxTroops);
+    const myReserve = maxTroops * myReserveRatio;
+    const surplus = me.troops() - myReserve;
+    if (surplus <= 0) return false;
 
     const teammates = safeCall(() => getAllies(), []).filter((ally) => {
       if (!ally) return false;
@@ -7816,10 +7823,17 @@
         neediest = ally;
       }
     }
-    if (!neediest || lowestRatio > 0.5) return false;
+    // Plan §2.10: trigger at troops/maxTroops < 0.25 (was 0.5). Above
+    // that, the teammate is not in real trouble and we should keep
+    // the troops for our own push.
+    if (!neediest || lowestRatio >= 0.25) return false;
 
-    // Donate 25% of standing army, capped at 30%.
-    const donation = Math.floor(me.troops() * 0.25);
+    // Plan §2.10 formula: donate our surplus above the reserve ratio,
+    // capped at 30% of our standing army in one shot so we never
+    // single-tick empty our frontline.
+    const donation = Math.floor(
+      Math.min(surplus, me.troops() * 0.3),
+    );
     if (donation <= 0) return false;
 
     if (sendDonateTroops(neediest.id(), donation)) {
@@ -7830,7 +7844,7 @@
       reasonLog(
         "TEAM_DONATE",
         `Propping up teammate ${neediest.displayName()} (${(lowestRatio * 100).toFixed(0)}% pop).`,
-        `${fmtTroops(donation)} donated`,
+        `${fmtTroops(donation)} donated from ${fmtTroops(surplus)} surplus`,
       );
       return true;
     }
