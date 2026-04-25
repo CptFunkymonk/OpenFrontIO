@@ -10871,8 +10871,15 @@
     },
   ];
 
+  // Plan §6.1: O(1) goal lookup. The original GOAL_SPECS.find() was
+  // called from every selectPrimaryGoal() (~24 entries), every
+  // setForcedGoal(), and the maybeEmit* helpers — turning a per-tick
+  // hot path into 24 pointer comparisons each call. The Map shaves
+  // those into a single hash hit.
+  const GOAL_SPEC_BY_ID = new Map(GOAL_SPECS.map((spec) => [spec.id, spec]));
+
   function goalSpecById(id) {
-    return GOAL_SPECS.find((spec) => spec.id === id) || null;
+    return GOAL_SPEC_BY_ID.get(id) || null;
   }
 
   /**
@@ -10932,15 +10939,16 @@
         context: evaluation.context || null,
       });
     }
-    // Deterministic tiebreaker: equal-priority goals sort alphabetically by
-    // id so the planner's output is reproducible tick-to-tick. Without this
-    // Array.prototype.sort can shuffle ties on different JS engines.
-    planner.lastEvaluation = evaluations
-      .slice()
-      .sort((a, b) => {
-        if (b.priority !== a.priority) return b.priority - a.priority;
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-      });
+    // Plan §6.2: deterministic tiebreaker — equal-priority goals sort
+    // alphabetically by id so the planner's output is reproducible
+    // tick-to-tick. Without this Array.prototype.sort can shuffle ties
+    // on different JS engines. The .slice() is unnecessary because
+    // evaluations is a freshly allocated array we own — sort in place.
+    evaluations.sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    planner.lastEvaluation = evaluations;
 
     const winner = planner.lastEvaluation.find((e) => e.valid);
     if (!winner) return null;
