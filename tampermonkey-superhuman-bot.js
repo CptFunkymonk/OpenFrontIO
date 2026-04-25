@@ -556,6 +556,84 @@
   const NativeWebSocket = window.WebSocket;
   const NativeWorker = window.Worker;
 
+  // ---------------------------------------------------------------------------
+  // Generalised timing harness (Plan §0).
+  //
+  // Wraps a synchronous function so we can measure wall time per "section"
+  // (updateWorldModel, computeThreats, refreshOverlay, etc.) and print an
+  // averaged report once per `runtime.timing.reportEveryTicks`. Off by
+  // default; flip via `runtime.debugFlags.timing = true` from devtools.
+  //
+  // Designed to be near-zero cost when disabled: the only work is the
+  // `runtime.debugFlags.timing` boolean check.
+  // ---------------------------------------------------------------------------
+  const HAS_PERF_NOW =
+    typeof performance !== "undefined" &&
+    typeof performance.now === "function";
+
+  runtime.timing = {
+    reportEveryTicks: 100,
+    lastReportTick: -999,
+    sections: new Map(), // name -> { sum, count, max }
+  };
+
+  function timingSection(name, fn) {
+    if (!runtime.debugFlags.timing || !HAS_PERF_NOW) return fn();
+    const t0 = performance.now();
+    try {
+      return fn();
+    } finally {
+      const dt = performance.now() - t0;
+      const sec = runtime.timing.sections.get(name);
+      if (sec) {
+        sec.sum += dt;
+        sec.count += 1;
+        if (dt > sec.max) sec.max = dt;
+      } else {
+        runtime.timing.sections.set(name, { sum: dt, count: 1, max: dt });
+      }
+    }
+  }
+
+  async function timingSectionAsync(name, fn) {
+    if (!runtime.debugFlags.timing || !HAS_PERF_NOW) return fn();
+    const t0 = performance.now();
+    try {
+      return await fn();
+    } finally {
+      const dt = performance.now() - t0;
+      const sec = runtime.timing.sections.get(name);
+      if (sec) {
+        sec.sum += dt;
+        sec.count += 1;
+        if (dt > sec.max) sec.max = dt;
+      } else {
+        runtime.timing.sections.set(name, { sum: dt, count: 1, max: dt });
+      }
+    }
+  }
+
+  function maybeFlushTimingReport(tick) {
+    if (!runtime.debugFlags.timing) return;
+    const t = runtime.timing;
+    if (tick - t.lastReportTick < t.reportEveryTicks) return;
+    t.lastReportTick = tick;
+    if (t.sections.size === 0) return;
+    const lines = [];
+    const sortedNames = Array.from(t.sections.keys()).sort();
+    for (const name of sortedNames) {
+      const sec = t.sections.get(name);
+      const avg = sec.count > 0 ? sec.sum / sec.count : 0;
+      lines.push(
+        name + " avg=" + avg.toFixed(2) + "ms max=" + sec.max.toFixed(2) +
+          "ms n=" + sec.count,
+      );
+    }
+    console.log("[SuperBot:timing] " + lines.join(" | "));
+    // Reset window so we get rolling 100-tick averages, not lifetime ones.
+    t.sections.clear();
+  }
+
   function botLog(message) {
     const entry = "[" + new Date().toLocaleTimeString() + "] " + message;
     runtime.logs.push(entry);
@@ -11065,32 +11143,9 @@
 
     const borderTiles = await queryExactBorderTiles(false);
 
-    // Phase 1 acceptance: instrument updateWorldModel timing behind a flag.
-    const tStart = runtime.debugFlags.timing ? performance.now() : 0;
-    updateWorldModel(me, borderTiles);
-    if (runtime.debugFlags.timing) {
-      const dt = performance.now() - tStart;
-      runtime._timingSampleSum += dt;
-      runtime._timingSampleCount += 1;
-      if (runtime.world.tick - runtime._timingLoggedAt >= 100) {
-        runtime._timingLoggedAt = runtime.world.tick;
-        const avg =
-          runtime._timingSampleCount > 0
-            ? runtime._timingSampleSum / runtime._timingSampleCount
-            : 0;
-        console.log(
-          "[SuperBot:timing] updateWorldModel avg " +
-            avg.toFixed(2) +
-            " ms over " +
-            runtime._timingSampleCount +
-            " ticks",
-        );
-        runtime._timingSampleSum = 0;
-        runtime._timingSampleCount = 0;
-      }
-    }
-
-    computeThreats(me, borderTiles);
+    // Plan §0: per-section timing harness behind runtime.debugFlags.timing.
+    timingSection("updateWorldModel", () => updateWorldModel(me, borderTiles));
+    timingSection("computeThreats", () => computeThreats(me, borderTiles));
     classifyMapIfNeeded(me);
     maybePeriodicIntelLog();
     updateSnapshot(me, borderTiles);
@@ -11108,15 +11163,19 @@
     // after world/threats/snapshot so every detector sees a consistent
     // view, and BEFORE goal planning so the per-tick emoji reflects the
     // *pre-decision* state ("I'm being attacked" before "I respond").
-    safeCall(() => maybeEmitEmoji(me), null);
+    timingSection("maybeEmitEmoji", () => safeCall(() => maybeEmitEmoji(me), null));
 
     // RL decision logger: sample world/delta/threats and drain outcomes.
     // Runs BEFORE planner so we can emit "state at tick T" and then pair
     // `planner_decision` in the same tick.
-    safeCall(() => maybeEmitPeriodicRL(me, borderTiles), null);
-    safeCall(() => drainRlOutcomes(tick, me), null);
+    timingSection("rlPeriodic", () => {
+      safeCall(() => maybeEmitPeriodicRL(me, borderTiles), null);
+      safeCall(() => drainRlOutcomes(tick, me), null);
+    });
 
-    const selection = selectPrimaryGoal();
+    const selection = timingSection("selectPrimaryGoal", () =>
+      selectPrimaryGoal(),
+    );
     adoptGoal(selection);
     safeCall(() => maybeEmitPlannerDecision(selection), null);
 
@@ -12748,6 +12807,10 @@
   }
 
   function refreshOverlay() {
+    return timingSection("refreshOverlay", refreshOverlayInner);
+  }
+
+  function refreshOverlayInner() {
     ensureOverlay();
     if (!runtime.overlay.root) return;
 
@@ -13097,7 +13160,8 @@
         // loop interval anyway. Skip when disabled or paused.
         await new Promise((resolve) => setTimeout(resolve, Math.min(delay, 260)));
       }
-      await runModulesForTick();
+      await timingSectionAsync("runModulesForTick", () => runModulesForTick());
+      maybeFlushTimingReport(runtime.world.tick);
     } catch (error) {
       decisionLog("loop error: " + error.message);
       console.error("[SuperBot] loop error", error);
