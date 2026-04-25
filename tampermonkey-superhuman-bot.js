@@ -8668,9 +8668,17 @@
 
   // ---------- Phase 1: world model ----------
 
+  // Plan §2.2: structure-count cache cadence. Structures only change every
+  // few seconds in real games, so re-walking units(type) every tick is
+  // wasted work. We re-sample once per K ticks (≈ 0.5 s at TICKS_PER_SECOND
+  // = 10) and reuse the cached `counts` + `levels` between samples.
+  const STRUCTURE_CACHE_TICKS = 5;
+
   /**
    * Count active structures (not under construction) grouped by type for the
-   * given player. Missing units fall back to 0 so callers don't have to null-check.
+   * given player. Missing units fall back to 0 so callers don't have to
+   * null-check. Heavy: walks every structure unit on the player. Caller
+   * should prefer getOrSampleStructures() so we throttle.
    */
   function collectStructureCounts(player) {
     const counts = {
@@ -8683,15 +8691,56 @@
     };
     const levels = { ...counts };
     for (const type of StructureTypes) {
-      const units = safeCall(() => player.units(type), []);
+      let units;
+      try {
+        units = player.units(type);
+      } catch (_) {
+        continue;
+      }
+      if (!units) continue;
       for (const unit of units) {
-        if (!safeCall(() => unit.isActive(), false)) continue;
-        if (safeCall(() => unit.isUnderConstruction(), false)) continue;
+        let active = false;
+        let underConstruction = false;
+        let level = 1;
+        try {
+          active = unit.isActive();
+          underConstruction = unit.isUnderConstruction();
+          level = unit.level();
+        } catch (_) { /* swallow */ }
+        if (!active || underConstruction) continue;
         counts[type] = (counts[type] || 0) + 1;
-        levels[type] = (levels[type] || 0) + Math.max(1, safeCall(() => unit.level(), 1));
+        levels[type] = (levels[type] || 0) + Math.max(1, level || 1);
       }
     }
     return { counts, levels };
+  }
+
+  /**
+   * Plan §2.2: cached per-opponent structure sampler. Reuses the most
+   * recently sampled `{ counts, levels }` until STRUCTURE_CACHE_TICKS has
+   * elapsed. Cache is stored on the same per-smallID history entry so it
+   * is automatically pruned alongside dead-player history.
+   */
+  function getOrSampleStructures(player, historyEntry, tick) {
+    if (
+      historyEntry &&
+      historyEntry.structures &&
+      historyEntry.structureLevels &&
+      typeof historyEntry.structuresAt === "number" &&
+      tick - historyEntry.structuresAt < STRUCTURE_CACHE_TICKS
+    ) {
+      return {
+        counts: historyEntry.structures,
+        levels: historyEntry.structureLevels,
+      };
+    }
+    const fresh = collectStructureCounts(player);
+    if (historyEntry) {
+      historyEntry.structures = fresh.counts;
+      historyEntry.structureLevels = fresh.levels;
+      historyEntry.structuresAt = tick;
+    }
+    return fresh;
   }
 
   function normalizeClanTag(value) {
@@ -8805,14 +8854,23 @@
   /**
    * Refresh the world model. Called at the top of every active-phase tick.
    * Cheap: only uses synchronous GameView reads, no worker RPCs.
+   *
+   * Plan §2 hot-path rewrite: collapses the 20-per-opponent safeCall storm
+   * into a single try/catch, caches structure counts via the per-smallID
+   * history entry, caches clan tag for the duration of the match, reuses
+   * world.bySmallID across ticks, and skips velocity rankings unless RL
+   * is enabled.
    */
   function updateWorldModel(me, borderTiles) {
     const gameView = getGameView();
     if (!gameView || !me) return;
 
-    const tick = safeCall(() => gameView.ticks(), 0);
-    const allPlayers = safeCall(() => gameView.playerViews(), []);
-    const alive = allPlayers.filter((p) => safeCall(() => p.isAlive(), false));
+    let tick = 0;
+    let allPlayers = [];
+    try {
+      tick = gameView.ticks();
+      allPlayers = gameView.playerViews();
+    } catch (_) { /* swallow */ }
 
     // Identity: learn our clan tag once, when the game starts.
     if (!runtime.identity.clanTag) {
@@ -8823,19 +8881,23 @@
       }
     }
 
-    const meSmallID = safeCall(() => me.smallID(), null);
+    let meSmallID = null;
+    try { meSmallID = me.smallID(); } catch (_) { /* swallow */ }
     const trustedTags = trustedClanTags();
-    const sample = (player) => {
-      const troops = safeCall(() => player.troops(), 0);
-      const tiles = safeCall(() => player.numTilesOwned(), 0);
-      const gold = Number(safeCall(() => player.gold(), 0));
-      return { tick, troops, tiles, gold };
-    };
+    const cfg = getCachedConfig();
+    const rlEnabled = Boolean(runtime.rl && runtime.rl.enabled);
 
     const shouldSample =
       runtime.world.tick === 0 ||
       tick - runtime.world.tick >= HISTORY_SAMPLE_EVERY ||
       runtime.world.history.size === 0;
+
+    // Plan §2.6: reuse the same Map across ticks instead of allocating a
+    // fresh one. `bySmallID.clear()` keeps the underlying capacity so
+    // re-inserts are amortised O(1).
+    const bySmallID = runtime.world.bySmallID || new Map();
+    bySmallID.clear();
+    runtime.world.bySmallID = bySmallID;
 
     const everyone = [];
     const livingSmallIDs = new Set();
@@ -8843,68 +8905,124 @@
     let nationCount = 0;
     let botCount = 0;
 
-    for (const player of alive) {
-      const smallID = safeCall(() => player.smallID(), null);
-      if (smallID === null) continue;
+    for (const player of allPlayers) {
+      // Plan §2.1: collapse ~20 closure allocations per opponent into a
+      // single outer try block. We pre-declare every field with a default
+      // and overwrite within the try; on a thrown accessor we keep the
+      // partial values we already managed to read.
+      let alive = false;
+      let smallID = null;
+      let type = null;
+      let id = null;
+      let displayName = "?";
+      let isDisconnected = false;
+      let isTraitor = false;
+      let traitorRemainingTicks = 0;
+      let hasSpawned = false;
+      let troops = 0;
+      let tiles = 0;
+      let gold = 0;
+      let maxTroops = 1;
+      let isFriendlyEngine = false;
+      let isAlliedWith = false;
+      let isOnSameTeam = false;
+      let incomingAttacks = [];
+      let outgoingAttacks = [];
+      let alliances = [];
+      let alliesList = [];
+
+      try {
+        alive = player.isAlive();
+        smallID = player.smallID();
+        type = player.type();
+        id = player.id();
+        displayName = player.displayName();
+        isDisconnected = player.isDisconnected();
+        isTraitor = player.isTraitor();
+        traitorRemainingTicks = player.getTraitorRemainingTicks();
+        hasSpawned = player.hasSpawned();
+        troops = player.troops();
+        tiles = player.numTilesOwned();
+        gold = Number(player.gold());
+        if (cfg) maxTroops = cfg.maxTroops(player) || 1;
+        if (smallID !== meSmallID) {
+          isFriendlyEngine = me.isFriendly(player);
+          isAlliedWith = me.isAlliedWith(player);
+          isOnSameTeam = me.isOnSameTeam(player);
+        }
+        incomingAttacks = player.incomingAttacks() || [];
+        outgoingAttacks = player.outgoingAttacks() || [];
+        alliances = player.alliances() || [];
+        alliesList = player.allies() || [];
+      } catch (_) { /* swallow — keep partial values */ }
+
+      if (!alive || smallID === null) continue;
       livingSmallIDs.add(smallID);
 
-      const type = safeCall(() => player.type(), null);
       if (type === PlayerType.Bot) botCount += 1;
       else if (type === PlayerType.Nation) nationCount += 1;
       else if (type === PlayerType.Human) humanCount += 1;
 
       if (shouldSample) {
-        pushHistorySample(smallID, sample(player));
+        pushHistorySample(smallID, { tick, troops, tiles, gold });
       }
       const historyEntry = runtime.world.history.get(smallID);
       const velocities = computeVelocities(historyEntry, tick);
-      const { counts, levels } = collectStructureCounts(player);
-      const clanTag = extractClanTag(player);
+
+      // Plan §2.2: throttle structure walks via per-history cache.
+      const { counts, levels } = getOrSampleStructures(
+        player,
+        historyEntry,
+        tick,
+      );
+
+      // Plan §2.3: clan tag is fixed for the match — resolve once and
+      // memoise on the history entry.
+      let clanTag;
+      if (historyEntry && historyEntry.clanTag !== undefined) {
+        clanTag = historyEntry.clanTag;
+      } else {
+        clanTag = extractClanTag(player);
+        if (historyEntry) historyEntry.clanTag = clanTag;
+      }
       const isClanmate =
         smallID !== meSmallID && clanTag && trustedTags.has(clanTag);
       const isFriendly =
-        smallID === meSmallID ||
-        safeCall(() => me.isFriendly(player), false) ||
-        Boolean(isClanmate);
+        smallID === meSmallID || isFriendlyEngine || Boolean(isClanmate);
       const isAlly =
-        smallID !== meSmallID &&
-        (safeCall(() => me.isAlliedWith(player), false) ||
-          safeCall(() => me.isOnSameTeam(player), false));
-      const maxTroops = safeCall(
-        () => gameView.config().maxTroops(player),
-        1,
-      );
-      const incomingAttacks = safeCall(
-        () => player.incomingAttacks(),
-        [],
-      );
-      const outgoingAttacks = safeCall(
-        () => player.outgoingAttacks(),
-        [],
-      );
-      const incomingTroops = incomingAttacks.reduce(
-        (sum, attack) => sum + safeCall(() => attack.troops(), 0),
-        0,
-      );
-      const outgoingTroops = outgoingAttacks.reduce(
-        (sum, attack) => sum + safeCall(() => attack.troops(), 0),
-        0,
-      );
+        smallID !== meSmallID && (isAlliedWith || isOnSameTeam);
 
-      const alliances = safeCall(() => player.alliances(), []);
-      const allyIDs = safeCall(
-        () =>
-          safeCall(() => player.allies(), []).map((a) =>
-            safeCall(() => a.smallID(), null),
-          ),
-        [],
-      ).filter((id) => id !== null);
+      // Reduce attack-troop totals without per-element safeCall.
+      let incomingTroops = 0;
+      for (const attack of incomingAttacks) {
+        let n = 0;
+        try {
+          n = typeof attack.troops === "function" ? attack.troops() : (attack.troops || 0);
+        } catch (_) { /* swallow */ }
+        incomingTroops += n;
+      }
+      let outgoingTroops = 0;
+      for (const attack of outgoingAttacks) {
+        let n = 0;
+        try {
+          n = typeof attack.troops === "function" ? attack.troops() : (attack.troops || 0);
+        } catch (_) { /* swallow */ }
+        outgoingTroops += n;
+      }
 
-      everyone.push({
+      // Build allyIDs without nested safeCall closures.
+      const allyIDs = [];
+      for (const a of alliesList) {
+        let aid = null;
+        try { aid = a.smallID(); } catch (_) { /* swallow */ }
+        if (aid !== null) allyIDs.push(aid);
+      }
+
+      const entry = {
         smallID,
-        id: safeCall(() => player.id(), null),
+        id,
         player,
-        name: safeCall(() => player.displayName(), "?"),
+        name: displayName,
         type,
         clanTag,
         isMe: smallID === meSmallID,
@@ -8912,18 +9030,15 @@
         isFriendly,
         isAlly,
         isEnemy: !isFriendly,
-        isDisconnected: safeCall(() => player.isDisconnected(), false),
-        isTraitor: safeCall(() => player.isTraitor(), false),
-        traitorRemainingTicks: safeCall(
-          () => player.getTraitorRemainingTicks(),
-          0,
-        ),
-        hasSpawned: safeCall(() => player.hasSpawned(), false),
-        troops: sample(player).troops,
-        tiles: sample(player).tiles,
-        gold: sample(player).gold,
+        isDisconnected,
+        isTraitor,
+        traitorRemainingTicks,
+        hasSpawned,
+        troops,
+        tiles,
+        gold,
         maxTroops,
-        troopRatio: maxTroops > 0 ? sample(player).troops / maxTroops : 0,
+        troopRatio: maxTroops > 0 ? troops / maxTroops : 0,
         structures: counts,
         structureLevels: levels,
         tilesPerMin: velocities.tilesPerMin,
@@ -8935,21 +9050,33 @@
         outgoingTroops,
         allyIDs,
         alliances,
-      });
+        // Used by isOnSameTeam fast-path in buildAllianceGraph.
+        _onSameTeamWith: null,
+      };
+      everyone.push(entry);
+      bySmallID.set(smallID, entry);
     }
 
     pruneStaleHistory(livingSmallIDs);
 
-    const bySmallID = new Map();
-    for (const entry of everyone) bySmallID.set(entry.smallID, entry);
-
     // Totals & land shares.
-    const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
-    const falloutTiles = safeCall(() => gameView.numTilesWithFallout(), 0);
+    let totalLand = 1;
+    let falloutTiles = 0;
+    try {
+      totalLand = Math.max(1, gameView.numLandTiles() || 1);
+      falloutTiles = gameView.numTilesWithFallout() || 0;
+    } catch (_) { /* swallow */ }
     const usableLand = Math.max(1, totalLand - falloutTiles);
-    const sortedByTiles = everyone
-      .slice()
-      .sort((a, b) => b.tiles - a.tiles || a.smallID - b.smallID);
+
+    // Plan §2.4: always compute byTiles + byTroops (cheap, consumed
+    // tactically). Only compute the velocity rankings when the RL logger
+    // is enabled — they are referenced exclusively by RL world snapshots.
+    const sortedByTiles = everyone.slice().sort(
+      (a, b) => b.tiles - a.tiles || a.smallID - b.smallID,
+    );
+    const sortedByTroops = everyone.slice().sort(
+      (a, b) => b.troops - a.troops || a.smallID - b.smallID,
+    );
     const firstTiles = sortedByTiles[0] ? sortedByTiles[0].tiles : 0;
     const secondTiles = sortedByTiles[1] ? sortedByTiles[1].tiles : 0;
     const myEntry = bySmallID.get(meSmallID) || null;
@@ -8971,18 +9098,22 @@
       secondShare: secondTiles / usableLand,
     };
     runtime.world.rankings.byTiles = sortedByTiles.map((e) => e.smallID);
-    runtime.world.rankings.byTroops = everyone
-      .slice()
-      .sort((a, b) => b.troops - a.troops || a.smallID - b.smallID)
-      .map((e) => e.smallID);
-    runtime.world.rankings.byTilesVelocity = everyone
-      .slice()
-      .sort((a, b) => b.tilesPerMin - a.tilesPerMin || a.smallID - b.smallID)
-      .map((e) => e.smallID);
-    runtime.world.rankings.byTroopsVelocity = everyone
-      .slice()
-      .sort((a, b) => b.troopsPerMin - a.troopsPerMin || a.smallID - b.smallID)
-      .map((e) => e.smallID);
+    runtime.world.rankings.byTroops = sortedByTroops.map((e) => e.smallID);
+    if (rlEnabled) {
+      runtime.world.rankings.byTilesVelocity = everyone
+        .slice()
+        .sort((a, b) => b.tilesPerMin - a.tilesPerMin || a.smallID - b.smallID)
+        .map((e) => e.smallID);
+      runtime.world.rankings.byTroopsVelocity = everyone
+        .slice()
+        .sort((a, b) => b.troopsPerMin - a.troopsPerMin || a.smallID - b.smallID)
+        .map((e) => e.smallID);
+    } else {
+      // Keep the arrays present so legacy callers see a defined shape.
+      // They get refreshed the moment RL flips back on.
+      runtime.world.rankings.byTilesVelocity = runtime.world.rankings.byTilesVelocity || [];
+      runtime.world.rankings.byTroopsVelocity = runtime.world.rankings.byTroopsVelocity || [];
+    }
 
     buildAllianceGraph(everyone, bySmallID, usableLand);
 
@@ -9002,21 +9133,33 @@
     for (const entry of everyone) {
       edges.set(entry.smallID, new Set());
     }
+
+    // Plan §2.5: skip the O(N²) per-pair isOnSameTeam scan when we're not
+    // in a team mode at all — this is the common case (FFA matches), and
+    // the inner safeCall closure was the dominant per-tick allocation in
+    // updateWorldModel for 8+ player games.
+    const gameView = getGameView();
+    const teamMode = gameView ? isTeamMode(gameView) : false;
+
     for (const entry of everyone) {
       for (const otherId of entry.allyIDs) {
         if (!bySmallID.has(otherId)) continue;
         edges.get(entry.smallID).add(otherId);
         edges.get(otherId).add(entry.smallID);
       }
-      // Team mode: add every teammate.
+      if (!teamMode) continue;
+      // Team mode: add every teammate. Tries the cached `_onSameTeamWith`
+      // map (built once per match per smallID pair) before falling back to
+      // the engine call.
       for (const other of everyone) {
         if (other.smallID === entry.smallID) continue;
-        if (
-          safeCall(
-            () => entry.player.isOnSameTeam && entry.player.isOnSameTeam(other.player),
-            false,
-          )
-        ) {
+        let same = false;
+        try {
+          if (entry.player && entry.player.isOnSameTeam) {
+            same = entry.player.isOnSameTeam(other.player);
+          }
+        } catch (_) { /* swallow */ }
+        if (same) {
           edges.get(entry.smallID).add(other.smallID);
           edges.get(other.smallID).add(entry.smallID);
         }
