@@ -511,6 +511,21 @@
       perPlayerActions: new Map(), // smallID -> [{ kind, atMs }]
       combos: new Map(), // smallID -> { lastKind, lastAtMs }
     },
+    /**
+     * Plan §1: per-tick view cache. Reset at the top of runModulesForTick
+     * so every helper inside one tick reuses the same engine references.
+     *
+     * Without this, the tick path calls getGameView() ~108×, getMyPlayer()
+     * dozens of times, and gameView.config()/getEnemies()/getAllies() in a
+     * tight inner loop — each one re-walking DOM selectors or
+     * playerViews().filter(). The cache turns all of that into a single
+     * lookup per tick.
+     *
+     * Slots are deliberately left lazy: helpers populate on first call so
+     * spawn-phase ticks (which never need enemies/allies) don't pay for
+     * fields they wouldn't have used anyway.
+     */
+    tickCache: null,
     // ----- RL Decision Logger (see top-of-file doc block) ---------------
     // Purely observational: populated by rlLog() and consumed by
     // dumpRlJson() / persistRlToStorage(). Resetting is done in
@@ -1157,12 +1172,18 @@
   }
 
   function getGameView() {
+    // Plan §1: consult the per-tick cache before doing anything else.
+    // The cache is set fresh at the top of runModulesForTick.
+    const cache = runtime.tickCache;
+    if (cache && cache.gameView) return cache.gameView;
+
     const existing = runtime.hooks.gameView;
     if (
       existing &&
       typeof existing.ticks === "function" &&
       typeof existing.myPlayer === "function"
     ) {
+      if (cache) cache.gameView = existing;
       return existing;
     }
 
@@ -1246,42 +1267,100 @@
   }
 
   function getMyPlayer() {
+    const cache = runtime.tickCache;
+    if (cache && cache.myPlayer !== undefined) return cache.myPlayer;
     const gameView = getGameView();
-    if (!gameView) return null;
-    return safeCall(() => gameView.myPlayer(), null);
+    if (!gameView) {
+      if (cache) cache.myPlayer = null;
+      return null;
+    }
+    const me = safeCall(() => gameView.myPlayer(), null);
+    if (cache) cache.myPlayer = me;
+    return me;
   }
 
   function getMyLivingPlayer() {
+    const cache = runtime.tickCache;
+    if (cache && cache.myLivingPlayer !== undefined) {
+      return cache.myLivingPlayer;
+    }
     const me = getMyPlayer();
-    if (!me) return null;
-    return safeCall(() => (me.isAlive() ? me : null), null);
+    if (!me) {
+      if (cache) cache.myLivingPlayer = null;
+      return null;
+    }
+    const living = safeCall(() => (me.isAlive() ? me : null), null);
+    if (cache) cache.myLivingPlayer = living;
+    return living;
   }
 
   function getAllPlayers() {
+    const cache = runtime.tickCache;
+    if (cache && cache.allPlayers !== undefined) return cache.allPlayers;
     const gameView = getGameView();
-    if (!gameView) return [];
-    return safeCall(
+    if (!gameView) {
+      if (cache) cache.allPlayers = [];
+      return [];
+    }
+    const players = safeCall(
       () => gameView.playerViews().filter((player) => player.isAlive()),
       [],
     );
+    if (cache) cache.allPlayers = players;
+    return players;
   }
 
   function getEnemies() {
+    const cache = runtime.tickCache;
+    if (cache && cache.enemies !== undefined) return cache.enemies;
     const me = getMyLivingPlayer();
-    if (!me) return [];
-    return getAllPlayers().filter((player) => {
-      if (player.smallID() === me.smallID()) return false;
-      return !safeCall(() => me.isFriendly(player), false);
-    });
+    if (!me) {
+      if (cache) cache.enemies = [];
+      return [];
+    }
+    const mySmallID = me.smallID();
+    const enemies = [];
+    for (const player of getAllPlayers()) {
+      if (player.smallID() === mySmallID) continue;
+      if (safeCall(() => me.isFriendly(player), false)) continue;
+      enemies.push(player);
+    }
+    if (cache) cache.enemies = enemies;
+    return enemies;
   }
 
   function getAllies() {
+    const cache = runtime.tickCache;
+    if (cache && cache.allies !== undefined) return cache.allies;
     const me = getMyLivingPlayer();
-    if (!me) return [];
-    return getAllPlayers().filter((player) => {
-      if (player.smallID() === me.smallID()) return false;
-      return safeCall(() => me.isFriendly(player), false);
-    });
+    if (!me) {
+      if (cache) cache.allies = [];
+      return [];
+    }
+    const mySmallID = me.smallID();
+    const allies = [];
+    for (const player of getAllPlayers()) {
+      if (player.smallID() === mySmallID) continue;
+      if (!safeCall(() => me.isFriendly(player), false)) continue;
+      allies.push(player);
+    }
+    if (cache) cache.allies = allies;
+    return allies;
+  }
+
+  /**
+   * Plan §1.3: cached gameView.config() reference. Many helpers call
+   * gameView.config() repeatedly within a single tick (maybeEconomy,
+   * maybeNaval, runGoal_NavalLandGrab, etc.); resolving once shaves
+   * dozens of accessor calls per tick.
+   */
+  function getCachedConfig() {
+    const cache = runtime.tickCache;
+    if (cache && cache.config !== undefined) return cache.config;
+    const gameView = getGameView();
+    const cfg = gameView ? safeCall(() => gameView.config(), null) : null;
+    if (cache) cache.config = cfg;
+    return cfg;
   }
 
   async function queryExactBorderTiles(force) {
@@ -11106,6 +11185,20 @@
   }
 
   async function runModulesForTick() {
+    // Plan §1: spin up a fresh per-tick view cache so every helper inside
+    // this tick reuses the same engine references. The cache is keyed on
+    // the tick number so a stale cache is impossible — the next tick
+    // overwrites it wholesale at the top of the function.
+    runtime.tickCache = {
+      tick: -1,
+      gameView: null,
+      myPlayer: undefined,
+      myLivingPlayer: undefined,
+      allPlayers: undefined,
+      enemies: undefined,
+      allies: undefined,
+      config: undefined,
+    };
     discoverRuntimeReferences();
     const gameView = getGameView();
     if (!gameView) {
@@ -11120,6 +11213,7 @@
       return;
     }
     runtime.lastProcessedTick = tick;
+    runtime.tickCache.tick = tick;
     runtime.state.lastIntentSignature = "";
 
     if (gameView.inSpawnPhase()) {
