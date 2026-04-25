@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.9.1
+// @version      2.10.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.9.1";
+  const BOT_VERSION = "2.10.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -511,6 +511,21 @@
       perPlayerActions: new Map(), // smallID -> [{ kind, atMs }]
       combos: new Map(), // smallID -> { lastKind, lastAtMs }
     },
+    /**
+     * Plan §1: per-tick view cache. Reset at the top of runModulesForTick
+     * so every helper inside one tick reuses the same engine references.
+     *
+     * Without this, the tick path calls getGameView() ~108×, getMyPlayer()
+     * dozens of times, and gameView.config()/getEnemies()/getAllies() in a
+     * tight inner loop — each one re-walking DOM selectors or
+     * playerViews().filter(). The cache turns all of that into a single
+     * lookup per tick.
+     *
+     * Slots are deliberately left lazy: helpers populate on first call so
+     * spawn-phase ticks (which never need enemies/allies) don't pay for
+     * fields they wouldn't have used anyway.
+     */
+    tickCache: null,
     // ----- RL Decision Logger (see top-of-file doc block) ---------------
     // Purely observational: populated by rlLog() and consumed by
     // dumpRlJson() / persistRlToStorage(). Resetting is done in
@@ -555,6 +570,84 @@
 
   const NativeWebSocket = window.WebSocket;
   const NativeWorker = window.Worker;
+
+  // ---------------------------------------------------------------------------
+  // Generalised timing harness (Plan §0).
+  //
+  // Wraps a synchronous function so we can measure wall time per "section"
+  // (updateWorldModel, computeThreats, refreshOverlay, etc.) and print an
+  // averaged report once per `runtime.timing.reportEveryTicks`. Off by
+  // default; flip via `runtime.debugFlags.timing = true` from devtools.
+  //
+  // Designed to be near-zero cost when disabled: the only work is the
+  // `runtime.debugFlags.timing` boolean check.
+  // ---------------------------------------------------------------------------
+  const HAS_PERF_NOW =
+    typeof performance !== "undefined" &&
+    typeof performance.now === "function";
+
+  runtime.timing = {
+    reportEveryTicks: 100,
+    lastReportTick: -999,
+    sections: new Map(), // name -> { sum, count, max }
+  };
+
+  function timingSection(name, fn) {
+    if (!runtime.debugFlags.timing || !HAS_PERF_NOW) return fn();
+    const t0 = performance.now();
+    try {
+      return fn();
+    } finally {
+      const dt = performance.now() - t0;
+      const sec = runtime.timing.sections.get(name);
+      if (sec) {
+        sec.sum += dt;
+        sec.count += 1;
+        if (dt > sec.max) sec.max = dt;
+      } else {
+        runtime.timing.sections.set(name, { sum: dt, count: 1, max: dt });
+      }
+    }
+  }
+
+  async function timingSectionAsync(name, fn) {
+    if (!runtime.debugFlags.timing || !HAS_PERF_NOW) return fn();
+    const t0 = performance.now();
+    try {
+      return await fn();
+    } finally {
+      const dt = performance.now() - t0;
+      const sec = runtime.timing.sections.get(name);
+      if (sec) {
+        sec.sum += dt;
+        sec.count += 1;
+        if (dt > sec.max) sec.max = dt;
+      } else {
+        runtime.timing.sections.set(name, { sum: dt, count: 1, max: dt });
+      }
+    }
+  }
+
+  function maybeFlushTimingReport(tick) {
+    if (!runtime.debugFlags.timing) return;
+    const t = runtime.timing;
+    if (tick - t.lastReportTick < t.reportEveryTicks) return;
+    t.lastReportTick = tick;
+    if (t.sections.size === 0) return;
+    const lines = [];
+    const sortedNames = Array.from(t.sections.keys()).sort();
+    for (const name of sortedNames) {
+      const sec = t.sections.get(name);
+      const avg = sec.count > 0 ? sec.sum / sec.count : 0;
+      lines.push(
+        name + " avg=" + avg.toFixed(2) + "ms max=" + sec.max.toFixed(2) +
+          "ms n=" + sec.count,
+      );
+    }
+    console.log("[SuperBot:timing] " + lines.join(" | "));
+    // Reset window so we get rolling 100-tick averages, not lifetime ones.
+    t.sections.clear();
+  }
 
   function botLog(message) {
     const entry = "[" + new Date().toLocaleTimeString() + "] " + message;
@@ -1079,12 +1172,18 @@
   }
 
   function getGameView() {
+    // Plan §1: consult the per-tick cache before doing anything else.
+    // The cache is set fresh at the top of runModulesForTick.
+    const cache = runtime.tickCache;
+    if (cache && cache.gameView) return cache.gameView;
+
     const existing = runtime.hooks.gameView;
     if (
       existing &&
       typeof existing.ticks === "function" &&
       typeof existing.myPlayer === "function"
     ) {
+      if (cache) cache.gameView = existing;
       return existing;
     }
 
@@ -1136,15 +1235,19 @@
   }
 
   function discoverRuntimeReferences() {
-    getGameView();
-    if (!runtime.hooks.uiState) {
-      const controlPanel = document.querySelector("control-panel");
-      if (controlPanel && controlPanel.uiState) {
-        runtime.hooks.uiState = controlPanel.uiState;
+    // Plan §7.2: short-circuit the DOM walk once both gameView and
+    // uiState are bound. The local-transport bridge still has to be
+    // re-checked every call because singleplayer Play/Leave can
+    // install / tear it down at any time.
+    if (!runtime.hooks.gameView || !runtime.hooks.uiState) {
+      getGameView();
+      if (!runtime.hooks.uiState) {
+        const controlPanel = document.querySelector("control-panel");
+        if (controlPanel && controlPanel.uiState) {
+          runtime.hooks.uiState = controlPanel.uiState;
+        }
       }
     }
-    // Re-check every discovery tick because singleplayer games install /
-    // tear down the bridge on Play/Leave.
     installLocalTransportBridge();
   }
 
@@ -1168,42 +1271,100 @@
   }
 
   function getMyPlayer() {
+    const cache = runtime.tickCache;
+    if (cache && cache.myPlayer !== undefined) return cache.myPlayer;
     const gameView = getGameView();
-    if (!gameView) return null;
-    return safeCall(() => gameView.myPlayer(), null);
+    if (!gameView) {
+      if (cache) cache.myPlayer = null;
+      return null;
+    }
+    const me = safeCall(() => gameView.myPlayer(), null);
+    if (cache) cache.myPlayer = me;
+    return me;
   }
 
   function getMyLivingPlayer() {
+    const cache = runtime.tickCache;
+    if (cache && cache.myLivingPlayer !== undefined) {
+      return cache.myLivingPlayer;
+    }
     const me = getMyPlayer();
-    if (!me) return null;
-    return safeCall(() => (me.isAlive() ? me : null), null);
+    if (!me) {
+      if (cache) cache.myLivingPlayer = null;
+      return null;
+    }
+    const living = safeCall(() => (me.isAlive() ? me : null), null);
+    if (cache) cache.myLivingPlayer = living;
+    return living;
   }
 
   function getAllPlayers() {
+    const cache = runtime.tickCache;
+    if (cache && cache.allPlayers !== undefined) return cache.allPlayers;
     const gameView = getGameView();
-    if (!gameView) return [];
-    return safeCall(
+    if (!gameView) {
+      if (cache) cache.allPlayers = [];
+      return [];
+    }
+    const players = safeCall(
       () => gameView.playerViews().filter((player) => player.isAlive()),
       [],
     );
+    if (cache) cache.allPlayers = players;
+    return players;
   }
 
   function getEnemies() {
+    const cache = runtime.tickCache;
+    if (cache && cache.enemies !== undefined) return cache.enemies;
     const me = getMyLivingPlayer();
-    if (!me) return [];
-    return getAllPlayers().filter((player) => {
-      if (player.smallID() === me.smallID()) return false;
-      return !safeCall(() => me.isFriendly(player), false);
-    });
+    if (!me) {
+      if (cache) cache.enemies = [];
+      return [];
+    }
+    const mySmallID = me.smallID();
+    const enemies = [];
+    for (const player of getAllPlayers()) {
+      if (player.smallID() === mySmallID) continue;
+      if (safeCall(() => me.isFriendly(player), false)) continue;
+      enemies.push(player);
+    }
+    if (cache) cache.enemies = enemies;
+    return enemies;
   }
 
   function getAllies() {
+    const cache = runtime.tickCache;
+    if (cache && cache.allies !== undefined) return cache.allies;
     const me = getMyLivingPlayer();
-    if (!me) return [];
-    return getAllPlayers().filter((player) => {
-      if (player.smallID() === me.smallID()) return false;
-      return safeCall(() => me.isFriendly(player), false);
-    });
+    if (!me) {
+      if (cache) cache.allies = [];
+      return [];
+    }
+    const mySmallID = me.smallID();
+    const allies = [];
+    for (const player of getAllPlayers()) {
+      if (player.smallID() === mySmallID) continue;
+      if (!safeCall(() => me.isFriendly(player), false)) continue;
+      allies.push(player);
+    }
+    if (cache) cache.allies = allies;
+    return allies;
+  }
+
+  /**
+   * Plan §1.3: cached gameView.config() reference. Many helpers call
+   * gameView.config() repeatedly within a single tick (maybeEconomy,
+   * maybeNaval, runGoal_NavalLandGrab, etc.); resolving once shaves
+   * dozens of accessor calls per tick.
+   */
+  function getCachedConfig() {
+    const cache = runtime.tickCache;
+    if (cache && cache.config !== undefined) return cache.config;
+    const gameView = getGameView();
+    const cfg = gameView ? safeCall(() => gameView.config(), null) : null;
+    if (cache) cache.config = cfg;
+    return cfg;
   }
 
   async function queryExactBorderTiles(force) {
@@ -2945,6 +3106,28 @@
     return out;
   }
 
+  // Plan §5.2: rule-tier gate. Emergency rules (incoming nuke, near
+  // death, attacker just appeared, eliminated, taunt) need to fire on
+  // the existing 5-tick cadence. Flavor rules (gold milestones,
+  // diplomacy chatter, periodic flexes) only need to fire every
+  // EMOJI_FLAVOR_PERIOD_TICKS — well within the 4 s global cooldown
+  // anyway, so the player never notices.
+  const EMOJI_FLAVOR_PERIOD_TICKS = 30;
+  const EMOJI_HIGH_PRIORITY_RULE_IDS = new Set([
+    "incoming_nuke",
+    "about_to_die",
+    "sos_under_pressure",
+    "someone_targeted_me",
+    "was_targeted_broadcast",
+    "ally_broke_on_us",
+    "enemy_eliminated",
+    "became_crown",
+    "lost_crown",
+    "nuke_launched",
+    "open_palm_stop",
+    "border_pressure_octant",
+  ]);
+
   /**
    * Per-tick emoji decision. Evaluates every rule in priority order;
    * fires at most one emoji that satisfies (a) its own per-rule
@@ -2975,6 +3158,14 @@
     }
     runtime.state.emoji.lastScanTick = tick;
 
+    // Plan §5.2: only walk the flavor rule set every
+    // EMOJI_FLAVOR_PERIOD_TICKS. The high-priority subset still walks
+    // every scan tick so emergencies surface on time.
+    const includeFlavor =
+      tick - (runtime.state.emoji.lastFlavorScanTick || -9999) >=
+      EMOJI_FLAVOR_PERIOD_TICKS;
+    if (includeFlavor) runtime.state.emoji.lastFlavorScanTick = tick;
+
     const ctx = {
       me,
       worldMe: world.me,
@@ -2983,6 +3174,7 @@
     };
 
     for (const rule of EMOJI_RULES) {
+      if (!includeFlavor && !EMOJI_HIGH_PRIORITY_RULE_IDS.has(rule.id)) continue;
       let result = null;
       try {
         result = rule.evaluate(ctx);
@@ -4002,6 +4194,12 @@
   // counts as effectively adjacent for invasion planning — even the early
   // game gates should let us hop across these safely.
   const NARROW_WATER_HOP_LIMIT = 6;
+  // Plan §3.3: refresh cadence for findNarrowWaterEnemies. Rivers don't
+  // change owner faster than a couple seconds; we re-run the BFS every
+  // 30 ticks (~ 3 s) and reuse the cached nearMap in between. Tests
+  // bypass the cache by reaching findNarrowWaterEnemies directly via
+  // runtime.test.internals.
+  const NARROW_WATER_REFRESH_TICKS = 30;
 
   // Ticks we consider a dispatched transport "in flight" before we give up
   // trying to correlate it with a surviving unit. Boats can travel a long
@@ -5976,7 +6174,11 @@
     const maxBoatDistance = getBoatDistanceLimit(gameView, me);
     const plans = [];
     const enemies = getEnemies().sort((a, b) => a.troops() - b.troops());
-    for (const enemy of enemies.slice(0, 4)) {
+    // Plan §7.3: adaptive fan-out under load, mirrors maybeNuke.
+    const heavyLoad = Boolean(runtime._lastTickHeavy);
+    const navalEnemyFanout = heavyLoad ? 3 : 4;
+    const navalCandidateFanout = heavyLoad ? 8 : 12;
+    for (const enemy of enemies.slice(0, navalEnemyFanout)) {
       const structureTiles = gatherStructureTiles(enemy);
       const structureTileSet = new Set(structureTiles);
       const randomTiles = sampleTilesForOwner(enemy.smallID(), 12, {
@@ -5988,7 +6190,7 @@
         (tile) => tile,
       );
 
-      for (const candidate of candidates.slice(0, 12)) {
+      for (const candidate of candidates.slice(0, navalCandidateFanout)) {
         const spawnTile = await queryTransportShipSpawn(candidate);
         if (spawnTile === false) continue;
         const boatDistance = gameView.manhattanDist(spawnTile, candidate);
@@ -6246,11 +6448,17 @@
       return false;
     }
 
+    // Plan §7.3: under load (last tick exceeded NUKE_HEAVY_TICK_BUDGET_MS)
+    // shrink the search fan-out so we don't compound a slow tick.
+    const heavyLoad = Boolean(runtime._lastTickHeavy);
+    const enemyFanout = heavyLoad ? 3 : 5;
+    const candidateFanout = heavyLoad ? 10 : 16;
+
     let bestPlan = null;
     for (const enemy of enemies
       .slice()
       .sort((a, b) => b.numTilesOwned() - a.numTilesOwned())
-      .slice(0, 5)) {
+      .slice(0, enemyFanout)) {
       const profile = await queryPlayerProfile(enemy);
       const candidateTiles = uniqueBy(
         gatherStructureTiles(enemy).concat(
@@ -6262,7 +6470,7 @@
         (tile) => tile,
       );
 
-      for (const candidate of candidateTiles.slice(0, 16)) {
+      for (const candidate of candidateTiles.slice(0, candidateFanout)) {
         if (wouldBreakAllianceOnNuke(candidate, nukeType)) continue;
         const buildables = await queryPlayerBuildables(candidate, [nukeType]);
         const buildable = buildables.find((entry) => entry.type === nukeType);
@@ -8650,9 +8858,17 @@
 
   // ---------- Phase 1: world model ----------
 
+  // Plan §2.2: structure-count cache cadence. Structures only change every
+  // few seconds in real games, so re-walking units(type) every tick is
+  // wasted work. We re-sample once per K ticks (≈ 0.5 s at TICKS_PER_SECOND
+  // = 10) and reuse the cached `counts` + `levels` between samples.
+  const STRUCTURE_CACHE_TICKS = 5;
+
   /**
    * Count active structures (not under construction) grouped by type for the
-   * given player. Missing units fall back to 0 so callers don't have to null-check.
+   * given player. Missing units fall back to 0 so callers don't have to
+   * null-check. Heavy: walks every structure unit on the player. Caller
+   * should prefer getOrSampleStructures() so we throttle.
    */
   function collectStructureCounts(player) {
     const counts = {
@@ -8665,15 +8881,56 @@
     };
     const levels = { ...counts };
     for (const type of StructureTypes) {
-      const units = safeCall(() => player.units(type), []);
+      let units;
+      try {
+        units = player.units(type);
+      } catch (_) {
+        continue;
+      }
+      if (!units) continue;
       for (const unit of units) {
-        if (!safeCall(() => unit.isActive(), false)) continue;
-        if (safeCall(() => unit.isUnderConstruction(), false)) continue;
+        let active = false;
+        let underConstruction = false;
+        let level = 1;
+        try {
+          active = unit.isActive();
+          underConstruction = unit.isUnderConstruction();
+          level = unit.level();
+        } catch (_) { /* swallow */ }
+        if (!active || underConstruction) continue;
         counts[type] = (counts[type] || 0) + 1;
-        levels[type] = (levels[type] || 0) + Math.max(1, safeCall(() => unit.level(), 1));
+        levels[type] = (levels[type] || 0) + Math.max(1, level || 1);
       }
     }
     return { counts, levels };
+  }
+
+  /**
+   * Plan §2.2: cached per-opponent structure sampler. Reuses the most
+   * recently sampled `{ counts, levels }` until STRUCTURE_CACHE_TICKS has
+   * elapsed. Cache is stored on the same per-smallID history entry so it
+   * is automatically pruned alongside dead-player history.
+   */
+  function getOrSampleStructures(player, historyEntry, tick) {
+    if (
+      historyEntry &&
+      historyEntry.structures &&
+      historyEntry.structureLevels &&
+      typeof historyEntry.structuresAt === "number" &&
+      tick - historyEntry.structuresAt < STRUCTURE_CACHE_TICKS
+    ) {
+      return {
+        counts: historyEntry.structures,
+        levels: historyEntry.structureLevels,
+      };
+    }
+    const fresh = collectStructureCounts(player);
+    if (historyEntry) {
+      historyEntry.structures = fresh.counts;
+      historyEntry.structureLevels = fresh.levels;
+      historyEntry.structuresAt = tick;
+    }
+    return fresh;
   }
 
   function normalizeClanTag(value) {
@@ -8787,14 +9044,23 @@
   /**
    * Refresh the world model. Called at the top of every active-phase tick.
    * Cheap: only uses synchronous GameView reads, no worker RPCs.
+   *
+   * Plan §2 hot-path rewrite: collapses the 20-per-opponent safeCall storm
+   * into a single try/catch, caches structure counts via the per-smallID
+   * history entry, caches clan tag for the duration of the match, reuses
+   * world.bySmallID across ticks, and skips velocity rankings unless RL
+   * is enabled.
    */
   function updateWorldModel(me, borderTiles) {
     const gameView = getGameView();
     if (!gameView || !me) return;
 
-    const tick = safeCall(() => gameView.ticks(), 0);
-    const allPlayers = safeCall(() => gameView.playerViews(), []);
-    const alive = allPlayers.filter((p) => safeCall(() => p.isAlive(), false));
+    let tick = 0;
+    let allPlayers = [];
+    try {
+      tick = gameView.ticks();
+      allPlayers = gameView.playerViews();
+    } catch (_) { /* swallow */ }
 
     // Identity: learn our clan tag once, when the game starts.
     if (!runtime.identity.clanTag) {
@@ -8805,19 +9071,23 @@
       }
     }
 
-    const meSmallID = safeCall(() => me.smallID(), null);
+    let meSmallID = null;
+    try { meSmallID = me.smallID(); } catch (_) { /* swallow */ }
     const trustedTags = trustedClanTags();
-    const sample = (player) => {
-      const troops = safeCall(() => player.troops(), 0);
-      const tiles = safeCall(() => player.numTilesOwned(), 0);
-      const gold = Number(safeCall(() => player.gold(), 0));
-      return { tick, troops, tiles, gold };
-    };
+    const cfg = getCachedConfig();
+    const rlEnabled = Boolean(runtime.rl && runtime.rl.enabled);
 
     const shouldSample =
       runtime.world.tick === 0 ||
       tick - runtime.world.tick >= HISTORY_SAMPLE_EVERY ||
       runtime.world.history.size === 0;
+
+    // Plan §2.6: reuse the same Map across ticks instead of allocating a
+    // fresh one. `bySmallID.clear()` keeps the underlying capacity so
+    // re-inserts are amortised O(1).
+    const bySmallID = runtime.world.bySmallID || new Map();
+    bySmallID.clear();
+    runtime.world.bySmallID = bySmallID;
 
     const everyone = [];
     const livingSmallIDs = new Set();
@@ -8825,68 +9095,124 @@
     let nationCount = 0;
     let botCount = 0;
 
-    for (const player of alive) {
-      const smallID = safeCall(() => player.smallID(), null);
-      if (smallID === null) continue;
+    for (const player of allPlayers) {
+      // Plan §2.1: collapse ~20 closure allocations per opponent into a
+      // single outer try block. We pre-declare every field with a default
+      // and overwrite within the try; on a thrown accessor we keep the
+      // partial values we already managed to read.
+      let alive = false;
+      let smallID = null;
+      let type = null;
+      let id = null;
+      let displayName = "?";
+      let isDisconnected = false;
+      let isTraitor = false;
+      let traitorRemainingTicks = 0;
+      let hasSpawned = false;
+      let troops = 0;
+      let tiles = 0;
+      let gold = 0;
+      let maxTroops = 1;
+      let isFriendlyEngine = false;
+      let isAlliedWith = false;
+      let isOnSameTeam = false;
+      let incomingAttacks = [];
+      let outgoingAttacks = [];
+      let alliances = [];
+      let alliesList = [];
+
+      try {
+        alive = player.isAlive();
+        smallID = player.smallID();
+        type = player.type();
+        id = player.id();
+        displayName = player.displayName();
+        isDisconnected = player.isDisconnected();
+        isTraitor = player.isTraitor();
+        traitorRemainingTicks = player.getTraitorRemainingTicks();
+        hasSpawned = player.hasSpawned();
+        troops = player.troops();
+        tiles = player.numTilesOwned();
+        gold = Number(player.gold());
+        if (cfg) maxTroops = cfg.maxTroops(player) || 1;
+        if (smallID !== meSmallID) {
+          isFriendlyEngine = me.isFriendly(player);
+          isAlliedWith = me.isAlliedWith(player);
+          isOnSameTeam = me.isOnSameTeam(player);
+        }
+        incomingAttacks = player.incomingAttacks() || [];
+        outgoingAttacks = player.outgoingAttacks() || [];
+        alliances = player.alliances() || [];
+        alliesList = player.allies() || [];
+      } catch (_) { /* swallow — keep partial values */ }
+
+      if (!alive || smallID === null) continue;
       livingSmallIDs.add(smallID);
 
-      const type = safeCall(() => player.type(), null);
       if (type === PlayerType.Bot) botCount += 1;
       else if (type === PlayerType.Nation) nationCount += 1;
       else if (type === PlayerType.Human) humanCount += 1;
 
       if (shouldSample) {
-        pushHistorySample(smallID, sample(player));
+        pushHistorySample(smallID, { tick, troops, tiles, gold });
       }
       const historyEntry = runtime.world.history.get(smallID);
       const velocities = computeVelocities(historyEntry, tick);
-      const { counts, levels } = collectStructureCounts(player);
-      const clanTag = extractClanTag(player);
+
+      // Plan §2.2: throttle structure walks via per-history cache.
+      const { counts, levels } = getOrSampleStructures(
+        player,
+        historyEntry,
+        tick,
+      );
+
+      // Plan §2.3: clan tag is fixed for the match — resolve once and
+      // memoise on the history entry.
+      let clanTag;
+      if (historyEntry && historyEntry.clanTag !== undefined) {
+        clanTag = historyEntry.clanTag;
+      } else {
+        clanTag = extractClanTag(player);
+        if (historyEntry) historyEntry.clanTag = clanTag;
+      }
       const isClanmate =
         smallID !== meSmallID && clanTag && trustedTags.has(clanTag);
       const isFriendly =
-        smallID === meSmallID ||
-        safeCall(() => me.isFriendly(player), false) ||
-        Boolean(isClanmate);
+        smallID === meSmallID || isFriendlyEngine || Boolean(isClanmate);
       const isAlly =
-        smallID !== meSmallID &&
-        (safeCall(() => me.isAlliedWith(player), false) ||
-          safeCall(() => me.isOnSameTeam(player), false));
-      const maxTroops = safeCall(
-        () => gameView.config().maxTroops(player),
-        1,
-      );
-      const incomingAttacks = safeCall(
-        () => player.incomingAttacks(),
-        [],
-      );
-      const outgoingAttacks = safeCall(
-        () => player.outgoingAttacks(),
-        [],
-      );
-      const incomingTroops = incomingAttacks.reduce(
-        (sum, attack) => sum + safeCall(() => attack.troops(), 0),
-        0,
-      );
-      const outgoingTroops = outgoingAttacks.reduce(
-        (sum, attack) => sum + safeCall(() => attack.troops(), 0),
-        0,
-      );
+        smallID !== meSmallID && (isAlliedWith || isOnSameTeam);
 
-      const alliances = safeCall(() => player.alliances(), []);
-      const allyIDs = safeCall(
-        () =>
-          safeCall(() => player.allies(), []).map((a) =>
-            safeCall(() => a.smallID(), null),
-          ),
-        [],
-      ).filter((id) => id !== null);
+      // Reduce attack-troop totals without per-element safeCall.
+      let incomingTroops = 0;
+      for (const attack of incomingAttacks) {
+        let n = 0;
+        try {
+          n = typeof attack.troops === "function" ? attack.troops() : (attack.troops || 0);
+        } catch (_) { /* swallow */ }
+        incomingTroops += n;
+      }
+      let outgoingTroops = 0;
+      for (const attack of outgoingAttacks) {
+        let n = 0;
+        try {
+          n = typeof attack.troops === "function" ? attack.troops() : (attack.troops || 0);
+        } catch (_) { /* swallow */ }
+        outgoingTroops += n;
+      }
 
-      everyone.push({
+      // Build allyIDs without nested safeCall closures.
+      const allyIDs = [];
+      for (const a of alliesList) {
+        let aid = null;
+        try { aid = a.smallID(); } catch (_) { /* swallow */ }
+        if (aid !== null) allyIDs.push(aid);
+      }
+
+      const entry = {
         smallID,
-        id: safeCall(() => player.id(), null),
+        id,
         player,
-        name: safeCall(() => player.displayName(), "?"),
+        name: displayName,
         type,
         clanTag,
         isMe: smallID === meSmallID,
@@ -8894,18 +9220,15 @@
         isFriendly,
         isAlly,
         isEnemy: !isFriendly,
-        isDisconnected: safeCall(() => player.isDisconnected(), false),
-        isTraitor: safeCall(() => player.isTraitor(), false),
-        traitorRemainingTicks: safeCall(
-          () => player.getTraitorRemainingTicks(),
-          0,
-        ),
-        hasSpawned: safeCall(() => player.hasSpawned(), false),
-        troops: sample(player).troops,
-        tiles: sample(player).tiles,
-        gold: sample(player).gold,
+        isDisconnected,
+        isTraitor,
+        traitorRemainingTicks,
+        hasSpawned,
+        troops,
+        tiles,
+        gold,
         maxTroops,
-        troopRatio: maxTroops > 0 ? sample(player).troops / maxTroops : 0,
+        troopRatio: maxTroops > 0 ? troops / maxTroops : 0,
         structures: counts,
         structureLevels: levels,
         tilesPerMin: velocities.tilesPerMin,
@@ -8917,21 +9240,33 @@
         outgoingTroops,
         allyIDs,
         alliances,
-      });
+        // Used by isOnSameTeam fast-path in buildAllianceGraph.
+        _onSameTeamWith: null,
+      };
+      everyone.push(entry);
+      bySmallID.set(smallID, entry);
     }
 
     pruneStaleHistory(livingSmallIDs);
 
-    const bySmallID = new Map();
-    for (const entry of everyone) bySmallID.set(entry.smallID, entry);
-
     // Totals & land shares.
-    const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
-    const falloutTiles = safeCall(() => gameView.numTilesWithFallout(), 0);
+    let totalLand = 1;
+    let falloutTiles = 0;
+    try {
+      totalLand = Math.max(1, gameView.numLandTiles() || 1);
+      falloutTiles = gameView.numTilesWithFallout() || 0;
+    } catch (_) { /* swallow */ }
     const usableLand = Math.max(1, totalLand - falloutTiles);
-    const sortedByTiles = everyone
-      .slice()
-      .sort((a, b) => b.tiles - a.tiles || a.smallID - b.smallID);
+
+    // Plan §2.4: always compute byTiles + byTroops (cheap, consumed
+    // tactically). Only compute the velocity rankings when the RL logger
+    // is enabled — they are referenced exclusively by RL world snapshots.
+    const sortedByTiles = everyone.slice().sort(
+      (a, b) => b.tiles - a.tiles || a.smallID - b.smallID,
+    );
+    const sortedByTroops = everyone.slice().sort(
+      (a, b) => b.troops - a.troops || a.smallID - b.smallID,
+    );
     const firstTiles = sortedByTiles[0] ? sortedByTiles[0].tiles : 0;
     const secondTiles = sortedByTiles[1] ? sortedByTiles[1].tiles : 0;
     const myEntry = bySmallID.get(meSmallID) || null;
@@ -8953,18 +9288,22 @@
       secondShare: secondTiles / usableLand,
     };
     runtime.world.rankings.byTiles = sortedByTiles.map((e) => e.smallID);
-    runtime.world.rankings.byTroops = everyone
-      .slice()
-      .sort((a, b) => b.troops - a.troops || a.smallID - b.smallID)
-      .map((e) => e.smallID);
-    runtime.world.rankings.byTilesVelocity = everyone
-      .slice()
-      .sort((a, b) => b.tilesPerMin - a.tilesPerMin || a.smallID - b.smallID)
-      .map((e) => e.smallID);
-    runtime.world.rankings.byTroopsVelocity = everyone
-      .slice()
-      .sort((a, b) => b.troopsPerMin - a.troopsPerMin || a.smallID - b.smallID)
-      .map((e) => e.smallID);
+    runtime.world.rankings.byTroops = sortedByTroops.map((e) => e.smallID);
+    if (rlEnabled) {
+      runtime.world.rankings.byTilesVelocity = everyone
+        .slice()
+        .sort((a, b) => b.tilesPerMin - a.tilesPerMin || a.smallID - b.smallID)
+        .map((e) => e.smallID);
+      runtime.world.rankings.byTroopsVelocity = everyone
+        .slice()
+        .sort((a, b) => b.troopsPerMin - a.troopsPerMin || a.smallID - b.smallID)
+        .map((e) => e.smallID);
+    } else {
+      // Keep the arrays present so legacy callers see a defined shape.
+      // They get refreshed the moment RL flips back on.
+      runtime.world.rankings.byTilesVelocity = runtime.world.rankings.byTilesVelocity || [];
+      runtime.world.rankings.byTroopsVelocity = runtime.world.rankings.byTroopsVelocity || [];
+    }
 
     buildAllianceGraph(everyone, bySmallID, usableLand);
 
@@ -8984,21 +9323,33 @@
     for (const entry of everyone) {
       edges.set(entry.smallID, new Set());
     }
+
+    // Plan §2.5: skip the O(N²) per-pair isOnSameTeam scan when we're not
+    // in a team mode at all — this is the common case (FFA matches), and
+    // the inner safeCall closure was the dominant per-tick allocation in
+    // updateWorldModel for 8+ player games.
+    const gameView = getGameView();
+    const teamMode = gameView ? isTeamMode(gameView) : false;
+
     for (const entry of everyone) {
       for (const otherId of entry.allyIDs) {
         if (!bySmallID.has(otherId)) continue;
         edges.get(entry.smallID).add(otherId);
         edges.get(otherId).add(entry.smallID);
       }
-      // Team mode: add every teammate.
+      if (!teamMode) continue;
+      // Team mode: add every teammate. Tries the cached `_onSameTeamWith`
+      // map (built once per match per smallID pair) before falling back to
+      // the engine call.
       for (const other of everyone) {
         if (other.smallID === entry.smallID) continue;
-        if (
-          safeCall(
-            () => entry.player.isOnSameTeam && entry.player.isOnSameTeam(other.player),
-            false,
-          )
-        ) {
+        let same = false;
+        try {
+          if (entry.player && entry.player.isOnSameTeam) {
+            same = entry.player.isOnSameTeam(other.player);
+          }
+        } catch (_) { /* swallow */ }
+        if (same) {
           edges.get(entry.smallID).add(other.smallID);
           edges.get(other.smallID).add(entry.smallID);
         }
@@ -9048,16 +9399,26 @@
 
   /**
    * Cheap proximity approximation: is this enemy bordering us right now?
-   * Uses the synchronous `sharesBorderWith` check when available; otherwise we
-   * inspect our current border-tile neighbors.
+   * Uses the synchronous `sharesBorderWith` check when available; otherwise
+   * we inspect our current border-tile neighbors.
+   *
+   * Plan §3.2: capability-detect `sharesBorderWith` once per match (stored
+   * on tickCache.hasSharesBorder) so the hot loop doesn't pay a closure +
+   * try/catch + typeof check on every opponent every tick.
    */
   function isAdjacentTo(me, other, borderTiles) {
     if (!me || !other) return false;
-    const shared = safeCall(
-      () => typeof me.sharesBorderWith === "function" && me.sharesBorderWith(other.player),
-      null,
-    );
-    if (shared !== null) return Boolean(shared);
+    const cache = runtime.tickCache;
+    let hasShares = cache ? cache.hasSharesBorder : undefined;
+    if (hasShares === undefined) {
+      hasShares = typeof me.sharesBorderWith === "function";
+      if (cache) cache.hasSharesBorder = hasShares;
+    }
+    if (hasShares) {
+      try {
+        return Boolean(me.sharesBorderWith(other.player));
+      } catch (_) { /* fall through to BFS fallback */ }
+    }
     const gameView = getGameView();
     if (!gameView || !borderTiles) return false;
     const otherSmallID = other.smallID;
@@ -9078,6 +9439,7 @@
     const world = runtime.world;
     if (!me || world.everyone.length === 0) return;
 
+    const tickNow = world.tick || 0;
     const totals = world.totals;
     const crownThreshold =
       world.threats.crownSmallID === world.prevCrownSmallID
@@ -9126,12 +9488,15 @@
     const incomingBySmallID = new Map();
     if (meEntry && Array.isArray(meEntry.incomingAttacks)) {
       for (const attack of meEntry.incomingAttacks) {
-        const attackerID = safeCall(() => attack.attackerID, null);
-        if (attackerID === null || attackerID === 0) continue;
-        const troops =
-          typeof attack.troops === "function"
-            ? safeCall(() => attack.troops(), 0)
+        let attackerID = null;
+        let troops = 0;
+        try {
+          attackerID = attack.attackerID;
+          troops = typeof attack.troops === "function"
+            ? attack.troops()
             : Number(attack.troops) || 0;
+        } catch (_) { /* swallow */ }
+        if (attackerID === null || attackerID === 0) continue;
         incomingBySmallID.set(
           attackerID,
           (incomingBySmallID.get(attackerID) || 0) + troops,
@@ -9158,13 +9523,40 @@
 
       if (crownEntry && entry.smallID === crownEntry.smallID) tags.add("CROWN");
 
-      // Nuke readiness lookahead.
-      const silos = safeCall(
-        () => entry.player.units(UnitType.MissileSilo),
-        [],
-      ).filter((u) => safeCall(() => u.isActive(), false) && !safeCall(() => u.isUnderConstruction(), false));
+      // Nuke readiness lookahead. Plan §3.1: throttle the silo walk via
+      // the per-history cache; silo construction completes far slower
+      // than tick cadence so a 5-tick refresh is plenty.
+      const historyEntry = world.history && world.history.get(entry.smallID);
+      let activeSilos = 0;
+      if (
+        historyEntry &&
+        typeof historyEntry.activeSilosAt === "number" &&
+        tickNow - historyEntry.activeSilosAt < STRUCTURE_CACHE_TICKS
+      ) {
+        activeSilos = historyEntry.activeSilos || 0;
+      } else {
+        let siloUnits = null;
+        try {
+          siloUnits = entry.player.units(UnitType.MissileSilo);
+        } catch (_) { /* swallow */ }
+        if (siloUnits) {
+          for (const u of siloUnits) {
+            let active = false;
+            let underConstruction = false;
+            try {
+              active = u.isActive();
+              underConstruction = u.isUnderConstruction();
+            } catch (_) { /* swallow */ }
+            if (active && !underConstruction) activeSilos += 1;
+          }
+        }
+        if (historyEntry) {
+          historyEntry.activeSilos = activeSilos;
+          historyEntry.activeSilosAt = tickNow;
+        }
+      }
       let nukeReadiness = 0;
-      if (silos.length > 0) nukeReadiness += 1;
+      if (activeSilos > 0) nukeReadiness += 1;
       if (entry.gold >= ATOM_GOLD_THRESHOLD) nukeReadiness += 1;
       if (entry.gold >= HYDRO_GOLD_THRESHOLD) nukeReadiness += 1;
       if (entry.gold >= MIRV_GOLD_THRESHOLD) nukeReadiness += 2;
@@ -9409,15 +9801,41 @@
     // reachable with a short water hop. These are first-class invasion
     // targets — a neighbour across a 2-tile river is effectively adjacent
     // from a strategic standpoint.
+    //
+    // Plan §3.3: this BFS seeds from every shore tile, so the per-tick
+    // cost scales with borderTiles.length. Rivers do not change owner on
+    // sub-second cadence, so we recompute at most every
+    // NARROW_WATER_REFRESH_TICKS (≈ 3 s) and reuse the cached list in
+    // between. The cached `nearMap` is invalidated implicitly when
+    // `borderTiles` changes substantially (we re-key on length and the
+    // first/last tile so a typical land-grab triggers a refresh).
     const gameView = getGameView();
-    const narrowWaterNeighbors = [];
+    let narrowWaterNeighbors = [];
     if (gameView && me && borderTiles && borderTiles.length > 0) {
-      const nearMap = findNarrowWaterEnemies(
-        gameView,
-        me,
-        borderTiles,
-        NARROW_WATER_HOP_LIMIT,
-      );
+      const cache = runtime.state.narrowWaterCache || {};
+      runtime.state.narrowWaterCache = cache;
+      const cacheKey = borderTiles.length === 0
+        ? "empty"
+        : borderTiles.length + ":" + borderTiles[0] + ":" + borderTiles[borderTiles.length - 1];
+      const fresh =
+        typeof cache.tick === "number" &&
+        tickNow - cache.tick < NARROW_WATER_REFRESH_TICKS &&
+        cache.key === cacheKey &&
+        cache.nearMap;
+      let nearMap;
+      if (fresh) {
+        nearMap = cache.nearMap;
+      } else {
+        nearMap = findNarrowWaterEnemies(
+          gameView,
+          me,
+          borderTiles,
+          NARROW_WATER_HOP_LIMIT,
+        );
+        cache.tick = tickNow;
+        cache.key = cacheKey;
+        cache.nearMap = nearMap;
+      }
       for (const [smallID, info] of nearMap) {
         const entry = world.bySmallID.get(smallID);
         if (!entry) continue;
@@ -10606,8 +11024,15 @@
     },
   ];
 
+  // Plan §6.1: O(1) goal lookup. The original GOAL_SPECS.find() was
+  // called from every selectPrimaryGoal() (~24 entries), every
+  // setForcedGoal(), and the maybeEmit* helpers — turning a per-tick
+  // hot path into 24 pointer comparisons each call. The Map shaves
+  // those into a single hash hit.
+  const GOAL_SPEC_BY_ID = new Map(GOAL_SPECS.map((spec) => [spec.id, spec]));
+
   function goalSpecById(id) {
-    return GOAL_SPECS.find((spec) => spec.id === id) || null;
+    return GOAL_SPEC_BY_ID.get(id) || null;
   }
 
   /**
@@ -10667,15 +11092,16 @@
         context: evaluation.context || null,
       });
     }
-    // Deterministic tiebreaker: equal-priority goals sort alphabetically by
-    // id so the planner's output is reproducible tick-to-tick. Without this
-    // Array.prototype.sort can shuffle ties on different JS engines.
-    planner.lastEvaluation = evaluations
-      .slice()
-      .sort((a, b) => {
-        if (b.priority !== a.priority) return b.priority - a.priority;
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-      });
+    // Plan §6.2: deterministic tiebreaker — equal-priority goals sort
+    // alphabetically by id so the planner's output is reproducible
+    // tick-to-tick. Without this Array.prototype.sort can shuffle ties
+    // on different JS engines. The .slice() is unnecessary because
+    // evaluations is a freshly allocated array we own — sort in place.
+    evaluations.sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    planner.lastEvaluation = evaluations;
 
     const winner = planner.lastEvaluation.find((e) => e.valid);
     if (!winner) return null;
@@ -11167,6 +11593,20 @@
   }
 
   async function runModulesForTick() {
+    // Plan §1: spin up a fresh per-tick view cache so every helper inside
+    // this tick reuses the same engine references. The cache is keyed on
+    // the tick number so a stale cache is impossible — the next tick
+    // overwrites it wholesale at the top of the function.
+    runtime.tickCache = {
+      tick: -1,
+      gameView: null,
+      myPlayer: undefined,
+      myLivingPlayer: undefined,
+      allPlayers: undefined,
+      enemies: undefined,
+      allies: undefined,
+      config: undefined,
+    };
     discoverRuntimeReferences();
     const gameView = getGameView();
     if (!gameView) {
@@ -11181,6 +11621,7 @@
       return;
     }
     runtime.lastProcessedTick = tick;
+    runtime.tickCache.tick = tick;
     runtime.state.lastIntentSignature = "";
 
     if (gameView.inSpawnPhase()) {
@@ -11204,32 +11645,9 @@
 
     const borderTiles = await queryExactBorderTiles(false);
 
-    // Phase 1 acceptance: instrument updateWorldModel timing behind a flag.
-    const tStart = runtime.debugFlags.timing ? performance.now() : 0;
-    updateWorldModel(me, borderTiles);
-    if (runtime.debugFlags.timing) {
-      const dt = performance.now() - tStart;
-      runtime._timingSampleSum += dt;
-      runtime._timingSampleCount += 1;
-      if (runtime.world.tick - runtime._timingLoggedAt >= 100) {
-        runtime._timingLoggedAt = runtime.world.tick;
-        const avg =
-          runtime._timingSampleCount > 0
-            ? runtime._timingSampleSum / runtime._timingSampleCount
-            : 0;
-        console.log(
-          "[SuperBot:timing] updateWorldModel avg " +
-            avg.toFixed(2) +
-            " ms over " +
-            runtime._timingSampleCount +
-            " ticks",
-        );
-        runtime._timingSampleSum = 0;
-        runtime._timingSampleCount = 0;
-      }
-    }
-
-    computeThreats(me, borderTiles);
+    // Plan §0: per-section timing harness behind runtime.debugFlags.timing.
+    timingSection("updateWorldModel", () => updateWorldModel(me, borderTiles));
+    timingSection("computeThreats", () => computeThreats(me, borderTiles));
     classifyMapIfNeeded(me);
     maybePeriodicIntelLog();
     updateSnapshot(me, borderTiles);
@@ -11247,15 +11665,19 @@
     // after world/threats/snapshot so every detector sees a consistent
     // view, and BEFORE goal planning so the per-tick emoji reflects the
     // *pre-decision* state ("I'm being attacked" before "I respond").
-    safeCall(() => maybeEmitEmoji(me), null);
+    timingSection("maybeEmitEmoji", () => safeCall(() => maybeEmitEmoji(me), null));
 
     // RL decision logger: sample world/delta/threats and drain outcomes.
     // Runs BEFORE planner so we can emit "state at tick T" and then pair
     // `planner_decision` in the same tick.
-    safeCall(() => maybeEmitPeriodicRL(me, borderTiles), null);
-    safeCall(() => drainRlOutcomes(tick, me), null);
+    timingSection("rlPeriodic", () => {
+      safeCall(() => maybeEmitPeriodicRL(me, borderTiles), null);
+      safeCall(() => drainRlOutcomes(tick, me), null);
+    });
 
-    const selection = selectPrimaryGoal();
+    const selection = timingSection("selectPrimaryGoal", () =>
+      selectPrimaryGoal(),
+    );
     adoptGoal(selection);
     safeCall(() => maybeEmitPlannerDecision(selection), null);
 
@@ -12084,7 +12506,7 @@
       planner.forcedGoalExpiresMs = Date.now() + 120_000;
       botLog("force-goal -> " + goalId);
     }
-    refreshOverlay();
+    refreshOverlay({ force: true });
   }
 
   function setArchetypeLock(value) {
@@ -12095,7 +12517,7 @@
     } else {
       botLog("archetype lock cleared");
     }
-    refreshOverlay();
+    refreshOverlay({ force: true });
   }
 
   function setExtraClanTags(csv) {
@@ -12749,7 +13171,7 @@
     toggleButton.addEventListener("click", () => {
       runtime.enabled = !runtime.enabled;
       botLog(runtime.enabled ? "bot enabled" : "bot disabled");
-      refreshOverlay();
+      refreshOverlay({ force: true });
     });
 
     modeButton.addEventListener("click", () => {
@@ -12757,7 +13179,7 @@
       else if (runtime.mode === "aggressive") runtime.mode = "turtle";
       else runtime.mode = "balanced";
       botLog("mode -> " + runtime.mode);
-      refreshOverlay();
+      refreshOverlay({ force: true });
     });
 
     exportButton.addEventListener("click", () => {
@@ -12807,7 +13229,7 @@
       clearBtn.addEventListener("click", () => {
         runtime.planner.forcedGoalId = null;
         runtime.planner.forcedGoalExpiresMs = 0;
-        refreshOverlay();
+        refreshOverlay({ force: true });
       });
       overrideRow.appendChild(clearBtn);
     }
@@ -12833,7 +13255,7 @@
       });
     }
 
-    refreshOverlay();
+    refreshOverlay({ force: true });
   }
 
   /**
@@ -12886,7 +13308,51 @@
       .replace(/"/g, "&quot;");
   }
 
-  function refreshOverlay() {
+  // Plan §4.1: most refreshOverlay() callsites fire from inside the tick
+  // loop *and* the overlay timer already runs at 500 ms. Coalesce: only
+  // actually rebuild the overlay at most once per OVERLAY_MIN_REFRESH_MS.
+  // Click handlers and the standalone setInterval still get fresh renders
+  // because the timer's 500 ms cadence aligns with this floor.
+  const OVERLAY_MIN_REFRESH_MS = 250;
+
+  function refreshOverlay(opts) {
+    const force = Boolean(opts && opts.force);
+    const now =
+      typeof performance !== "undefined" &&
+      typeof performance.now === "function"
+        ? performance.now()
+        : Date.now();
+    if (
+      !force &&
+      runtime.overlay._lastRefreshAtMs &&
+      now - runtime.overlay._lastRefreshAtMs < OVERLAY_MIN_REFRESH_MS
+    ) {
+      // Mark a deferred refresh: when the timer-driven refreshOverlay()
+      // fires next, _lastRefreshAtMs will already be stale so it will
+      // do the work. No need to schedule a separate timeout.
+      return;
+    }
+    runtime.overlay._lastRefreshAtMs = now;
+    return timingSection("refreshOverlay", refreshOverlayInner);
+  }
+
+  /**
+   * Plan §4.2: write innerHTML only when the rendered string actually
+   * changed. Saves the layout/reflow cost of rewriting identical HTML.
+   */
+  function setHtmlIfChanged(root, html) {
+    if (!root) return;
+    if (root._lastHtml === html) return;
+    root._lastHtml = html;
+    root.innerHTML = html;
+  }
+
+  function setRowsIfChanged(root, rows) {
+    if (!root) return;
+    setHtmlIfChanged(root, renderRows(rows));
+  }
+
+  function refreshOverlayInner() {
     ensureOverlay();
     if (!runtime.overlay.root) return;
 
@@ -12923,7 +13389,7 @@
     }
 
     if (hooksRoot) {
-      hooksRoot.innerHTML = renderRows([
+      setRowsIfChanged(hooksRoot, [
         {
           label: "WebSocket",
           value: runtime.hooks.socket
@@ -12961,7 +13427,7 @@
     }
 
     if (stateRoot) {
-      stateRoot.innerHTML = renderRows([
+      setRowsIfChanged(stateRoot, [
         { label: "Phase", value: runtime.state.matchPhase },
         {
           label: "Strategy",
@@ -12987,7 +13453,8 @@
 
     if (statsRoot) {
       const stats = runtime.statsSnapshot;
-      statsRoot.innerHTML = renderRows(
+      setRowsIfChanged(
+        statsRoot,
         stats
           ? [
               { label: "Tick", value: String(stats.tick) },
@@ -13014,7 +13481,7 @@
         .map((s) => s.name + " (+" + s.tilesPerMin.toFixed(0) + "/m)")
         .join(", ") || "-";
       const danger = world.threats.nearestDanger;
-      intelRoot.innerHTML = renderRows([
+      setRowsIfChanged(intelRoot, [
         { label: "Archetype", value: world.archetype || "unknown" },
         {
           label: "Coalition",
@@ -13139,16 +13606,21 @@
           );
         })
         .join("");
-      goalRoot.innerHTML = header + `<div style="margin-top:6px">${list}</div>`;
+      setHtmlIfChanged(
+        goalRoot,
+        header + `<div style="margin-top:6px">${list}</div>`,
+      );
     }
 
     if (reasonsRoot) {
       const entries = runtime.reasons.slice(-8).reverse();
       if (entries.length === 0) {
-        reasonsRoot.innerHTML =
-          '<div style="color: rgba(216, 228, 255, 0.5); font-size: 11px;">no reasoned actions yet</div>';
+        setHtmlIfChanged(
+          reasonsRoot,
+          '<div style="color: rgba(216, 228, 255, 0.5); font-size: 11px;">no reasoned actions yet</div>',
+        );
       } else {
-        reasonsRoot.innerHTML = entries
+        const html = entries
           .map((entry) => {
             const desc = GOAL_DESCRIPTIONS[entry.goalId];
             const headTitle = desc
@@ -13165,6 +13637,7 @@
             );
           })
           .join("");
+        setHtmlIfChanged(reasonsRoot, html);
       }
     }
 
@@ -13195,19 +13668,27 @@
     }
 
     if (decisionsRoot) {
-      decisionsRoot.innerHTML = runtime.decisions
+      const html = runtime.decisions
         .slice(-18)
         .map((entry) => '<div class="superbot-log-line">' + escapeHtml(entry) + "</div>")
         .join("");
-      decisionsRoot.scrollTop = decisionsRoot.scrollHeight;
+      if (decisionsRoot._lastHtml !== html) {
+        decisionsRoot._lastHtml = html;
+        decisionsRoot.innerHTML = html;
+        decisionsRoot.scrollTop = decisionsRoot.scrollHeight;
+      }
     }
 
     if (activityRoot) {
-      activityRoot.innerHTML = runtime.logs
+      const html = runtime.logs
         .slice(-22)
         .map((entry) => '<div class="superbot-log-line">' + escapeHtml(entry) + "</div>")
         .join("");
-      activityRoot.scrollTop = activityRoot.scrollHeight;
+      if (activityRoot._lastHtml !== html) {
+        activityRoot._lastHtml = html;
+        activityRoot.innerHTML = html;
+        activityRoot.scrollTop = activityRoot.scrollHeight;
+      }
     }
   }
 
@@ -13236,7 +13717,16 @@
         // loop interval anyway. Skip when disabled or paused.
         await new Promise((resolve) => setTimeout(resolve, Math.min(delay, 260)));
       }
-      await runModulesForTick();
+      // Plan §7.3: track per-tick wall-time so the offensive fan-out
+      // helpers can self-throttle on slow hosts (Firefox under load).
+      const tickStart = HAS_PERF_NOW ? performance.now() : 0;
+      await timingSectionAsync("runModulesForTick", () => runModulesForTick());
+      if (HAS_PERF_NOW) {
+        const dt = performance.now() - tickStart;
+        runtime._lastTickMs = dt;
+        runtime._lastTickHeavy = dt > 60;
+      }
+      maybeFlushTimingReport(runtime.world.tick);
     } catch (error) {
       decisionLog("loop error: " + error.message);
       console.error("[SuperBot] loop error", error);
@@ -13980,7 +14470,9 @@
 
   function init() {
     window.__superhumanBotRuntime = runtime;
-    window.__superhumanBotRefreshOverlay = refreshOverlay;
+    // Tests + manual devtools usage want a guaranteed-immediate refresh.
+    // The throttled path is for the tick loop; the public API forces.
+    window.__superhumanBotRefreshOverlay = () => refreshOverlay({ force: true });
     window.__superhumanBotDebug = {
       dumpWorld: () => dumpWorldJson(),
       forceGoal: (id) => setForcedGoal(id),
