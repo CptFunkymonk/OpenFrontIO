@@ -12314,7 +12314,7 @@
       planner.forcedGoalExpiresMs = Date.now() + 120_000;
       botLog("force-goal -> " + goalId);
     }
-    refreshOverlay();
+    refreshOverlay({ force: true });
   }
 
   function setArchetypeLock(value) {
@@ -12325,7 +12325,7 @@
     } else {
       botLog("archetype lock cleared");
     }
-    refreshOverlay();
+    refreshOverlay({ force: true });
   }
 
   function setExtraClanTags(csv) {
@@ -12979,7 +12979,7 @@
     toggleButton.addEventListener("click", () => {
       runtime.enabled = !runtime.enabled;
       botLog(runtime.enabled ? "bot enabled" : "bot disabled");
-      refreshOverlay();
+      refreshOverlay({ force: true });
     });
 
     modeButton.addEventListener("click", () => {
@@ -12987,7 +12987,7 @@
       else if (runtime.mode === "aggressive") runtime.mode = "turtle";
       else runtime.mode = "balanced";
       botLog("mode -> " + runtime.mode);
-      refreshOverlay();
+      refreshOverlay({ force: true });
     });
 
     exportButton.addEventListener("click", () => {
@@ -13037,7 +13037,7 @@
       clearBtn.addEventListener("click", () => {
         runtime.planner.forcedGoalId = null;
         runtime.planner.forcedGoalExpiresMs = 0;
-        refreshOverlay();
+        refreshOverlay({ force: true });
       });
       overrideRow.appendChild(clearBtn);
     }
@@ -13063,7 +13063,7 @@
       });
     }
 
-    refreshOverlay();
+    refreshOverlay({ force: true });
   }
 
   /**
@@ -13116,8 +13116,48 @@
       .replace(/"/g, "&quot;");
   }
 
-  function refreshOverlay() {
+  // Plan §4.1: most refreshOverlay() callsites fire from inside the tick
+  // loop *and* the overlay timer already runs at 500 ms. Coalesce: only
+  // actually rebuild the overlay at most once per OVERLAY_MIN_REFRESH_MS.
+  // Click handlers and the standalone setInterval still get fresh renders
+  // because the timer's 500 ms cadence aligns with this floor.
+  const OVERLAY_MIN_REFRESH_MS = 250;
+
+  function refreshOverlay(opts) {
+    const force = Boolean(opts && opts.force);
+    const now =
+      typeof performance !== "undefined" &&
+      typeof performance.now === "function"
+        ? performance.now()
+        : Date.now();
+    if (
+      !force &&
+      runtime.overlay._lastRefreshAtMs &&
+      now - runtime.overlay._lastRefreshAtMs < OVERLAY_MIN_REFRESH_MS
+    ) {
+      // Mark a deferred refresh: when the timer-driven refreshOverlay()
+      // fires next, _lastRefreshAtMs will already be stale so it will
+      // do the work. No need to schedule a separate timeout.
+      return;
+    }
+    runtime.overlay._lastRefreshAtMs = now;
     return timingSection("refreshOverlay", refreshOverlayInner);
+  }
+
+  /**
+   * Plan §4.2: write innerHTML only when the rendered string actually
+   * changed. Saves the layout/reflow cost of rewriting identical HTML.
+   */
+  function setHtmlIfChanged(root, html) {
+    if (!root) return;
+    if (root._lastHtml === html) return;
+    root._lastHtml = html;
+    root.innerHTML = html;
+  }
+
+  function setRowsIfChanged(root, rows) {
+    if (!root) return;
+    setHtmlIfChanged(root, renderRows(rows));
   }
 
   function refreshOverlayInner() {
@@ -13157,7 +13197,7 @@
     }
 
     if (hooksRoot) {
-      hooksRoot.innerHTML = renderRows([
+      setRowsIfChanged(hooksRoot, [
         {
           label: "WebSocket",
           value: runtime.hooks.socket
@@ -13195,7 +13235,7 @@
     }
 
     if (stateRoot) {
-      stateRoot.innerHTML = renderRows([
+      setRowsIfChanged(stateRoot, [
         { label: "Phase", value: runtime.state.matchPhase },
         {
           label: "Strategy",
@@ -13221,7 +13261,8 @@
 
     if (statsRoot) {
       const stats = runtime.statsSnapshot;
-      statsRoot.innerHTML = renderRows(
+      setRowsIfChanged(
+        statsRoot,
         stats
           ? [
               { label: "Tick", value: String(stats.tick) },
@@ -13248,7 +13289,7 @@
         .map((s) => s.name + " (+" + s.tilesPerMin.toFixed(0) + "/m)")
         .join(", ") || "-";
       const danger = world.threats.nearestDanger;
-      intelRoot.innerHTML = renderRows([
+      setRowsIfChanged(intelRoot, [
         { label: "Archetype", value: world.archetype || "unknown" },
         {
           label: "Coalition",
@@ -13373,16 +13414,21 @@
           );
         })
         .join("");
-      goalRoot.innerHTML = header + `<div style="margin-top:6px">${list}</div>`;
+      setHtmlIfChanged(
+        goalRoot,
+        header + `<div style="margin-top:6px">${list}</div>`,
+      );
     }
 
     if (reasonsRoot) {
       const entries = runtime.reasons.slice(-8).reverse();
       if (entries.length === 0) {
-        reasonsRoot.innerHTML =
-          '<div style="color: rgba(216, 228, 255, 0.5); font-size: 11px;">no reasoned actions yet</div>';
+        setHtmlIfChanged(
+          reasonsRoot,
+          '<div style="color: rgba(216, 228, 255, 0.5); font-size: 11px;">no reasoned actions yet</div>',
+        );
       } else {
-        reasonsRoot.innerHTML = entries
+        const html = entries
           .map((entry) => {
             const desc = GOAL_DESCRIPTIONS[entry.goalId];
             const headTitle = desc
@@ -13399,6 +13445,7 @@
             );
           })
           .join("");
+        setHtmlIfChanged(reasonsRoot, html);
       }
     }
 
@@ -13429,19 +13476,27 @@
     }
 
     if (decisionsRoot) {
-      decisionsRoot.innerHTML = runtime.decisions
+      const html = runtime.decisions
         .slice(-18)
         .map((entry) => '<div class="superbot-log-line">' + escapeHtml(entry) + "</div>")
         .join("");
-      decisionsRoot.scrollTop = decisionsRoot.scrollHeight;
+      if (decisionsRoot._lastHtml !== html) {
+        decisionsRoot._lastHtml = html;
+        decisionsRoot.innerHTML = html;
+        decisionsRoot.scrollTop = decisionsRoot.scrollHeight;
+      }
     }
 
     if (activityRoot) {
-      activityRoot.innerHTML = runtime.logs
+      const html = runtime.logs
         .slice(-22)
         .map((entry) => '<div class="superbot-log-line">' + escapeHtml(entry) + "</div>")
         .join("");
-      activityRoot.scrollTop = activityRoot.scrollHeight;
+      if (activityRoot._lastHtml !== html) {
+        activityRoot._lastHtml = html;
+        activityRoot.innerHTML = html;
+        activityRoot.scrollTop = activityRoot.scrollHeight;
+      }
     }
   }
 
@@ -14215,7 +14270,9 @@
 
   function init() {
     window.__superhumanBotRuntime = runtime;
-    window.__superhumanBotRefreshOverlay = refreshOverlay;
+    // Tests + manual devtools usage want a guaranteed-immediate refresh.
+    // The throttled path is for the tick loop; the public API forces.
+    window.__superhumanBotRefreshOverlay = () => refreshOverlay({ force: true });
     window.__superhumanBotDebug = {
       dumpWorld: () => dumpWorldJson(),
       forceGoal: (id) => setForcedGoal(id),
