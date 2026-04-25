@@ -3102,6 +3102,28 @@
     return out;
   }
 
+  // Plan §5.2: rule-tier gate. Emergency rules (incoming nuke, near
+  // death, attacker just appeared, eliminated, taunt) need to fire on
+  // the existing 5-tick cadence. Flavor rules (gold milestones,
+  // diplomacy chatter, periodic flexes) only need to fire every
+  // EMOJI_FLAVOR_PERIOD_TICKS — well within the 4 s global cooldown
+  // anyway, so the player never notices.
+  const EMOJI_FLAVOR_PERIOD_TICKS = 30;
+  const EMOJI_HIGH_PRIORITY_RULE_IDS = new Set([
+    "incoming_nuke",
+    "about_to_die",
+    "sos_under_pressure",
+    "someone_targeted_me",
+    "was_targeted_broadcast",
+    "ally_broke_on_us",
+    "enemy_eliminated",
+    "became_crown",
+    "lost_crown",
+    "nuke_launched",
+    "open_palm_stop",
+    "border_pressure_octant",
+  ]);
+
   /**
    * Per-tick emoji decision. Evaluates every rule in priority order;
    * fires at most one emoji that satisfies (a) its own per-rule
@@ -3132,6 +3154,14 @@
     }
     runtime.state.emoji.lastScanTick = tick;
 
+    // Plan §5.2: only walk the flavor rule set every
+    // EMOJI_FLAVOR_PERIOD_TICKS. The high-priority subset still walks
+    // every scan tick so emergencies surface on time.
+    const includeFlavor =
+      tick - (runtime.state.emoji.lastFlavorScanTick || -9999) >=
+      EMOJI_FLAVOR_PERIOD_TICKS;
+    if (includeFlavor) runtime.state.emoji.lastFlavorScanTick = tick;
+
     const ctx = {
       me,
       worldMe: world.me,
@@ -3140,6 +3170,7 @@
     };
 
     for (const rule of EMOJI_RULES) {
+      if (!includeFlavor && !EMOJI_HIGH_PRIORITY_RULE_IDS.has(rule.id)) continue;
       let result = null;
       try {
         result = rule.evaluate(ctx);
