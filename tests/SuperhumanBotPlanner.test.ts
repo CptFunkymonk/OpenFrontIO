@@ -384,9 +384,9 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     );
   });
 
-  it("exposes a BOT_VERSION constant bumped to 2.9.0", () => {
+  it("exposes a BOT_VERSION constant bumped to 2.9.1", () => {
     const runtime = loadUserscript();
-    expect(runtime.test.internals.BOT_VERSION).toBe("2.9.0");
+    expect(runtime.test.internals.BOT_VERSION).toBe("2.9.1");
   });
 });
 
@@ -572,7 +572,7 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
       // Mode button tooltip should describe AGGRESSIVE specifically.
       const modeBtn = panel.querySelector("#superbot-mode");
       expect(modeBtn, "mode button should exist").toBeTruthy();
-      const modeTitle = modeBtn!.getAttribute("title") || "";
+      const modeTitle = modeBtn!.getAttribute("title") ?? "";
       expect(modeTitle).toContain("AGGRESSIVE");
       expect(modeTitle).toContain("Balanced → Aggressive → Turtle");
 
@@ -582,7 +582,7 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
         overrideRow!.querySelectorAll("button"),
       ).find((b) => b.dataset.goal === "DEFENSIVE_TURTLE");
       expect(turtleBtn, "Turtle override button should exist").toBeTruthy();
-      expect(turtleBtn!.getAttribute("title") || "").toContain(
+      expect(turtleBtn!.getAttribute("title") ?? "").toContain(
         "We are the crown",
       );
 
@@ -640,10 +640,10 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
       ).find((b) => b.dataset.goal === "PREEMPT_INVASION");
       expect(repelBtn, "Repel Invasion override button should exist").toBeTruthy();
       expect(preemptBtn, "Preempt Invasion override button should exist").toBeTruthy();
-      expect(repelBtn!.getAttribute("title") || "").toContain(
+      expect(repelBtn!.getAttribute("title") ?? "").toContain(
         "live invasion",
       );
-      expect(preemptBtn!.getAttribute("title") || "").toContain(
+      expect(preemptBtn!.getAttribute("title") ?? "").toContain(
         "brewing invader",
       );
 
