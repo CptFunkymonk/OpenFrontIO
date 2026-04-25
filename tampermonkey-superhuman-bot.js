@@ -1235,15 +1235,19 @@
   }
 
   function discoverRuntimeReferences() {
-    getGameView();
-    if (!runtime.hooks.uiState) {
-      const controlPanel = document.querySelector("control-panel");
-      if (controlPanel && controlPanel.uiState) {
-        runtime.hooks.uiState = controlPanel.uiState;
+    // Plan §7.2: short-circuit the DOM walk once both gameView and
+    // uiState are bound. The local-transport bridge still has to be
+    // re-checked every call because singleplayer Play/Leave can
+    // install / tear it down at any time.
+    if (!runtime.hooks.gameView || !runtime.hooks.uiState) {
+      getGameView();
+      if (!runtime.hooks.uiState) {
+        const controlPanel = document.querySelector("control-panel");
+        if (controlPanel && controlPanel.uiState) {
+          runtime.hooks.uiState = controlPanel.uiState;
+        }
       }
     }
-    // Re-check every discovery tick because singleplayer games install /
-    // tear down the bridge on Play/Leave.
     installLocalTransportBridge();
   }
 
@@ -6031,7 +6035,11 @@
     const maxBoatDistance = getBoatDistanceLimit(gameView, me);
     const plans = [];
     const enemies = getEnemies().sort((a, b) => a.troops() - b.troops());
-    for (const enemy of enemies.slice(0, 4)) {
+    // Plan §7.3: adaptive fan-out under load, mirrors maybeNuke.
+    const heavyLoad = Boolean(runtime._lastTickHeavy);
+    const navalEnemyFanout = heavyLoad ? 3 : 4;
+    const navalCandidateFanout = heavyLoad ? 8 : 12;
+    for (const enemy of enemies.slice(0, navalEnemyFanout)) {
       const structureTiles = gatherStructureTiles(enemy);
       const structureTileSet = new Set(structureTiles);
       const randomTiles = sampleTilesForOwner(enemy.smallID(), 12, {
@@ -6043,7 +6051,7 @@
         (tile) => tile,
       );
 
-      for (const candidate of candidates.slice(0, 12)) {
+      for (const candidate of candidates.slice(0, navalCandidateFanout)) {
         const spawnTile = await queryTransportShipSpawn(candidate);
         if (spawnTile === false) continue;
         const boatDistance = gameView.manhattanDist(spawnTile, candidate);
@@ -6301,11 +6309,17 @@
       return false;
     }
 
+    // Plan §7.3: under load (last tick exceeded NUKE_HEAVY_TICK_BUDGET_MS)
+    // shrink the search fan-out so we don't compound a slow tick.
+    const heavyLoad = Boolean(runtime._lastTickHeavy);
+    const enemyFanout = heavyLoad ? 3 : 5;
+    const candidateFanout = heavyLoad ? 10 : 16;
+
     let bestPlan = null;
     for (const enemy of enemies
       .slice()
       .sort((a, b) => b.numTilesOwned() - a.numTilesOwned())
-      .slice(0, 5)) {
+      .slice(0, enemyFanout)) {
       const profile = await queryPlayerProfile(enemy);
       const candidateTiles = uniqueBy(
         gatherStructureTiles(enemy).concat(
@@ -6317,7 +6331,7 @@
         (tile) => tile,
       );
 
-      for (const candidate of candidateTiles.slice(0, 16)) {
+      for (const candidate of candidateTiles.slice(0, candidateFanout)) {
         if (wouldBreakAllianceOnNuke(candidate, nukeType)) continue;
         const buildables = await queryPlayerBuildables(candidate, [nukeType]);
         const buildable = buildables.find((entry) => entry.type === nukeType);
@@ -13564,7 +13578,15 @@
         // loop interval anyway. Skip when disabled or paused.
         await new Promise((resolve) => setTimeout(resolve, Math.min(delay, 260)));
       }
+      // Plan §7.3: track per-tick wall-time so the offensive fan-out
+      // helpers can self-throttle on slow hosts (Firefox under load).
+      const tickStart = HAS_PERF_NOW ? performance.now() : 0;
       await timingSectionAsync("runModulesForTick", () => runModulesForTick());
+      if (HAS_PERF_NOW) {
+        const dt = performance.now() - tickStart;
+        runtime._lastTickMs = dt;
+        runtime._lastTickHeavy = dt > 60;
+      }
       maybeFlushTimingReport(runtime.world.tick);
     } catch (error) {
       decisionLog("loop error: " + error.message);
