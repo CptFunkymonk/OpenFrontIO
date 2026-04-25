@@ -4020,6 +4020,12 @@
   // counts as effectively adjacent for invasion planning — even the early
   // game gates should let us hop across these safely.
   const NARROW_WATER_HOP_LIMIT = 6;
+  // Plan §3.3: refresh cadence for findNarrowWaterEnemies. Rivers don't
+  // change owner faster than a couple seconds; we re-run the BFS every
+  // 30 ticks (~ 3 s) and reuse the cached nearMap in between. Tests
+  // bypass the cache by reaching findNarrowWaterEnemies directly via
+  // runtime.test.internals.
+  const NARROW_WATER_REFRESH_TICKS = 30;
 
   // Ticks we consider a dispatched transport "in flight" before we give up
   // trying to correlate it with a surviving unit. Boats can travel a long
@@ -9209,16 +9215,26 @@
 
   /**
    * Cheap proximity approximation: is this enemy bordering us right now?
-   * Uses the synchronous `sharesBorderWith` check when available; otherwise we
-   * inspect our current border-tile neighbors.
+   * Uses the synchronous `sharesBorderWith` check when available; otherwise
+   * we inspect our current border-tile neighbors.
+   *
+   * Plan §3.2: capability-detect `sharesBorderWith` once per match (stored
+   * on tickCache.hasSharesBorder) so the hot loop doesn't pay a closure +
+   * try/catch + typeof check on every opponent every tick.
    */
   function isAdjacentTo(me, other, borderTiles) {
     if (!me || !other) return false;
-    const shared = safeCall(
-      () => typeof me.sharesBorderWith === "function" && me.sharesBorderWith(other.player),
-      null,
-    );
-    if (shared !== null) return Boolean(shared);
+    const cache = runtime.tickCache;
+    let hasShares = cache ? cache.hasSharesBorder : undefined;
+    if (hasShares === undefined) {
+      hasShares = typeof me.sharesBorderWith === "function";
+      if (cache) cache.hasSharesBorder = hasShares;
+    }
+    if (hasShares) {
+      try {
+        return Boolean(me.sharesBorderWith(other.player));
+      } catch (_) { /* fall through to BFS fallback */ }
+    }
     const gameView = getGameView();
     if (!gameView || !borderTiles) return false;
     const otherSmallID = other.smallID;
@@ -9239,6 +9255,7 @@
     const world = runtime.world;
     if (!me || world.everyone.length === 0) return;
 
+    const tickNow = world.tick || 0;
     const totals = world.totals;
     const crownThreshold =
       world.threats.crownSmallID === world.prevCrownSmallID
@@ -9287,12 +9304,15 @@
     const incomingBySmallID = new Map();
     if (meEntry && Array.isArray(meEntry.incomingAttacks)) {
       for (const attack of meEntry.incomingAttacks) {
-        const attackerID = safeCall(() => attack.attackerID, null);
-        if (attackerID === null || attackerID === 0) continue;
-        const troops =
-          typeof attack.troops === "function"
-            ? safeCall(() => attack.troops(), 0)
+        let attackerID = null;
+        let troops = 0;
+        try {
+          attackerID = attack.attackerID;
+          troops = typeof attack.troops === "function"
+            ? attack.troops()
             : Number(attack.troops) || 0;
+        } catch (_) { /* swallow */ }
+        if (attackerID === null || attackerID === 0) continue;
         incomingBySmallID.set(
           attackerID,
           (incomingBySmallID.get(attackerID) || 0) + troops,
@@ -9319,13 +9339,40 @@
 
       if (crownEntry && entry.smallID === crownEntry.smallID) tags.add("CROWN");
 
-      // Nuke readiness lookahead.
-      const silos = safeCall(
-        () => entry.player.units(UnitType.MissileSilo),
-        [],
-      ).filter((u) => safeCall(() => u.isActive(), false) && !safeCall(() => u.isUnderConstruction(), false));
+      // Nuke readiness lookahead. Plan §3.1: throttle the silo walk via
+      // the per-history cache; silo construction completes far slower
+      // than tick cadence so a 5-tick refresh is plenty.
+      const historyEntry = world.history && world.history.get(entry.smallID);
+      let activeSilos = 0;
+      if (
+        historyEntry &&
+        typeof historyEntry.activeSilosAt === "number" &&
+        tickNow - historyEntry.activeSilosAt < STRUCTURE_CACHE_TICKS
+      ) {
+        activeSilos = historyEntry.activeSilos || 0;
+      } else {
+        let siloUnits = null;
+        try {
+          siloUnits = entry.player.units(UnitType.MissileSilo);
+        } catch (_) { /* swallow */ }
+        if (siloUnits) {
+          for (const u of siloUnits) {
+            let active = false;
+            let underConstruction = false;
+            try {
+              active = u.isActive();
+              underConstruction = u.isUnderConstruction();
+            } catch (_) { /* swallow */ }
+            if (active && !underConstruction) activeSilos += 1;
+          }
+        }
+        if (historyEntry) {
+          historyEntry.activeSilos = activeSilos;
+          historyEntry.activeSilosAt = tickNow;
+        }
+      }
       let nukeReadiness = 0;
-      if (silos.length > 0) nukeReadiness += 1;
+      if (activeSilos > 0) nukeReadiness += 1;
       if (entry.gold >= ATOM_GOLD_THRESHOLD) nukeReadiness += 1;
       if (entry.gold >= HYDRO_GOLD_THRESHOLD) nukeReadiness += 1;
       if (entry.gold >= MIRV_GOLD_THRESHOLD) nukeReadiness += 2;
@@ -9570,15 +9617,41 @@
     // reachable with a short water hop. These are first-class invasion
     // targets — a neighbour across a 2-tile river is effectively adjacent
     // from a strategic standpoint.
+    //
+    // Plan §3.3: this BFS seeds from every shore tile, so the per-tick
+    // cost scales with borderTiles.length. Rivers do not change owner on
+    // sub-second cadence, so we recompute at most every
+    // NARROW_WATER_REFRESH_TICKS (≈ 3 s) and reuse the cached list in
+    // between. The cached `nearMap` is invalidated implicitly when
+    // `borderTiles` changes substantially (we re-key on length and the
+    // first/last tile so a typical land-grab triggers a refresh).
     const gameView = getGameView();
-    const narrowWaterNeighbors = [];
+    let narrowWaterNeighbors = [];
     if (gameView && me && borderTiles && borderTiles.length > 0) {
-      const nearMap = findNarrowWaterEnemies(
-        gameView,
-        me,
-        borderTiles,
-        NARROW_WATER_HOP_LIMIT,
-      );
+      const cache = runtime.state.narrowWaterCache || {};
+      runtime.state.narrowWaterCache = cache;
+      const cacheKey = borderTiles.length === 0
+        ? "empty"
+        : borderTiles.length + ":" + borderTiles[0] + ":" + borderTiles[borderTiles.length - 1];
+      const fresh =
+        typeof cache.tick === "number" &&
+        tickNow - cache.tick < NARROW_WATER_REFRESH_TICKS &&
+        cache.key === cacheKey &&
+        cache.nearMap;
+      let nearMap;
+      if (fresh) {
+        nearMap = cache.nearMap;
+      } else {
+        nearMap = findNarrowWaterEnemies(
+          gameView,
+          me,
+          borderTiles,
+          NARROW_WATER_HOP_LIMIT,
+        );
+        cache.tick = tickNow;
+        cache.key = cacheKey;
+        cache.nearMap = nearMap;
+      }
       for (const [smallID, info] of nearMap) {
         const entry = world.bySmallID.get(smallID);
         if (!entry) continue;
