@@ -1,5 +1,5 @@
 /**
- * Regression tests for the Plan v2 upgrade (superbot v2.9).
+ * Regression tests for the Plan v2 upgrade (superbot v2.9.x).
  *
  * Covers the new closed-form behaviours layered on top of the existing
  * planner suite:
@@ -52,6 +52,225 @@ function resetSpawnState(runtime: any) {
     sentToSmallIDs: new Set(),
   };
 }
+
+const TerrainType = {
+  Plains: 0,
+  Highland: 1,
+  Mountain: 2,
+};
+
+function makeSpawnScoringGameView(opts: {
+  width?: number;
+  height?: number;
+  terrain?: Map<number, number>;
+  players?: any[];
+}) {
+  const width = opts.width ?? 220;
+  const height = opts.height ?? 140;
+  const terrain = opts.terrain ?? new Map<number, number>();
+  const players = opts.players ?? [];
+  const ref = (x: number, y: number) => y * width + x;
+  const xOf = (tile: number) => tile % width;
+  const yOf = (tile: number) => Math.floor(tile / width);
+  return {
+    width: () => width,
+    height: () => height,
+    ref,
+    x: xOf,
+    y: yOf,
+    isValidCoord: (x: number, y: number) =>
+      x >= 0 && y >= 0 && x < width && y < height,
+    isLand: () => true,
+    isWater: () => false,
+    isBorder: () => false,
+    hasOwner: () => false,
+    ownerID: () => 0,
+    hasFallout: () => false,
+    isOceanShore: () => false,
+    magnitude: (tile: number) => {
+      const type = terrain.get(tile) ?? TerrainType.Plains;
+      if (type === TerrainType.Highland) return 12;
+      if (type === TerrainType.Mountain) return 24;
+      return 4;
+    },
+    terrainType: (tile: number) => terrain.get(tile) ?? TerrainType.Plains,
+    manhattanDist: (a: number, b: number) =>
+      Math.abs(xOf(a) - xOf(b)) + Math.abs(yOf(a) - yOf(b)),
+    neighbors: (tile: number) => {
+      const x = xOf(tile);
+      const y = yOf(tile);
+      const out: number[] = [];
+      if (x > 0) out.push(ref(x - 1, y));
+      if (x + 1 < width) out.push(ref(x + 1, y));
+      if (y > 0) out.push(ref(x, y - 1));
+      if (y + 1 < height) out.push(ref(x, y + 1));
+      return out;
+    },
+    circleSearch: (center: number, radius: number) => {
+      const out: number[] = [];
+      const cx = xOf(center);
+      const cy = yOf(center);
+      for (let dx = -radius; dx <= radius; dx++) {
+        for (let dy = -radius; dy <= radius; dy++) {
+          if (dx * dx + dy * dy > radius * radius) continue;
+          const x = cx + dx;
+          const y = cy + dy;
+          if (x >= 0 && y >= 0 && x < width && y < height) {
+            out.push(ref(x, y));
+          }
+        }
+      }
+      return out;
+    },
+    playerViews: () => players,
+    config: () => ({
+      minDistanceBetweenPlayers: () => 20,
+      numSpawnPhaseTurns: () => 300,
+    }),
+  };
+}
+
+function playerStub(type: any, smallID: number, tile: number) {
+  return {
+    smallID: () => smallID,
+    type: () => type,
+    spawnTile: () => tile,
+    hasSpawned: () => true,
+  };
+}
+
+function installSpawnScoringView(runtime: any, gameView: any) {
+  runtime.hooks.gameView = {
+    ...gameView,
+    ticks: () => 0,
+    myPlayer: () => null,
+  };
+  runtime.world.meSmallID = 1;
+  runtime.state.spawn.lastSubScores = null;
+}
+
+describe("spawn scoring — plains expansion and human isolation", () => {
+  it("rewards a larger contiguous plains field over a rocky expansion area", () => {
+    const runtime = loadUserscript();
+    const { computeSpawnCenterScore } = runtime.test.internals;
+    const terrain = new Map<number, number>();
+    const gameView = makeSpawnScoringGameView({ terrain });
+    const rockyCenter = gameView.ref(145, 60);
+    const plainsCenter = gameView.ref(45, 60);
+
+    for (const tile of gameView.circleSearch(rockyCenter, 80)) {
+      terrain.set(tile, TerrainType.Mountain);
+    }
+    for (const tile of gameView.circleSearch(rockyCenter, 4)) {
+      terrain.set(tile, TerrainType.Plains);
+    }
+
+    installSpawnScoringView(runtime, gameView);
+    const rocky = computeSpawnCenterScore(gameView, rockyCenter);
+    const rockySubs = { ...runtime.state.spawn.lastSubScores };
+    const plains = computeSpawnCenterScore(gameView, plainsCenter);
+    const plainsSubs = { ...runtime.state.spawn.lastSubScores };
+
+    expect(plains).toBeGreaterThan(rocky);
+    expect(plainsSubs.nearPlains).toBeGreaterThan(rockySubs.nearPlains);
+    expect(plainsSubs.plainsFlood).toBeGreaterThan(rockySubs.plainsFlood);
+  });
+
+  it("lets human isolation beat a nearby-human spawn with similar plains", () => {
+    const runtime = loadUserscript();
+    const { computeSpawnCenterScore, PlayerType } = runtime.test.internals;
+    const safeCenter = 150;
+    const crowdedCenter = 40;
+    const humanTile = 60 * 220 + 78;
+    const gameView = makeSpawnScoringGameView({
+      players: [playerStub(PlayerType.Human, 2, humanTile)],
+    });
+    const safeTile = gameView.ref(safeCenter, 60);
+    const crowdedTile = gameView.ref(crowdedCenter, 60);
+
+    installSpawnScoringView(runtime, gameView);
+    const crowded = computeSpawnCenterScore(gameView, crowdedTile);
+    const crowdedSubs = { ...runtime.state.spawn.lastSubScores };
+    const safe = computeSpawnCenterScore(gameView, safeTile);
+    const safeSubs = { ...runtime.state.spawn.lastSubScores };
+
+    expect(safe).toBeGreaterThan(crowded);
+    expect(safeSubs.humanIsolation).toBeGreaterThan(crowdedSubs.humanIsolation);
+    expect(crowdedSubs.humanProx).toBeLessThan(0);
+  });
+
+  it("treats reachable uncontested tribes as spawn opportunities", () => {
+    const runtime = loadUserscript();
+    const { computeSpawnCenterScore, PlayerType } = runtime.test.internals;
+    const gameView = makeSpawnScoringGameView({
+      players: [playerStub(PlayerType.Bot, 3, 95)],
+    });
+    const center = gameView.ref(40, 60);
+
+    installSpawnScoringView(runtime, gameView);
+    const score = computeSpawnCenterScore(gameView, center);
+    const subs = runtime.state.spawn.lastSubScores;
+
+    expect(score).not.toBeNull();
+    expect(subs.tribeOpportunity).toBeGreaterThan(0);
+    expect(subs.tribeCompetition).toBe(0);
+  });
+
+  it("discounts tribe value when another human is closer to that tribe", () => {
+    const runtime = loadUserscript();
+    const { computeSpawnCenterScore, PlayerType } = runtime.test.internals;
+    const center = 40;
+    const tribeTile = 95;
+    const uncontestedView = makeSpawnScoringGameView({
+      players: [playerStub(PlayerType.Bot, 3, tribeTile)],
+    });
+    const contestedView = makeSpawnScoringGameView({
+      players: [
+        playerStub(PlayerType.Bot, 3, tribeTile),
+        playerStub(PlayerType.Human, 2, 98),
+      ],
+    });
+
+    installSpawnScoringView(runtime, uncontestedView);
+    const uncontested = computeSpawnCenterScore(
+      uncontestedView,
+      uncontestedView.ref(center, 60),
+    );
+    const uncontestedSubs = { ...runtime.state.spawn.lastSubScores };
+    installSpawnScoringView(runtime, contestedView);
+    const contested = computeSpawnCenterScore(
+      contestedView,
+      contestedView.ref(center, 60),
+    );
+    const contestedSubs = { ...runtime.state.spawn.lastSubScores };
+
+    expect(contested).toBeLessThan(uncontested);
+    expect(uncontestedSubs.tribeOpportunity).toBeGreaterThan(0);
+    expect(contestedSubs.tribeOpportunity).toBe(0);
+    expect(contestedSubs.tribeCompetition).toBeLessThan(0);
+  });
+
+  it("records explainable spawn sub-scores for RL logging", () => {
+    const runtime = loadUserscript();
+    const { computeSpawnCenterScore } = runtime.test.internals;
+    const gameView = makeSpawnScoringGameView({});
+
+    installSpawnScoringView(runtime, gameView);
+    const score = computeSpawnCenterScore(gameView, gameView.ref(80, 80));
+
+    expect(score).not.toBeNull();
+    expect(runtime.state.spawn.lastSubScores).toMatchObject({
+      patchPlains: expect.any(Number),
+      nearPlains: expect.any(Number),
+      plainsFlood: expect.any(Number),
+      humanIsolation: expect.any(Number),
+      humanProx: expect.any(Number),
+      tribeOpportunity: expect.any(Number),
+      tribeCompetition: expect.any(Number),
+      nationProx: expect.any(Number),
+    });
+  });
+});
 
 describe("calculateAttackTroops — engine saturation anchoring", () => {
   const me = (troops: number) => ({ troops: () => troops });
@@ -642,7 +861,7 @@ function stubGameViewForPlanner(runtime: any, stubUnits: Map<any, any[]>) {
     }),
     myPlayer: () => ({
       isAlive: () => true,
-      units: (t: any) => stubUnits.get(t) || [],
+      units: (t: any) => stubUnits.get(t) ?? [],
       smallID: () => 1,
     }),
   };

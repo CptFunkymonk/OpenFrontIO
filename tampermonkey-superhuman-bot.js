@@ -3649,40 +3649,177 @@
   }
 
   /**
-   * Penalise spawns that are very close to other known players' spawn points.
-   * Applies to both pre-spawn Nations (whose spawnTile is visible) and
-   * already-placed players whose centroid approximates their presence.
+   * Anchor another player to a spawn tile, falling back to a sampled owned
+   * tile once the server no longer exposes spawnTile(). This keeps spawn
+   * scoring typed: humans are competitors, nations are moderate risk, and
+   * tribes are nearby opportunities rather than generic enemies.
    */
-  function enemyProximityPenalty(gameView, center) {
-    let penalty = 0;
+  function spawnAnchorTileForPlayer(gameView, player) {
+    const spawnTile = safeCall(() => player.spawnTile(), undefined);
+    if (spawnTile !== undefined && spawnTile !== null) return spawnTile;
+    if (!safeCall(() => player.hasSpawned(), false)) return null;
+    const smallID = safeCall(() => player.smallID(), -1);
+    if (smallID < 0) return null;
+    const sample = sampleTilesForOwner(smallID, 1, {
+      requireLand: true,
+      maxSamples: 120,
+    });
+    return sample.length > 0 ? sample[0] : null;
+  }
+
+  function terrainExpansionWeight(type) {
+    if (type === TerrainType.Plains) return 1;
+    if (type === TerrainType.Highland) return 0.45;
+    if (type === TerrainType.Mountain) return 0.12;
+    return 0;
+  }
+
+  function weightedTerrainCountsNear(gameView, center, radius) {
+    let plains = 0;
+    let highland = 0;
+    let mountain = 0;
+    let owned = 0;
+    let weighted = 0;
+    for (const tile of gameView.circleSearch(center, radius)) {
+      if (!gameView.isLand(tile)) continue;
+      if (gameView.ownerID(tile) !== 0) {
+        owned += 1;
+        continue;
+      }
+      const type = safeCall(() => gameView.terrainType(tile), -1);
+      if (type === TerrainType.Plains) plains += 1;
+      else if (type === TerrainType.Highland) highland += 1;
+      else if (type === TerrainType.Mountain) mountain += 1;
+      weighted += terrainExpansionWeight(type);
+    }
+    const total = plains + highland + mountain;
+    return {
+      plains,
+      highland,
+      mountain,
+      owned,
+      total,
+      plainsRatio: total > 0 ? plains / total : 0,
+      weighted,
+    };
+  }
+
+  function weightedPlainsFloodScore(gameView, center, limit) {
+    const visited = new Set([center]);
+    const queue = [center];
+    let head = 0;
+    let explored = 0;
+    let score = 0;
+
+    while (head < queue.length && explored < limit) {
+      const current = queue[head++];
+      if (!gameView.isLand(current)) continue;
+      if (gameView.ownerID(current) !== 0) continue;
+
+      explored += 1;
+      score += terrainExpansionWeight(safeCall(() => gameView.terrainType(current), -1));
+
+      for (const neighbor of gameView.neighbors(current)) {
+        if (visited.has(neighbor)) continue;
+        if (!gameView.isLand(neighbor)) continue;
+        if (gameView.ownerID(neighbor) !== 0) continue;
+        visited.add(neighbor);
+        queue.push(neighbor);
+      }
+    }
+
+    return Math.min(limit, score);
+  }
+
+  function humanIsolationScore(nearestHuman) {
+    if (!Number.isFinite(nearestHuman)) return 260;
+    if (nearestHuman < 45) return -900 - (45 - nearestHuman) * 18;
+    if (nearestHuman < 80) return -420 + (nearestHuman - 45) * 10;
+    if (nearestHuman < 140) return -70 + (nearestHuman - 80) * 4.5;
+    return 220;
+  }
+
+  function nationProximityScore(nearestNation) {
+    if (!Number.isFinite(nearestNation)) return 0;
+    if (nearestNation < 45) return -260 - (45 - nearestNation) * 6;
+    if (nearestNation < 90) return -120 + (nearestNation - 45) * 2;
+    return 0;
+  }
+
+  function tribeOpportunityScore(distance) {
+    if (!Number.isFinite(distance)) return 0;
+    if (distance < 35) return 40;
+    if (distance <= 95) return 260 - Math.abs(distance - 60) * 2.2;
+    if (distance <= 150) return Math.max(0, 120 - (distance - 95) * 1.8);
+    return 0;
+  }
+
+  function computeTypedSpawnProximity(gameView, center) {
     const mySmall = runtime.world.meSmallID;
+    const humans = [];
+    const tribes = [];
+    let nearestHuman = Infinity;
+    let nearestNation = Infinity;
+    let nearestTribe = Infinity;
+
     for (const p of safeCall(() => gameView.playerViews(), [])) {
       if (!p) continue;
       const smallID = safeCall(() => p.smallID(), -1);
       if (smallID === mySmall) continue;
-      const spawnTile = safeCall(() => p.spawnTile(), undefined);
-      if (spawnTile !== undefined && spawnTile !== null) {
-        const dist = gameView.manhattanDist(center, spawnTile);
-        if (dist < 60) penalty += (60 - dist) * 0.6;
-      } else if (safeCall(() => p.hasSpawned(), false)) {
-        // Approximate presence by a small sample of their tiles.
-        const sample = sampleTilesForOwner(smallID, 1, {
-          requireLand: true,
-          maxSamples: 120,
-        });
-        if (sample.length > 0) {
-          const dist = gameView.manhattanDist(center, sample[0]);
-          if (dist < 60) penalty += (60 - dist) * 0.4;
-        }
+      const anchor = spawnAnchorTileForPlayer(gameView, p);
+      if (anchor === null || anchor === undefined) continue;
+      const dist = gameView.manhattanDist(center, anchor);
+      const type = safeCall(() => p.type(), null);
+      if (type === PlayerType.Human) {
+        nearestHuman = Math.min(nearestHuman, dist);
+        humans.push({ tile: anchor, dist });
+      } else if (type === PlayerType.Nation) {
+        nearestNation = Math.min(nearestNation, dist);
+      } else if (type === PlayerType.Bot) {
+        nearestTribe = Math.min(nearestTribe, dist);
+        tribes.push({ tile: anchor, dist });
       }
     }
-    return penalty;
+
+    let tribeOpportunity = 0;
+    let tribeCompetition = 0;
+    for (const tribe of tribes) {
+      const base = tribeOpportunityScore(tribe.dist);
+      if (base <= 0) continue;
+      let contested = false;
+      for (const human of humans) {
+        const humanToTribe = gameView.manhattanDist(human.tile, tribe.tile);
+        if (humanToTribe <= tribe.dist + 20) {
+          contested = true;
+          break;
+        }
+      }
+      if (contested) {
+        tribeCompetition -= base * 0.75;
+      } else {
+        tribeOpportunity += base;
+      }
+    }
+
+    tribeOpportunity = Math.min(420, tribeOpportunity);
+    tribeCompetition = Math.max(-360, tribeCompetition);
+    return {
+      nearestHuman,
+      nearestNation,
+      nearestTribe,
+      humanIsolation: humanIsolationScore(nearestHuman),
+      humanProx: Number.isFinite(nearestHuman) && nearestHuman < 70
+        ? -(70 - nearestHuman) * 7
+        : 0,
+      nationProx: nationProximityScore(nearestNation),
+      tribeOpportunity,
+      tribeCompetition,
+    };
   }
 
   // ------------------------------------------------------------------
-  // Strategic spawn features (Plan §2.1). These three helpers reward
-  // defensible peninsulas: low perimeter-to-area, few land corridors,
-  // and far from the currently-known opponent cluster.
+  // Secondary topology features. Plains expansion + typed proximity drive
+  // spawn choice; coast/choke shape remains only a tie-breaker.
   // ------------------------------------------------------------------
 
   /**
@@ -3812,12 +3949,19 @@
       else if (typ === TerrainType.Highland) highland += 1;
       else if (typ === TerrainType.Mountain) mountain += 1;
     }
-    // Plains-first gate (Plan §2.1.6): Plains give attackers `mag=80`
-    // (cheapest terrain to push off of), Highland 100, Mountain 120. A
-    // patch that is <60% plains forces us to grind against higher
-    // defensive magnitudes on every outgoing attack — reject outright.
     const totalTerrain = Math.max(1, plains + highland + mountain);
-    if (plains / totalTerrain < 0.6) {
+    const patchPlainsRatio = plains / totalTerrain;
+    const nearTerrain = weightedTerrainCountsNear(gameView, center, 18);
+    const farTerrain = weightedTerrainCountsNear(gameView, center, 42);
+    const plainsFlood = weightedPlainsFloodScore(gameView, center, 700);
+    // Plains-first gate: Plains give attackers mag=80 / speed=16.5
+    // (cheapest and fastest TerraNullius expansion). A merely adequate
+    // spawn patch can pass only if the surrounding expansion field is
+    // strongly plains-rich; otherwise we reject it before scoring.
+    if (
+      patchPlainsRatio < 0.6 &&
+      (patchPlainsRatio < 0.5 || nearTerrain.plainsRatio < 0.75)
+    ) {
       return null;
     }
 
@@ -3835,29 +3979,21 @@
       }
     }
 
-    // Upgraded strategic components (Phase 4).
+    // Keep raw open-land counts as low-weight compatibility signals, but
+    // score expansion mostly by terrain-weighted plains availability.
     const localOpen = countUnownedLandNear(center, 12);
-    const flood = floodScoreFrom(center, 600);
     const frontier = countUnownedLandNear(center, 40);
     const elev = elevationAverage(gameView, center, 10);
-    // Plan §2.1.7: shore access within 8 tiles (was 4). Early ports
-    // drive gold via proximityBonusPortsNb, and an 8-tile radius
-    // captures most coastal plateaus without rewarding tiles that
-    // are *surrounded* by water.
     const coast = coastNearby(gameView, center, 8) ? 1 : 0;
     const choke = isChokepointLike(gameView, center, 20) ? 1 : 0;
-    const enemyPenalty = enemyProximityPenalty(gameView, center);
 
-    // Strategic-topology components (Plan §2.1): peninsula shape,
-    // corridor count, and Gaussian-weighted enemy cluster distance.
-    // The peninsula score is (1 - perimeterRatio) so a low-perimeter
-    // coastal patch scores near 1. The corridor score rewards spawns
-    // with <= 1 land neck; more necks mean more borders to defend.
+    // Secondary topology components. These are tie-breakers now; plains
+    // expansion and typed player proximity are the primary strategy.
     const perimeter = perimeterToAreaRatio(gameView, center, 16);
     const peninsulaScore = 1 - Math.min(1, perimeter);
     const necks = corridorCount(gameView, center, 40);
     const corridorScore = 1 - Math.min(necks, 3) / 3;
-    const clusterPenalty = gaussianEnemyClusterPenalty(gameView, center);
+    const proximity = computeTypedSpawnProximity(gameView, center);
 
     // Nation spawns already placed nearby — keep distance.
     let falloutNearby = 0;
@@ -3868,53 +4004,53 @@
       }
     }
 
-    const terrainPoints =
-      plains * 1000 + highland * 100 + mountain + spawnTiles.length;
-    // Plan §2.1 acceptance: break out each term so the analyst can see
-    // *why* a spawn was picked. Each field is the signed final
-    // contribution (positive = bonus, negative = penalty). Stashed on
-    // runtime.state.spawn.lastSubScores so trySampleSpawnCandidate can
-    // attach it to the candidate record without changing the function
-    // return shape (the score is still a single number).
+    // Spawn scoring is now explainable around the requested objectives:
+    // fast plains expansion, human isolation, and uncontested tribe access.
+    // The old raw patch terrain score dwarfed every strategic term; these
+    // normalized terms let human competition change the final ranking.
     const subScores = {
-      terrain: terrainPoints * 1.5,
-      localOpen: localOpen * 2,
-      flood: flood * 3,
-      frontier: frontier * 5,
-      elev: elev * 0.8,
-      // Plan §2.1.7: coast weight bumped 120 → 150. Ports pay back
-      // their 125k cost in 5-10 trade-ship cycles and then compound.
-      coast: coast * 150,
-      choke: choke * 40,
-      // Plan §2.1.3/4/5: peninsula shape, narrow-neck count, and
-      // Gaussian enemy-cluster distance. These three terms together
-      // account for the bulk of "pick the defensible coastal spot".
-      peninsula: peninsulaScore * 300,
-      corridor: corridorScore * 200,
-      cluster: -clusterPenalty * 600,
+      patchPlains: patchPlainsRatio * 520 + plains * 8,
+      nearPlains: nearTerrain.weighted * 8 + nearTerrain.plainsRatio * 180,
+      plainsFlood: plainsFlood * 3.6,
+      localOpen: localOpen * 0.8,
+      frontier: frontier * 1.2 + farTerrain.weighted * 1.7,
+      elev: elev * 0.25,
+      coast: coast * 45,
+      choke: choke * 18,
+      peninsula: peninsulaScore * 45,
+      corridor: corridorScore * 35,
+      humanIsolation: proximity.humanIsolation,
+      humanProx: proximity.humanProx,
+      tribeOpportunity: proximity.tribeOpportunity,
+      tribeCompetition: proximity.tribeCompetition,
+      nationProx: proximity.nationProx,
       owned: -ownedPenalty,
       ocean: -oceanPenalty,
-      enemyProx: -enemyPenalty * 4,
       fallout: -falloutNearby * 300,
     };
     const strategic =
+      subScores.patchPlains +
+      subScores.nearPlains +
+      subScores.plainsFlood +
       subScores.localOpen +
-      subScores.flood +
       subScores.frontier +
       subScores.elev +
       subScores.coast +
       subScores.choke +
       subScores.peninsula +
       subScores.corridor +
-      subScores.cluster +
+      subScores.humanIsolation +
+      subScores.humanProx +
+      subScores.tribeOpportunity +
+      subScores.tribeCompetition +
+      subScores.nationProx +
       subScores.owned +
       subScores.ocean +
-      subScores.enemyProx +
       subScores.fallout;
     if (runtime.state && runtime.state.spawn) {
       runtime.state.spawn.lastSubScores = subScores;
     }
-    return subScores.terrain + strategic;
+    return strategic;
   }
 
   function trySampleSpawnCandidate(gameView) {
@@ -3976,7 +4112,10 @@
     for (const cand of sorted.slice(0, 72)) {
       const fresh = computeSpawnCenterScore(gameView, cand.center);
       if (fresh === null) continue;
-      const refreshed = { center: cand.center, score: fresh };
+      const subScores = runtime.state.spawn.lastSubScores
+        ? Object.assign({}, runtime.state.spawn.lastSubScores)
+        : cand.subScores || null;
+      const refreshed = { center: cand.center, score: fresh, subScores };
       rememberSpawnCandidate(refreshed);
       if (!best || refreshed.score > best.score) {
         best = refreshed;
@@ -14506,6 +14645,10 @@
         calculateAttackTroops,
         openingDiplomacyBlast,
         maybeDonateToStrugglingTeammate,
+        computeSpawnCenterScore,
+        weightedTerrainCountsNear,
+        weightedPlainsFloodScore,
+        computeTypedSpawnProximity,
         perimeterToAreaRatio,
         corridorCount,
         gaussianEnemyClusterPenalty,
