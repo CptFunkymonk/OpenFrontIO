@@ -841,6 +841,17 @@ describe("tampermonkey-superhuman-bot invasion-defense goals", () => {
     expect(preemptResult.actual).toBe("PREEMPT_INVASION");
   });
 
+  it("picks PREEMPT_INVASION for an early overmatched Human neighbour", () => {
+    const runtime = loadUserscript();
+    const summary = runtime.test.runSuite();
+    const earlyResult = summary.results.find((r: any) =>
+      r.name.startsWith("early human overmatch"),
+    );
+    expect(earlyResult, "early overmatch scenario should be in suite").toBeDefined();
+    expect(earlyResult.pass).toBe(true);
+    expect(earlyResult.actual).toBe("PREEMPT_INVASION");
+  });
+
   it("prefers REPEL_INVASION over PREEMPT when both are present", () => {
     const runtime = loadUserscript();
     const summary = runtime.test.runSuite();
@@ -1654,6 +1665,212 @@ describe("tampermonkey-superhuman-bot invasion-defense stall", () => {
 
     world.threats.overwhelmingNeighbor = null;
     expect(shouldStallForInvasionDefense()).toBe(false);
+  });
+
+  it("flags early adjacent Human troop disparity as preemptive invasion risk", () => {
+    const runtime = loadUserscript();
+    const {
+      computeEarlyHumanOvermatch,
+      isEarlyGameForInvasionDefense,
+      EARLY_INVASION_HUMAN_TROOP_RATIO,
+      PlayerType,
+    } = runtime.test.internals;
+    const me = { troops: 10_000, tiles: 400 };
+    const earlyWorld = {
+      tick: 600,
+      totals: { myShare: 0.04, usableLand: 10_000 },
+    };
+
+    expect(isEarlyGameForInvasionDefense(earlyWorld, me)).toBe(true);
+    const risk = computeEarlyHumanOvermatch(
+      me,
+      [
+        {
+          smallID: 7,
+          name: "Nearby Human",
+          type: PlayerType.Human,
+          isFriendly: false,
+          troops: 16_000,
+          outgoingTroops: 0,
+          incomingTroops: 0,
+        },
+      ],
+      earlyWorld,
+    );
+
+    expect(risk).not.toBeNull();
+    expect(risk.enemy.name).toBe("Nearby Human");
+    expect(risk.ratio).toBeCloseTo(1.6, 2);
+    expect(risk.threshold).toBe(EARLY_INVASION_HUMAN_TROOP_RATIO);
+    expect(risk.reason).toBe("earlyHumanOvermatch");
+  });
+
+  it("limits early Human overmatch to unpinned hostile Humans during the opening", () => {
+    const runtime = loadUserscript();
+    const { computeEarlyHumanOvermatch, PlayerType } = runtime.test.internals;
+    const me = { troops: 10_000, tiles: 400 };
+    const earlyWorld = {
+      tick: 600,
+      totals: { myShare: 0.04, usableLand: 10_000 },
+    };
+    const lateWorld = {
+      tick: 4000,
+      totals: { myShare: 0.2, usableLand: 10_000 },
+    };
+
+    expect(
+      computeEarlyHumanOvermatch(
+        me,
+        [
+          {
+            smallID: 2,
+            name: "Nation",
+            type: PlayerType.Nation,
+            isFriendly: false,
+            troops: 30_000,
+          },
+        ],
+        earlyWorld,
+      ),
+    ).toBeNull();
+    expect(
+      computeEarlyHumanOvermatch(
+        me,
+        [
+          {
+            smallID: 3,
+            name: "Too Close",
+            type: PlayerType.Human,
+            isFriendly: false,
+            troops: 15_000,
+          },
+        ],
+        earlyWorld,
+      ),
+    ).toBeNull();
+    expect(
+      computeEarlyHumanOvermatch(
+        me,
+        [
+          {
+            smallID: 4,
+            name: "Late Human",
+            type: PlayerType.Human,
+            isFriendly: false,
+            troops: 30_000,
+          },
+        ],
+        lateWorld,
+      ),
+    ).toBeNull();
+    expect(
+      computeEarlyHumanOvermatch(
+        me,
+        [
+          {
+            smallID: 5,
+            name: "Pinned Human",
+            type: PlayerType.Human,
+            isFriendly: false,
+            troops: 20_000,
+            incomingTroops: 5_000,
+          },
+        ],
+        earlyWorld,
+      ),
+    ).toBeNull();
+    expect(
+      computeEarlyHumanOvermatch(
+        me,
+        [
+          {
+            smallID: 6,
+            name: "Friendly Human",
+            type: PlayerType.Human,
+            isFriendly: true,
+            troops: 100_000,
+          },
+        ],
+        earlyWorld,
+      ),
+    ).toBeNull();
+  });
+
+  it("maybeExpand refuses to spend troops under early Human overmatch", async () => {
+    const runtime = loadUserscript();
+    const { maybeExpand } = runtime.test.internals;
+    const priorGameView = runtime.hooks.gameView;
+    const priorWorld = runtime.world;
+    const priorBridge = runtime.hooks.localBridge;
+    const priorSocket = runtime.hooks.socket;
+    const priorLastSig = runtime.state.lastIntentSignature;
+    const win: any = (globalThis as any).window;
+    const priorHarness = win.__SUPERBOT_TEST_MODE;
+
+    const width = 4;
+    const ref = (x: number, y: number) => y * width + x;
+    const myTile = ref(1, 1);
+    const openTile = ref(2, 1);
+    const sent: any[] = [];
+    const me = {
+      smallID: () => 1,
+      troops: () => 20_000,
+      numTilesOwned: () => 1,
+    };
+    runtime.hooks.gameView = {
+      ticks: () => 1000,
+      myPlayer: () => me,
+      numLandTiles: () => 16,
+      ownerID: (tile: number) => (tile === myTile ? 1 : 0),
+      isLand: () => true,
+      hasFallout: () => false,
+      neighbors: (tile: number) => {
+        const x = tile % width;
+        const y = Math.floor(tile / width);
+        const out: number[] = [];
+        if (x > 0) out.push(ref(x - 1, y));
+        if (x + 1 < width) out.push(ref(x + 1, y));
+        if (y > 0) out.push(ref(x, y - 1));
+        if (y + 1 < width) out.push(ref(x, y + 1));
+        return out;
+      },
+      config: () => ({
+        maxTroops: () => 100_000,
+      }),
+    };
+    runtime.world = {
+      ...runtime.world,
+      tick: 1000,
+      threats: {
+        ...(runtime.world.threats ?? {}),
+        earlyHumanOvermatch: {
+          enemy: { name: "Nearby Human" },
+          ratio: 1.6,
+          threshold: 1.5,
+        },
+        overwhelmingNeighbor: null,
+      },
+    };
+    runtime.state.cooldowns.expand = -999;
+    runtime.hooks.socket = null;
+    runtime.hooks.localBridge = { send: (msg: any) => sent.push(msg) };
+    runtime.state.lastIntentSignature = "";
+    win.__SUPERBOT_TEST_MODE = true;
+
+    try {
+      const acted = await maybeExpand(me, [myTile, openTile]);
+      expect(acted).toBe(false);
+      expect(sent.filter((msg) => msg?.intent?.type === "attack")).toHaveLength(
+        0,
+      );
+    } finally {
+      runtime.hooks.gameView = priorGameView;
+      runtime.world = priorWorld;
+      runtime.hooks.localBridge = priorBridge;
+      runtime.hooks.socket = priorSocket;
+      runtime.state.lastIntentSignature = priorLastSig;
+      win.__SUPERBOT_TEST_MODE = priorHarness;
+    }
   });
 });
 

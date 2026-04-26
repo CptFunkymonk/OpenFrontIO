@@ -159,6 +159,15 @@
   // src/core/execution/nation/NationAllianceBehavior.ts
   // (isAlliancePartnerThreat):  otherPlayer.troops() > this.player.troops() * 2.5.
   const INVASION_STALL_TROOP_RATIO = 2.5;
+  // Early-game player-neighbour paranoia. Before cities / factories have
+  // stabilized our population cap, a bordering Human with a 50% troop lead
+  // should be treated as a likely imminent kill attempt even if they have not
+  // yet sent an attack. Route this into PREEMPT_INVASION so we stop spending
+  // troops on discretionary land grabs and harden the shared border instead.
+  const EARLY_INVASION_HUMAN_TROOP_RATIO = 1.5;
+  const EARLY_INVASION_MAX_TICKS = 3 * TICKS_PER_MINUTE;
+  const EARLY_INVASION_MAX_MAP_SHARE = 0.08;
+  const EARLY_INVASION_PINNED_TROOP_RATIO = 0.15;
   const RL_STORAGE_KEY_PREFIX = "superbotRL:";
   const RL_STORAGE_MAX_MATCHES = 3;
   // Compact export budget. The default dump target — 500 KB easily fits
@@ -487,6 +496,7 @@
         invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
         overwhelmingNeighbor: null,
+        earlyHumanOvermatch: null,
       },
       archetype: "unknown",
       archetypeLocked: null, // manual override from overlay
@@ -5483,6 +5493,21 @@
     const tick = gameView.ticks();
     if (tick - runtime.state.cooldowns.expand < 5) return false;
 
+    const earlyHumanOvermatch =
+      runtime.world &&
+      runtime.world.threats &&
+      runtime.world.threats.earlyHumanOvermatch;
+    if (earlyHumanOvermatch) {
+      decisionLog(
+        "expand: holding under early human overmatch — " +
+          (earlyHumanOvermatch.enemy.name || "neighbour") +
+          " has " +
+          earlyHumanOvermatch.ratio.toFixed(2) +
+          "x our troops",
+      );
+      return false;
+    }
+
     // Plan §2.4: do NOT stall terra-nullius expansion on the basis of an
     // overwhelming neighbour. Attacking TerraNullius costs a flat
     // `mag/5` per tile regardless of troop count, so grabbing empty
@@ -8054,6 +8079,28 @@
   // conservative edge for 'can they break me if they commit'.
   const INVASION_STALL_FOCUSED_RATIO = 2.0;
 
+  function sumAttackTroops(attacks) {
+    if (!Array.isArray(attacks)) return 0;
+    return attacks.reduce(
+      (sum, a) => sum + (Number(safeCall(() => a.troops(), 0)) || 0),
+      0,
+    );
+  }
+
+  function entryOutgoingTroops(entry) {
+    return (
+      Number(entry && entry.outgoingTroops) ||
+      sumAttackTroops(entry && entry.outgoingAttacks)
+    );
+  }
+
+  function entryIncomingTroops(entry) {
+    return (
+      Number(entry && entry.incomingTroops) ||
+      sumAttackTroops(entry && entry.incomingAttacks)
+    );
+  }
+
   function computeOverwhelmingNeighbor(myEntry, adjacentEnemies) {
     if (!myEntry) return null;
     const myTroops = Number(myEntry.troops) || 0;
@@ -8079,22 +8126,8 @@
       // Either case keeps the default 2.5× stall threshold. Otherwise
       // we use the tighter 2.0× "focused" threshold because they're
       // free to roll their whole army at us.
-      const outgoingTroops =
-        Number(entry.outgoingTroops) ||
-        (Array.isArray(entry.outgoingAttacks)
-          ? entry.outgoingAttacks.reduce(
-              (sum, a) => sum + (Number(safeCall(() => a.troops(), 0)) || 0),
-              0,
-            )
-          : 0);
-      const incomingTroops =
-        Number(entry.incomingTroops) ||
-        (Array.isArray(entry.incomingAttacks)
-          ? entry.incomingAttacks.reduce(
-              (sum, a) => sum + (Number(safeCall(() => a.troops(), 0)) || 0),
-              0,
-            )
-          : 0);
+      const outgoingTroops = entryOutgoingTroops(entry);
+      const incomingTroops = entryIncomingTroops(entry);
       const focused = outgoingTroops <= 0 && incomingTroops <= 0;
       const threshold = focused
         ? INVASION_STALL_FOCUSED_RATIO
@@ -8114,6 +8147,76 @@
       // idealMinTroops: the troop floor we want to sit at so the defender
       // bonus stays saturated against this neighbour. Derived above —
       // defender >= 0.4 × attacker keeps within(..., 0.6, 2) pinned at 2.
+      idealMinTroops: Math.ceil(theirTroops * 0.4),
+    };
+  }
+
+  function isEarlyGameForInvasionDefense(world, myEntry) {
+    if (!world || !myEntry) return false;
+    const tick = Number(world.tick) || 0;
+    const usableLand = Math.max(
+      1,
+      Number(world.totals && world.totals.usableLand) ||
+        Number(world.totals && world.totals.totalLand) ||
+        1,
+    );
+    const explicitShare =
+      world.totals && typeof world.totals.myShare === "number"
+        ? world.totals.myShare
+        : null;
+    const tileShare =
+      explicitShare !== null
+        ? explicitShare
+        : (Number(myEntry.tiles) || 0) / usableLand;
+    return (
+      tick <= EARLY_INVASION_MAX_TICKS ||
+      tileShare <= EARLY_INVASION_MAX_MAP_SHARE
+    );
+  }
+
+  function computeEarlyHumanOvermatch(myEntry, adjacentEnemies, world) {
+    if (!isEarlyGameForInvasionDefense(world, myEntry)) return null;
+    const myTroops = Number(myEntry.troops) || 0;
+    if (myTroops < 1) return null;
+    if (!Array.isArray(adjacentEnemies) || adjacentEnemies.length === 0) {
+      return null;
+    }
+
+    let worst = null;
+    let worstRatio = 0;
+    for (const entry of adjacentEnemies) {
+      if (!entry) continue;
+      if (entry.isFriendly) continue;
+      if (entry.isDisconnected) continue;
+      if (entry.type !== PlayerType.Human) continue;
+
+      const theirTroops = Number(entry.troops) || 0;
+      const ratio = theirTroops / myTroops;
+      if (ratio <= EARLY_INVASION_HUMAN_TROOP_RATIO) continue;
+
+      const outgoingTroops = entryOutgoingTroops(entry);
+      const incomingTroops = entryIncomingTroops(entry);
+      const dedicatedElsewhere =
+        theirTroops > 0 &&
+        outgoingTroops >= theirTroops * EARLY_INVASION_PINNED_TROOP_RATIO;
+      const pinnedByOthers =
+        theirTroops > 0 &&
+        incomingTroops >= theirTroops * EARLY_INVASION_PINNED_TROOP_RATIO;
+      if (dedicatedElsewhere || pinnedByOthers) continue;
+
+      if (ratio > worstRatio) {
+        worst = entry;
+        worstRatio = ratio;
+      }
+    }
+
+    if (!worst) return null;
+    const theirTroops = Number(worst.troops) || 0;
+    return {
+      enemy: worst,
+      ratio: worstRatio,
+      threshold: EARLY_INVASION_HUMAN_TROOP_RATIO,
+      reason: "earlyHumanOvermatch",
       idealMinTroops: Math.ceil(theirTroops * 0.4),
     };
   }
@@ -9789,14 +9892,6 @@
       if (a.isAdjacent !== b.isAdjacent) return a.isAdjacent ? -1 : 1;
       return b.tiles - a.tiles;
     });
-    // Invasion lists: active first (most urgent), biggest pressure at the
-    // top. Brewing list is ranked by strength so we preempt the scariest
-    // build-up if we can afford to.
-    activeInvaders.sort(
-      (a, b) => (b.invasionIncoming || 0) - (a.invasionIncoming || 0),
-    );
-    brewingInvaders.sort((a, b) => (b.strength || 0) - (a.strength || 0));
-
     // River / strait neighbours: enemies we're NOT land-adjacent to but
     // reachable with a short water hop. These are first-class invasion
     // targets — a neighbour across a 2-tile river is effectively adjacent
@@ -9866,6 +9961,34 @@
       runtime.world.me,
       adjacentEnemies,
     );
+    const earlyHumanOvermatch = computeEarlyHumanOvermatch(
+      runtime.world.me,
+      adjacentEnemies,
+      runtime.world,
+    );
+    if (earlyHumanOvermatch && earlyHumanOvermatch.enemy) {
+      const earlyEnemy = earlyHumanOvermatch.enemy;
+      if (!earlyEnemy.tags) earlyEnemy.tags = new Set();
+      earlyEnemy.tags.add("BREWING_INVASION");
+      earlyEnemy.tags.add("EARLY_HUMAN_OVERMATCH");
+      earlyEnemy.invasionPressure = 0;
+      earlyEnemy.invasionIncoming = 0;
+      earlyEnemy.threatScore = (earlyEnemy.threatScore || 0) + 20;
+      if (
+        !activeInvaders.some((e) => e.smallID === earlyEnemy.smallID) &&
+        !brewingInvaders.some((e) => e.smallID === earlyEnemy.smallID)
+      ) {
+        brewingInvaders.push(earlyEnemy);
+      }
+    }
+    // Invasion lists: active first (most urgent), biggest pressure at the
+    // top. Brewing list is ranked by strength so we preempt the scariest
+    // build-up if we can afford to. Run this after the early-overmatch
+    // injection so the new defensive signal participates in ordering.
+    activeInvaders.sort(
+      (a, b) => (b.invasionIncoming || 0) - (a.invasionIncoming || 0),
+    );
+    brewingInvaders.sort((a, b) => (b.strength || 0) - (a.strength || 0));
 
     runtime.world.threats = {
       crownSmallID: crownEntry ? crownEntry.smallID : null,
@@ -9884,6 +10007,7 @@
       invasionTroopsInbound,
       inboundTroopTotal,
       overwhelmingNeighbor,
+      earlyHumanOvermatch,
     };
   }
 
@@ -10487,8 +10611,15 @@
         const troopRatio = invader.troops / Math.max(1, me.troops);
         // Scale with how overmatched we are: a 2× invader warrants more
         // urgency than a 1.2× one. Base 82 clears TERRA_NULLIUS_RUSH's
-        // typical peak (~81) and RETALIATION's idle peak (70).
-        let priority = 82;
+        // typical peak (~81) and RETALIATION's idle peak (70). The explicit
+        // early-Human-overmatch signal is stronger: opening TERRA can now
+        // reach 90, but a neighbouring player with a 1.5× troop lead is a
+        // survival problem, so lift that case just above max empty-land rush.
+        const earlyOvermatch =
+          world.threats.earlyHumanOvermatch &&
+          world.threats.earlyHumanOvermatch.enemy &&
+          world.threats.earlyHumanOvermatch.enemy.smallID === invader.smallID;
+        let priority = earlyOvermatch ? 91 : 82;
         if (troopRatio >= 1.5) priority += 2;
         if (troopRatio >= 2.0) priority += 2;
         return {
@@ -13813,6 +13944,7 @@
         invasionTroopsInbound: 0,
         inboundTroopTotal: 0,
         overwhelmingNeighbor: null,
+        earlyHumanOvermatch: null,
       },
       archetype: "CONTINENTAL",
       archetypeLocked: null,
@@ -14239,6 +14371,52 @@
       "PREEMPT_INVASION",
     );
 
+    // Scenario 14b: early human overmatch — adjacent player has a large
+    // opening troop lead but has not attacked yet. Treat this exactly like a
+    // brewing invader so we harden instead of spending troops on expansion.
+    const scenario14b = buildTestWorld({
+      tick: 900,
+      totals: {
+        alivePlayers: 4,
+        humanCount: 2,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.12,
+        myShare: 0.04,
+        secondShare: 0.08,
+      },
+    });
+    scenario14b.me.troops = 20_000;
+    const earlyHuman = {
+      smallID: 66,
+      name: "Opening Bully",
+      type: PlayerType.Human,
+      isFriendly: false,
+      isAdjacent: true,
+      troops: 32_000,
+      troopsPerMin: 0,
+      troopRatio: 0.45,
+      outgoingTroops: 0,
+      incomingTroops: 0,
+      strength: 45_000,
+    };
+    scenario14b.threats.earlyHumanOvermatch = {
+      enemy: earlyHuman,
+      ratio: 1.6,
+      threshold: EARLY_INVASION_HUMAN_TROOP_RATIO,
+      reason: "earlyHumanOvermatch",
+      idealMinTroops: 12_800,
+    };
+    scenario14b.threats.brewingInvaders = [earlyHuman];
+    scenario14b.threats.adjacentEnemies = [earlyHuman];
+    step(
+      "early human overmatch -> PREEMPT_INVASION",
+      scenario14b,
+      "PREEMPT_INVASION",
+    );
+
     // Scenario 15: REPEL_INVASION outranks PREEMPT_INVASION when both
     // lists are populated at the same time (active takes priority).
     const scenario15 = buildTestWorld();
@@ -14631,9 +14809,14 @@
         reconcileBoatLosses,
         maybeRiverCrossing,
         computeOverwhelmingNeighbor,
+        computeEarlyHumanOvermatch,
+        isEarlyGameForInvasionDefense,
         shouldStallForInvasionDefense,
         INVASION_STALL_TROOP_RATIO,
         INVASION_STALL_FOCUSED_RATIO,
+        EARLY_INVASION_HUMAN_TROOP_RATIO,
+        EARLY_INVASION_MAX_TICKS,
+        EARLY_INVASION_MAX_MAP_SHARE,
         NARROW_WATER_HOP_LIMIT,
         LOST_BOAT_BASE_COOLDOWN_TICKS,
         LOST_BOAT_MAX_COOLDOWN_TICKS,
