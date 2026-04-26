@@ -580,7 +580,9 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
       const overrideRow = panel.querySelector("#superbot-override-goals");
       const turtleBtn = Array.from(
         overrideRow!.querySelectorAll("button"),
-      ).find((b) => b.dataset.goal === "DEFENSIVE_TURTLE");
+      ).find(
+        (b: HTMLButtonElement) => b.dataset.goal === "DEFENSIVE_TURTLE",
+      ) as HTMLButtonElement | undefined;
       expect(turtleBtn, "Turtle override button should exist").toBeTruthy();
       expect(turtleBtn!.getAttribute("title") ?? "").toContain(
         "We are the crown",
@@ -634,10 +636,14 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
       const overrideRow = panel!.querySelector("#superbot-override-goals");
       const repelBtn = Array.from(
         overrideRow!.querySelectorAll("button"),
-      ).find((b) => b.dataset.goal === "REPEL_INVASION");
+      ).find(
+        (b: HTMLButtonElement) => b.dataset.goal === "REPEL_INVASION",
+      ) as HTMLButtonElement | undefined;
       const preemptBtn = Array.from(
         overrideRow!.querySelectorAll("button"),
-      ).find((b) => b.dataset.goal === "PREEMPT_INVASION");
+      ).find(
+        (b: HTMLButtonElement) => b.dataset.goal === "PREEMPT_INVASION",
+      ) as HTMLButtonElement | undefined;
       expect(repelBtn, "Repel Invasion override button should exist").toBeTruthy();
       expect(preemptBtn, "Preempt Invasion override button should exist").toBeTruthy();
       expect(repelBtn!.getAttribute("title") ?? "").toContain(
@@ -1058,7 +1064,7 @@ describe("tampermonkey-superhuman-bot narrow-water river invasion", () => {
       runtime.test.internals;
     const { gameView, myBorderX } = makeWorld({ riverWidth: 2 });
     const me = { smallID: () => 1 };
-    const borderTiles = [];
+    const borderTiles: number[] = [];
     for (let y = 0; y < HEIGHT; y++) borderTiles.push(ref(myBorderX, y));
 
     const found = findNarrowWaterEnemies(
@@ -1085,7 +1091,7 @@ describe("tampermonkey-superhuman-bot narrow-water river invasion", () => {
       enemyStartX: 20,
     });
     const me = { smallID: () => 1 };
-    const borderTiles = [];
+    const borderTiles: number[] = [];
     for (let y = 0; y < HEIGHT; y++) borderTiles.push(ref(myBorderX, y));
 
     const found = findNarrowWaterEnemies(
@@ -1102,7 +1108,7 @@ describe("tampermonkey-superhuman-bot narrow-water river invasion", () => {
     const { findNarrowWaterEnemies } = runtime.test.internals;
     const { gameView, myBorderX } = makeWorld({ riverWidth: 6 });
     const me = { smallID: () => 1 };
-    const borderTiles = [];
+    const borderTiles: number[] = [];
     for (let y = 0; y < HEIGHT; y++) borderTiles.push(ref(myBorderX, y));
 
     // At exactly the hop limit (6), the enemy should still be found.
