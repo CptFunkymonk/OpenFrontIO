@@ -4716,29 +4716,31 @@
     const gameView = getGameView();
     if (!gameView) return null;
 
-    // Plan §2.1.1: out-sample the server. The engine collects one
-    // candidate per tick for ~2/3 of the spawn phase (~200 ticks on
-    // public matches) and locks the best. We only pick once, so we
-    // burst-sample every call. Budget is bounded so we do not starve
-    // the main loop on slow clients.
+    // Out-sample the server, but cheaply.
     //
-    // 20× the spawn-phase tick count keeps us above the server's
-    // sample density while capping at 6000 so the per-call cost
-    // stays bounded. Plan §6 risks: if the measured wall-time per
-    // call exceeds 10 ms we self-cap at 3000 on subsequent calls to
-    // keep the spawn-phase tick loop responsive.
+    // The engine collects one candidate per tick for ~2/3 of the spawn
+    // phase (~200 ticks on public matches) and locks the best; we only
+    // get to pick once, so we burst-sample every call.
+    //
+    // Manual-spawn maps don't have an opaque server-side scorer to beat
+    // — the player normally picks the tile themselves — so 5× the spawn
+    // phase tick count is plenty. Capping at 1500 keeps the per-call
+    // scorer cost well under one tick interval (140 ms) on average
+    // hardware. The `degraded` self-governor below halves the cap to
+    // 750 if we ever measure a >10 ms call, preserving the per-tick
+    // headroom even on slow clients.
     const spawnPhaseTicks = safeCall(
       () => gameView.config().numSpawnPhaseTurns(),
       300,
     );
-    const SAMPLE_CAP = Math.min(6000, Math.max(1500, spawnPhaseTicks * 20));
+    const SAMPLE_CAP = Math.min(1500, Math.max(600, spawnPhaseTicks * 5));
     const spawnPerf = runtime.state.spawn.perf || {
       lastCallMs: 0,
       degraded: false,
       measuredAt: -1,
     };
     runtime.state.spawn.perf = spawnPerf;
-    const SAMPLES = spawnPerf.degraded ? Math.min(3000, SAMPLE_CAP) : SAMPLE_CAP;
+    const SAMPLES = spawnPerf.degraded ? Math.min(750, SAMPLE_CAP) : SAMPLE_CAP;
 
     const hasPerfNow =
       typeof performance !== "undefined" &&
@@ -4765,7 +4767,7 @@
             dt.toFixed(1) +
             "ms for " +
             SAMPLES +
-            " samples — degrading to 3000 cap",
+            " samples — degrading to 750 cap",
         );
       }
     }
