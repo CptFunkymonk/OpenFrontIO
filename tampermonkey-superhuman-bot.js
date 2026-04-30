@@ -113,6 +113,26 @@
   const STEALTH_REACTION_MIN_MS = 300;
   const STEALTH_REACTION_MAX_MS = 900;
   const STEALTH_SPAWN_THINK_MS = 8000;
+
+  // Random-spawn candidate-collection budget.
+  //
+  // The previous design (Plan §2.1) burst-sampled 20 random tiles per spawn
+  // tick to "out-sample the server" (the engine itself collects 1/tick).
+  // That worked for selection quality but made the spawn phase the most
+  // CPU-expensive moment of the whole match — `computeSpawnCenterScore`
+  // does ~14 circleSearch / BFS passes per accepted candidate, and at
+  // 20×/tick × ~7 ticks/s it routinely starved the per-tick budget.
+  //
+  // The new budget keeps a comfortable lead over the server's sampling
+  // density without overrunning the 140 ms tick interval:
+  //   - 6 attempts per spawn tick (vs 20 before)
+  //   - bounded to ~4 ms wall-clock per burst on hosts with performance.now
+  //   - capped at 1500 distinct accepted candidates per match — well above
+  //     the engine's ~200 and enough that `chooseBestRandomSpawnCandidate`
+  //     keeps picking effectively the same tile as the 4000-cap version.
+  const SPAWN_RANDOM_BURST_PER_TICK = 6;
+  const SPAWN_RANDOM_BURST_BUDGET_MS = 4;
+  const SPAWN_CANDIDATE_POOL_TARGET = 1500;
   const STEALTH_COMBO_COOLDOWN_MS = 500;
   const STEALTH_PER_PLAYER_DIVERSITY_WINDOW_MS = 3000;
   const STEALTH_PER_PLAYER_DIVERSITY_CAP = 3;
@@ -324,11 +344,12 @@
         /** @type {{ center: number, score: number }[] | null} */
         sortedCandidates: null,
         finalIndex: 0,
-        // Raised from 2000 (Plan §2.1): with the 20× burst-sample rate
-        // we expect ~4000 unique candidates during the collection
-        // window, and keeping them all gives the final `chooseBest`
-        // pass a much richer pool to pick from.
-        maxCandidateCenters: 6000,
+        // Hard cap on distinct accepted candidates the
+        // `rememberSpawnCandidate` map will retain. `maybeHandleSpawn`
+        // additionally early-exits the per-tick burst once the pool
+        // hits SPAWN_CANDIDATE_POOL_TARGET (1500 by default), so this
+        // cap mostly serves as a defensive ceiling for unusual hosts.
+        maxCandidateCenters: 2000,
         randomSpawnIntentSent: false,
         thinkUntilMs: 0,
       },
@@ -5387,15 +5408,37 @@
       const tick = gameView.ticks();
 
       if (tick <= collectionEnd) {
-        // Plan §2.1.1/.2: the server samples 1 random tile per tick. We
-        // burst 20 per tick so after the collection window we have a
-        // ~4000-candidate pool (vs ~200 before), deeply out-sampling the
-        // server scorer. `rememberSpawnCandidate` already caps the set
-        // size, so we cannot grow unbounded.
-        for (let i = 0; i < 20; i++) {
-          const sampled = trySampleSpawnCandidate(gameView);
-          if (sampled) {
-            rememberSpawnCandidate(sampled);
+        // The server samples 1 random tile per tick. We burst-sample so
+        // the post-collection pool deeply out-samples the server scorer,
+        // but the loop is bounded three ways so it can never starve the
+        // per-tick budget:
+        //   1. `SPAWN_RANDOM_BURST_PER_TICK` attempts per tick.
+        //   2. `SPAWN_RANDOM_BURST_BUDGET_MS` wall-clock cap (skipped when
+        //      performance.now() isn't available, e.g. in headless tests).
+        //   3. `SPAWN_CANDIDATE_POOL_TARGET` once we already have enough
+        //      distinct candidates queued, we stop sampling for the rest
+        //      of the collection window — the existing
+        //      `chooseBestRandomSpawnCandidate` selection logic still
+        //      runs against the full pool when the window closes.
+        const candidates = runtime.state.spawn.candidateByCenter;
+        const poolTarget = SPAWN_CANDIDATE_POOL_TARGET;
+        if (!candidates || candidates.size < poolTarget) {
+          const hasPerf =
+            typeof performance !== "undefined" &&
+            typeof performance.now === "function";
+          const burstStart = hasPerf ? performance.now() : 0;
+          for (let i = 0; i < SPAWN_RANDOM_BURST_PER_TICK; i++) {
+            if (candidates && candidates.size >= poolTarget) break;
+            const sampled = trySampleSpawnCandidate(gameView);
+            if (sampled) {
+              rememberSpawnCandidate(sampled);
+            }
+            if (
+              hasPerf &&
+              performance.now() - burstStart > SPAWN_RANDOM_BURST_BUDGET_MS
+            ) {
+              break;
+            }
           }
         }
         runtime.state.lastAction =
