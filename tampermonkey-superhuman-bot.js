@@ -4031,13 +4031,17 @@
     }
     const totalTerrain = Math.max(1, plains + highland + mountain);
     const patchPlainsRatio = plains / totalTerrain;
-    const nearTerrain = weightedTerrainCountsNear(gameView, center, 18);
-    const farTerrain = weightedTerrainCountsNear(gameView, center, 42);
-    const plainsFlood = weightedPlainsFloodScore(gameView, center, 700);
+
     // Plains-first gate: Plains give attackers mag=80 / speed=16.5
     // (cheapest and fastest TerraNullius expansion). A merely adequate
     // spawn patch can pass only if the surrounding expansion field is
     // strongly plains-rich; otherwise we reject it before scoring.
+    //
+    // The radius-18 terrain scan is the cheapest of the three terrain
+    // passes, so we run it first to power the gate. Heavier passes
+    // (radius-42 + 700-tile BFS) are deferred until *after* the gate so
+    // rejected candidates pay only for the cheap pass.
+    const nearTerrain = weightedTerrainCountsNear(gameView, center, 18);
     if (
       patchPlainsRatio < 0.6 &&
       (patchPlainsRatio < 0.5 || nearTerrain.plainsRatio < 0.75)
@@ -4045,12 +4049,17 @@
       return null;
     }
 
-    let ownedPenalty = 0;
-    for (const tile of gameView.circleSearch(center, 18)) {
-      if (gameView.ownerID(tile) > 0) {
-        ownedPenalty += 3;
-      }
-    }
+    // Now that the candidate has passed the gate, run the heavier
+    // terrain analyses.
+    const farTerrain = weightedTerrainCountsNear(gameView, center, 42);
+    const plainsFlood = weightedPlainsFloodScore(gameView, center, 700);
+
+    // Reuse the radius-18 owned-tile count we already collected above
+    // (saves one full `circleSearch(center, 18)` pass per accepted
+    // candidate). `weightedTerrainCountsNear` only counts land tiles
+    // when accumulating `owned`; in practice water tiles are
+    // unowned (ownerID === 0), so this matches the previous behaviour.
+    const ownedPenalty = nearTerrain.owned * 3;
 
     let oceanPenalty = 0;
     for (const tile of gameView.circleSearch(center, 6)) {
