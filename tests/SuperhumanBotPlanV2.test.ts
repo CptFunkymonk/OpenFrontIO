@@ -270,6 +270,79 @@ describe("spawn scoring — plains expansion and human isolation", () => {
       nationProx: expect.any(Number),
     });
   });
+
+  it("caches spawn globals per tick: playerViews() runs once, score is stable", () => {
+    const runtime = loadUserscript();
+    const { computeSpawnCenterScore, PlayerType } = runtime.test.internals;
+    let playerViewsCalls = 0;
+    const baseView = makeSpawnScoringGameView({
+      players: [
+        playerStub(PlayerType.Human, 2, 60 * 220 + 78),
+        playerStub(PlayerType.Bot, 3, 60 * 220 + 95),
+      ],
+    });
+    const gameView = {
+      ...baseView,
+      playerViews: () => {
+        playerViewsCalls += 1;
+        return [
+          playerStub(PlayerType.Human, 2, 60 * 220 + 78),
+          playerStub(PlayerType.Bot, 3, 60 * 220 + 95),
+        ];
+      },
+    };
+
+    installSpawnScoringView(runtime, gameView);
+    // Simulate the per-tick cache reset that runModulesForTick does.
+    runtime.tickCache = {
+      tick: 0,
+      gameView: null,
+      myPlayer: undefined,
+      myLivingPlayer: undefined,
+      allPlayers: undefined,
+      enemies: undefined,
+      allies: undefined,
+      config: undefined,
+      spawnGlobals: null,
+    };
+
+    const tile = gameView.ref(40, 60);
+    const first = computeSpawnCenterScore(gameView, tile);
+    const callsAfterFirst = playerViewsCalls;
+    const second = computeSpawnCenterScore(gameView, tile);
+    const third = computeSpawnCenterScore(gameView, gameView.ref(45, 65));
+
+    // First call builds the cache (1 playerViews()), subsequent calls
+    // should reuse it without invoking playerViews() again.
+    expect(callsAfterFirst).toBe(1);
+    expect(playerViewsCalls).toBe(1);
+    // Score must remain identical for the same input across calls.
+    expect(second).toBe(first);
+    // A different (still valid) candidate scores without re-walking
+    // playerViews(); proves the cache covers the whole spawn tick.
+    expect(third).not.toBeNull();
+    expect(playerViewsCalls).toBe(1);
+
+    // After a tick cache reset (new tick), playerViews() is consulted
+    // again exactly once.
+    runtime.tickCache = {
+      tick: 1,
+      gameView: null,
+      myPlayer: undefined,
+      myLivingPlayer: undefined,
+      allPlayers: undefined,
+      enemies: undefined,
+      allies: undefined,
+      config: undefined,
+      spawnGlobals: null,
+    };
+    computeSpawnCenterScore(gameView, tile);
+    expect(playerViewsCalls).toBe(2);
+    // Restore the default (null) so subsequent tests that assume an
+    // un-cached runtime don't see lazily-cached null values from our
+    // synthetic gameView (e.g. `myPlayer === null`).
+    runtime.tickCache = null;
+  });
 });
 
 describe("calculateAttackTroops — engine saturation anchoring", () => {
