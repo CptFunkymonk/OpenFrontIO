@@ -3677,6 +3677,67 @@
     return sample.length > 0 ? sample[0] : null;
   }
 
+  /**
+   * Per-spawn-tick global cache.
+   *
+   * Pre-spawn we evaluate hundreds-to-thousands of candidate tiles per tick
+   * via `computeSpawnCenterScore`. Each evaluation used to walk
+   * `gameView.playerViews()` *three* times (min-distance gate, typed
+   * proximity, gaussian cluster) — but the player roster, my smallID, the
+   * configured min-distance, and every other player's spawn anchor are all
+   * identical for every candidate within a single tick. Compute them once,
+   * stash on the per-tick cache, and let the candidate loop re-use them.
+   *
+   * The cache is read-only after build and lives on `runtime.tickCache`,
+   * which is reset at the top of every `runModulesForTick` so we can never
+   * leak into the next tick.
+   *
+   * Each opponent entry contains:
+   *   - smallID, type (PlayerType.Human|Nation|Bot)
+   *   - spawnTile: number|null  — server-reported spawn tile, when known
+   *   - anchor:    number|null  — spawnTile if known, otherwise a sampled
+   *                               owned land tile, otherwise null
+   */
+  function buildSpawnGlobals(gameView) {
+    const me = getMyPlayer();
+    const mySmall = me ? safeCall(() => me.smallID(), -1) : -1;
+    const minDist = safeCall(
+      () => gameView.config().minDistanceBetweenPlayers(),
+      0,
+    );
+    const opponents = [];
+    const allViews = safeCall(() => gameView.playerViews(), []);
+    for (const p of allViews) {
+      if (!p) continue;
+      const smallID = safeCall(() => p.smallID(), -1);
+      if (smallID < 0) continue;
+      if (mySmall >= 0 && smallID === mySmall) continue;
+      const type = safeCall(() => p.type(), null);
+      const spawnTile = safeCall(() => p.spawnTile(), undefined);
+      const knownSpawn =
+        spawnTile !== undefined && spawnTile !== null ? spawnTile : null;
+      const anchor =
+        knownSpawn !== null
+          ? knownSpawn
+          : spawnAnchorTileForPlayer(gameView, p);
+      opponents.push({
+        smallID,
+        type,
+        spawnTile: knownSpawn,
+        anchor: anchor === undefined ? null : anchor,
+      });
+    }
+    return { mySmallID: mySmall, minDistanceBetweenPlayers: minDist, opponents };
+  }
+
+  function getSpawnGlobals(gameView) {
+    const cache = runtime.tickCache;
+    if (cache && cache.spawnGlobals) return cache.spawnGlobals;
+    const built = buildSpawnGlobals(gameView);
+    if (cache) cache.spawnGlobals = built;
+    return built;
+  }
+
   function terrainExpansionWeight(type) {
     if (type === TerrainType.Plains) return 1;
     if (type === TerrainType.Highland) return 0.45;
@@ -3765,21 +3826,20 @@
   }
 
   function computeTypedSpawnProximity(gameView, center) {
-    const mySmall = runtime.world.meSmallID;
+    // Pull the cached opponent roster once per tick (anchors / smallIDs
+    // resolved a single time per spawn tick rather than per candidate).
+    const globals = getSpawnGlobals(gameView);
     const humans = [];
     const tribes = [];
     let nearestHuman = Infinity;
     let nearestNation = Infinity;
     let nearestTribe = Infinity;
 
-    for (const p of safeCall(() => gameView.playerViews(), [])) {
-      if (!p) continue;
-      const smallID = safeCall(() => p.smallID(), -1);
-      if (smallID === mySmall) continue;
-      const anchor = spawnAnchorTileForPlayer(gameView, p);
+    for (const opp of globals.opponents) {
+      const anchor = opp.anchor;
       if (anchor === null || anchor === undefined) continue;
       const dist = gameView.manhattanDist(center, anchor);
-      const type = safeCall(() => p.type(), null);
+      const type = opp.type;
       if (type === PlayerType.Human) {
         nearestHuman = Math.min(nearestHuman, dist);
         humans.push({ tile: anchor, dist });
@@ -3898,29 +3958,19 @@
    * bounded).
    */
   function gaussianEnemyClusterPenalty(gameView, center) {
-    const mySmall = runtime.world.meSmallID;
+    // Use the per-tick opponent cache so we don't re-sample owned tiles
+    // hundreds of times across a sampling burst. Anchors already prefer
+    // the server-reported spawnTile and fall back to a single sampled
+    // owned tile, matching the previous behaviour exactly.
+    const globals = getSpawnGlobals(gameView);
     let sum = 0;
-    for (const p of safeCall(() => gameView.playerViews(), [])) {
-      if (!p) continue;
-      const smallID = safeCall(() => p.smallID(), -1);
-      if (smallID === mySmall) continue;
-      const type = safeCall(() => p.type(), null);
-      // Humans dominate diplomacy + nuke timing; weight them heaviest.
-      const weight = type === PlayerType.Human ? 1.0 : 0.6;
-      let dist = Infinity;
-      const spawnTile = safeCall(() => p.spawnTile(), undefined);
-      if (spawnTile !== undefined && spawnTile !== null) {
-        dist = gameView.manhattanDist(center, spawnTile);
-      } else if (safeCall(() => p.hasSpawned(), false)) {
-        const sample = sampleTilesForOwner(smallID, 1, {
-          requireLand: true,
-          maxSamples: 60,
-        });
-        if (sample.length > 0) {
-          dist = gameView.manhattanDist(center, sample[0]);
-        }
-      }
+    for (const opp of globals.opponents) {
+      const anchor = opp.anchor;
+      if (anchor === null || anchor === undefined) continue;
+      const dist = gameView.manhattanDist(center, anchor);
       if (!Number.isFinite(dist)) continue;
+      // Humans dominate diplomacy + nuke timing; weight them heaviest.
+      const weight = opp.type === PlayerType.Human ? 1.0 : 0.6;
       // σ = 80 tiles → two players at d=40 contribute ~0.78 each.
       sum += weight * Math.exp(-(dist * dist) / (2 * 80 * 80));
     }
@@ -3934,19 +3984,18 @@
     const spawnTiles = getManualSpawnTiles(center);
     if (!spawnTiles || spawnTiles.length === 0) return null;
 
-    const minDist = safeCall(
-      () => gameView.config().minDistanceBetweenPlayers(),
-      0,
-    );
-    const me = getMyPlayer();
-    const mySmall = me ? safeCall(() => me.smallID(), -1) : -1;
-    for (const p of safeCall(() => gameView.playerViews(), [])) {
-      if (!p) continue;
-      if (mySmall >= 0 && p.smallID() === mySmall) continue;
-      const st = safeCall(() => p.spawnTile(), undefined);
-      if (st === undefined || st === null) continue;
-      if (gameView.manhattanDist(center, st) < minDist) {
-        return null;
+    // Use the per-tick spawn globals: avoids re-walking gameView.playerViews()
+    // and re-resolving spawnTile()/smallID() per candidate. The opponent
+    // list is built once per spawn tick by getSpawnGlobals().
+    const globals = getSpawnGlobals(gameView);
+    const minDist = globals.minDistanceBetweenPlayers;
+    if (minDist > 0) {
+      for (const opp of globals.opponents) {
+        const st = opp.spawnTile;
+        if (st === null) continue;
+        if (gameView.manhattanDist(center, st) < minDist) {
+          return null;
+        }
       }
     }
 
@@ -11737,6 +11786,10 @@
       enemies: undefined,
       allies: undefined,
       config: undefined,
+      // Lazy: built once per spawn tick by getSpawnGlobals(). Cached here
+      // so candidate-score helpers reuse opponent anchors / minDist /
+      // mySmallID instead of re-walking playerViews() per candidate.
+      spawnGlobals: null,
     };
     discoverRuntimeReferences();
     const gameView = getGameView();
@@ -14859,6 +14912,8 @@
         perimeterToAreaRatio,
         corridorCount,
         gaussianEnemyClusterPenalty,
+        buildSpawnGlobals,
+        getSpawnGlobals,
         // Plan §8 acceptance-test helpers.
         selectPrimaryGoal,
         recordAllianceBreak,
