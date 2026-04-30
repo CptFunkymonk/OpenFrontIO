@@ -13840,7 +13840,31 @@
       // perception/decision time. Keeps us in the "fast human" range
       // (300–900 ms) rather than the "frame-perfect bot" range. Skipped in
       // harness/test mode so deterministic smoke tests stay fast.
-      if (runtime.enabled && !isHarnessMode()) {
+      //
+      // Pre-spawn fast-path: the reaction delay only exists to humanise the
+      // cadence of *outgoing intents*. While we are still in the spawn phase
+      // (no living player yet) the only intent we will send is the spawn
+      // itself, which already has its own STEALTH_SPAWN_THINK_MS thinking
+      // timer inside maybeHandleSpawn(). Sleeping again here just chokes the
+      // tick loop while the heaviest pre-spawn work (candidate scoring) is
+      // already trying to fit in a 140 ms tick budget. Skip the jitter when
+      // the match has not started, the socket is closed, or the engine
+      // reports we are still in spawn phase.
+      const phase = runtime.state && runtime.state.matchPhase;
+      const prespawn =
+        phase === "boot" ||
+        phase === "closed" ||
+        phase === "start" ||
+        phase === "spawn";
+      const liveGameView = runtime.hooks && runtime.hooks.gameView;
+      const inSpawnPhaseNow =
+        prespawn ||
+        Boolean(
+          liveGameView &&
+            typeof liveGameView.inSpawnPhase === "function" &&
+            safeCall(() => liveGameView.inSpawnPhase(), false),
+        );
+      if (runtime.enabled && !isHarnessMode() && !inSpawnPhaseNow) {
         const delay =
           STEALTH_REACTION_MIN_MS +
           Math.floor(Math.random() * (STEALTH_REACTION_MAX_MS - STEALTH_REACTION_MIN_MS));
