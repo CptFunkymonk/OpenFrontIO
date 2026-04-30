@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.10.0
+// @version      2.10.1
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.10.0";
+  const BOT_VERSION = "2.10.1";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -113,6 +113,26 @@
   const STEALTH_REACTION_MIN_MS = 300;
   const STEALTH_REACTION_MAX_MS = 900;
   const STEALTH_SPAWN_THINK_MS = 8000;
+
+  // Random-spawn candidate-collection budget.
+  //
+  // The previous design (Plan §2.1) burst-sampled 20 random tiles per spawn
+  // tick to "out-sample the server" (the engine itself collects 1/tick).
+  // That worked for selection quality but made the spawn phase the most
+  // CPU-expensive moment of the whole match — `computeSpawnCenterScore`
+  // does ~14 circleSearch / BFS passes per accepted candidate, and at
+  // 20×/tick × ~7 ticks/s it routinely starved the per-tick budget.
+  //
+  // The new budget keeps a comfortable lead over the server's sampling
+  // density without overrunning the 140 ms tick interval:
+  //   - 6 attempts per spawn tick (vs 20 before)
+  //   - bounded to ~4 ms wall-clock per burst on hosts with performance.now
+  //   - capped at 1500 distinct accepted candidates per match — well above
+  //     the engine's ~200 and enough that `chooseBestRandomSpawnCandidate`
+  //     keeps picking effectively the same tile as the 4000-cap version.
+  const SPAWN_RANDOM_BURST_PER_TICK = 6;
+  const SPAWN_RANDOM_BURST_BUDGET_MS = 4;
+  const SPAWN_CANDIDATE_POOL_TARGET = 1500;
   const STEALTH_COMBO_COOLDOWN_MS = 500;
   const STEALTH_PER_PLAYER_DIVERSITY_WINDOW_MS = 3000;
   const STEALTH_PER_PLAYER_DIVERSITY_CAP = 3;
@@ -324,11 +344,12 @@
         /** @type {{ center: number, score: number }[] | null} */
         sortedCandidates: null,
         finalIndex: 0,
-        // Raised from 2000 (Plan §2.1): with the 20× burst-sample rate
-        // we expect ~4000 unique candidates during the collection
-        // window, and keeping them all gives the final `chooseBest`
-        // pass a much richer pool to pick from.
-        maxCandidateCenters: 6000,
+        // Hard cap on distinct accepted candidates the
+        // `rememberSpawnCandidate` map will retain. `maybeHandleSpawn`
+        // additionally early-exits the per-tick burst once the pool
+        // hits SPAWN_CANDIDATE_POOL_TARGET (1500 by default), so this
+        // cap mostly serves as a defensive ceiling for unusual hosts.
+        maxCandidateCenters: 2000,
         randomSpawnIntentSent: false,
         thinkUntilMs: 0,
       },
@@ -3677,6 +3698,67 @@
     return sample.length > 0 ? sample[0] : null;
   }
 
+  /**
+   * Per-spawn-tick global cache.
+   *
+   * Pre-spawn we evaluate hundreds-to-thousands of candidate tiles per tick
+   * via `computeSpawnCenterScore`. Each evaluation used to walk
+   * `gameView.playerViews()` *three* times (min-distance gate, typed
+   * proximity, gaussian cluster) — but the player roster, my smallID, the
+   * configured min-distance, and every other player's spawn anchor are all
+   * identical for every candidate within a single tick. Compute them once,
+   * stash on the per-tick cache, and let the candidate loop re-use them.
+   *
+   * The cache is read-only after build and lives on `runtime.tickCache`,
+   * which is reset at the top of every `runModulesForTick` so we can never
+   * leak into the next tick.
+   *
+   * Each opponent entry contains:
+   *   - smallID, type (PlayerType.Human|Nation|Bot)
+   *   - spawnTile: number|null  — server-reported spawn tile, when known
+   *   - anchor:    number|null  — spawnTile if known, otherwise a sampled
+   *                               owned land tile, otherwise null
+   */
+  function buildSpawnGlobals(gameView) {
+    const me = getMyPlayer();
+    const mySmall = me ? safeCall(() => me.smallID(), -1) : -1;
+    const minDist = safeCall(
+      () => gameView.config().minDistanceBetweenPlayers(),
+      0,
+    );
+    const opponents = [];
+    const allViews = safeCall(() => gameView.playerViews(), []);
+    for (const p of allViews) {
+      if (!p) continue;
+      const smallID = safeCall(() => p.smallID(), -1);
+      if (smallID < 0) continue;
+      if (mySmall >= 0 && smallID === mySmall) continue;
+      const type = safeCall(() => p.type(), null);
+      const spawnTile = safeCall(() => p.spawnTile(), undefined);
+      const knownSpawn =
+        spawnTile !== undefined && spawnTile !== null ? spawnTile : null;
+      const anchor =
+        knownSpawn !== null
+          ? knownSpawn
+          : spawnAnchorTileForPlayer(gameView, p);
+      opponents.push({
+        smallID,
+        type,
+        spawnTile: knownSpawn,
+        anchor: anchor === undefined ? null : anchor,
+      });
+    }
+    return { mySmallID: mySmall, minDistanceBetweenPlayers: minDist, opponents };
+  }
+
+  function getSpawnGlobals(gameView) {
+    const cache = runtime.tickCache;
+    if (cache && cache.spawnGlobals) return cache.spawnGlobals;
+    const built = buildSpawnGlobals(gameView);
+    if (cache) cache.spawnGlobals = built;
+    return built;
+  }
+
   function terrainExpansionWeight(type) {
     if (type === TerrainType.Plains) return 1;
     if (type === TerrainType.Highland) return 0.45;
@@ -3765,21 +3847,20 @@
   }
 
   function computeTypedSpawnProximity(gameView, center) {
-    const mySmall = runtime.world.meSmallID;
+    // Pull the cached opponent roster once per tick (anchors / smallIDs
+    // resolved a single time per spawn tick rather than per candidate).
+    const globals = getSpawnGlobals(gameView);
     const humans = [];
     const tribes = [];
     let nearestHuman = Infinity;
     let nearestNation = Infinity;
     let nearestTribe = Infinity;
 
-    for (const p of safeCall(() => gameView.playerViews(), [])) {
-      if (!p) continue;
-      const smallID = safeCall(() => p.smallID(), -1);
-      if (smallID === mySmall) continue;
-      const anchor = spawnAnchorTileForPlayer(gameView, p);
+    for (const opp of globals.opponents) {
+      const anchor = opp.anchor;
       if (anchor === null || anchor === undefined) continue;
       const dist = gameView.manhattanDist(center, anchor);
-      const type = safeCall(() => p.type(), null);
+      const type = opp.type;
       if (type === PlayerType.Human) {
         nearestHuman = Math.min(nearestHuman, dist);
         humans.push({ tile: anchor, dist });
@@ -3898,29 +3979,19 @@
    * bounded).
    */
   function gaussianEnemyClusterPenalty(gameView, center) {
-    const mySmall = runtime.world.meSmallID;
+    // Use the per-tick opponent cache so we don't re-sample owned tiles
+    // hundreds of times across a sampling burst. Anchors already prefer
+    // the server-reported spawnTile and fall back to a single sampled
+    // owned tile, matching the previous behaviour exactly.
+    const globals = getSpawnGlobals(gameView);
     let sum = 0;
-    for (const p of safeCall(() => gameView.playerViews(), [])) {
-      if (!p) continue;
-      const smallID = safeCall(() => p.smallID(), -1);
-      if (smallID === mySmall) continue;
-      const type = safeCall(() => p.type(), null);
-      // Humans dominate diplomacy + nuke timing; weight them heaviest.
-      const weight = type === PlayerType.Human ? 1.0 : 0.6;
-      let dist = Infinity;
-      const spawnTile = safeCall(() => p.spawnTile(), undefined);
-      if (spawnTile !== undefined && spawnTile !== null) {
-        dist = gameView.manhattanDist(center, spawnTile);
-      } else if (safeCall(() => p.hasSpawned(), false)) {
-        const sample = sampleTilesForOwner(smallID, 1, {
-          requireLand: true,
-          maxSamples: 60,
-        });
-        if (sample.length > 0) {
-          dist = gameView.manhattanDist(center, sample[0]);
-        }
-      }
+    for (const opp of globals.opponents) {
+      const anchor = opp.anchor;
+      if (anchor === null || anchor === undefined) continue;
+      const dist = gameView.manhattanDist(center, anchor);
       if (!Number.isFinite(dist)) continue;
+      // Humans dominate diplomacy + nuke timing; weight them heaviest.
+      const weight = opp.type === PlayerType.Human ? 1.0 : 0.6;
       // σ = 80 tiles → two players at d=40 contribute ~0.78 each.
       sum += weight * Math.exp(-(dist * dist) / (2 * 80 * 80));
     }
@@ -3934,19 +4005,18 @@
     const spawnTiles = getManualSpawnTiles(center);
     if (!spawnTiles || spawnTiles.length === 0) return null;
 
-    const minDist = safeCall(
-      () => gameView.config().minDistanceBetweenPlayers(),
-      0,
-    );
-    const me = getMyPlayer();
-    const mySmall = me ? safeCall(() => me.smallID(), -1) : -1;
-    for (const p of safeCall(() => gameView.playerViews(), [])) {
-      if (!p) continue;
-      if (mySmall >= 0 && p.smallID() === mySmall) continue;
-      const st = safeCall(() => p.spawnTile(), undefined);
-      if (st === undefined || st === null) continue;
-      if (gameView.manhattanDist(center, st) < minDist) {
-        return null;
+    // Use the per-tick spawn globals: avoids re-walking gameView.playerViews()
+    // and re-resolving spawnTile()/smallID() per candidate. The opponent
+    // list is built once per spawn tick by getSpawnGlobals().
+    const globals = getSpawnGlobals(gameView);
+    const minDist = globals.minDistanceBetweenPlayers;
+    if (minDist > 0) {
+      for (const opp of globals.opponents) {
+        const st = opp.spawnTile;
+        if (st === null) continue;
+        if (gameView.manhattanDist(center, st) < minDist) {
+          return null;
+        }
       }
     }
 
@@ -3961,13 +4031,17 @@
     }
     const totalTerrain = Math.max(1, plains + highland + mountain);
     const patchPlainsRatio = plains / totalTerrain;
-    const nearTerrain = weightedTerrainCountsNear(gameView, center, 18);
-    const farTerrain = weightedTerrainCountsNear(gameView, center, 42);
-    const plainsFlood = weightedPlainsFloodScore(gameView, center, 700);
+
     // Plains-first gate: Plains give attackers mag=80 / speed=16.5
     // (cheapest and fastest TerraNullius expansion). A merely adequate
     // spawn patch can pass only if the surrounding expansion field is
     // strongly plains-rich; otherwise we reject it before scoring.
+    //
+    // The radius-18 terrain scan is the cheapest of the three terrain
+    // passes, so we run it first to power the gate. Heavier passes
+    // (radius-42 + 700-tile BFS) are deferred until *after* the gate so
+    // rejected candidates pay only for the cheap pass.
+    const nearTerrain = weightedTerrainCountsNear(gameView, center, 18);
     if (
       patchPlainsRatio < 0.6 &&
       (patchPlainsRatio < 0.5 || nearTerrain.plainsRatio < 0.75)
@@ -3975,12 +4049,17 @@
       return null;
     }
 
-    let ownedPenalty = 0;
-    for (const tile of gameView.circleSearch(center, 18)) {
-      if (gameView.ownerID(tile) > 0) {
-        ownedPenalty += 3;
-      }
-    }
+    // Now that the candidate has passed the gate, run the heavier
+    // terrain analyses.
+    const farTerrain = weightedTerrainCountsNear(gameView, center, 42);
+    const plainsFlood = weightedPlainsFloodScore(gameView, center, 700);
+
+    // Reuse the radius-18 owned-tile count we already collected above
+    // (saves one full `circleSearch(center, 18)` pass per accepted
+    // candidate). `weightedTerrainCountsNear` only counts land tiles
+    // when accumulating `owned`; in practice water tiles are
+    // unowned (ownerID === 0), so this matches the previous behaviour.
+    const ownedPenalty = nearTerrain.owned * 3;
 
     let oceanPenalty = 0;
     for (const tile of gameView.circleSearch(center, 6)) {
@@ -4646,29 +4725,31 @@
     const gameView = getGameView();
     if (!gameView) return null;
 
-    // Plan §2.1.1: out-sample the server. The engine collects one
-    // candidate per tick for ~2/3 of the spawn phase (~200 ticks on
-    // public matches) and locks the best. We only pick once, so we
-    // burst-sample every call. Budget is bounded so we do not starve
-    // the main loop on slow clients.
+    // Out-sample the server, but cheaply.
     //
-    // 20× the spawn-phase tick count keeps us above the server's
-    // sample density while capping at 6000 so the per-call cost
-    // stays bounded. Plan §6 risks: if the measured wall-time per
-    // call exceeds 10 ms we self-cap at 3000 on subsequent calls to
-    // keep the spawn-phase tick loop responsive.
+    // The engine collects one candidate per tick for ~2/3 of the spawn
+    // phase (~200 ticks on public matches) and locks the best; we only
+    // get to pick once, so we burst-sample every call.
+    //
+    // Manual-spawn maps don't have an opaque server-side scorer to beat
+    // — the player normally picks the tile themselves — so 5× the spawn
+    // phase tick count is plenty. Capping at 1500 keeps the per-call
+    // scorer cost well under one tick interval (140 ms) on average
+    // hardware. The `degraded` self-governor below halves the cap to
+    // 750 if we ever measure a >10 ms call, preserving the per-tick
+    // headroom even on slow clients.
     const spawnPhaseTicks = safeCall(
       () => gameView.config().numSpawnPhaseTurns(),
       300,
     );
-    const SAMPLE_CAP = Math.min(6000, Math.max(1500, spawnPhaseTicks * 20));
+    const SAMPLE_CAP = Math.min(1500, Math.max(600, spawnPhaseTicks * 5));
     const spawnPerf = runtime.state.spawn.perf || {
       lastCallMs: 0,
       degraded: false,
       measuredAt: -1,
     };
     runtime.state.spawn.perf = spawnPerf;
-    const SAMPLES = spawnPerf.degraded ? Math.min(3000, SAMPLE_CAP) : SAMPLE_CAP;
+    const SAMPLES = spawnPerf.degraded ? Math.min(750, SAMPLE_CAP) : SAMPLE_CAP;
 
     const hasPerfNow =
       typeof performance !== "undefined" &&
@@ -4695,7 +4776,7 @@
             dt.toFixed(1) +
             "ms for " +
             SAMPLES +
-            " samples — degrading to 3000 cap",
+            " samples — degrading to 750 cap",
         );
       }
     }
@@ -5338,15 +5419,37 @@
       const tick = gameView.ticks();
 
       if (tick <= collectionEnd) {
-        // Plan §2.1.1/.2: the server samples 1 random tile per tick. We
-        // burst 20 per tick so after the collection window we have a
-        // ~4000-candidate pool (vs ~200 before), deeply out-sampling the
-        // server scorer. `rememberSpawnCandidate` already caps the set
-        // size, so we cannot grow unbounded.
-        for (let i = 0; i < 20; i++) {
-          const sampled = trySampleSpawnCandidate(gameView);
-          if (sampled) {
-            rememberSpawnCandidate(sampled);
+        // The server samples 1 random tile per tick. We burst-sample so
+        // the post-collection pool deeply out-samples the server scorer,
+        // but the loop is bounded three ways so it can never starve the
+        // per-tick budget:
+        //   1. `SPAWN_RANDOM_BURST_PER_TICK` attempts per tick.
+        //   2. `SPAWN_RANDOM_BURST_BUDGET_MS` wall-clock cap (skipped when
+        //      performance.now() isn't available, e.g. in headless tests).
+        //   3. `SPAWN_CANDIDATE_POOL_TARGET` once we already have enough
+        //      distinct candidates queued, we stop sampling for the rest
+        //      of the collection window — the existing
+        //      `chooseBestRandomSpawnCandidate` selection logic still
+        //      runs against the full pool when the window closes.
+        const candidates = runtime.state.spawn.candidateByCenter;
+        const poolTarget = SPAWN_CANDIDATE_POOL_TARGET;
+        if (!candidates || candidates.size < poolTarget) {
+          const hasPerf =
+            typeof performance !== "undefined" &&
+            typeof performance.now === "function";
+          const burstStart = hasPerf ? performance.now() : 0;
+          for (let i = 0; i < SPAWN_RANDOM_BURST_PER_TICK; i++) {
+            if (candidates && candidates.size >= poolTarget) break;
+            const sampled = trySampleSpawnCandidate(gameView);
+            if (sampled) {
+              rememberSpawnCandidate(sampled);
+            }
+            if (
+              hasPerf &&
+              performance.now() - burstStart > SPAWN_RANDOM_BURST_BUDGET_MS
+            ) {
+              break;
+            }
           }
         }
         runtime.state.lastAction =
@@ -11737,6 +11840,10 @@
       enemies: undefined,
       allies: undefined,
       config: undefined,
+      // Lazy: built once per spawn tick by getSpawnGlobals(). Cached here
+      // so candidate-score helpers reuse opponent anchors / minDist /
+      // mySmallID instead of re-walking playerViews() per candidate.
+      spawnGlobals: null,
     };
     discoverRuntimeReferences();
     const gameView = getGameView();
@@ -13840,7 +13947,31 @@
       // perception/decision time. Keeps us in the "fast human" range
       // (300–900 ms) rather than the "frame-perfect bot" range. Skipped in
       // harness/test mode so deterministic smoke tests stay fast.
-      if (runtime.enabled && !isHarnessMode()) {
+      //
+      // Pre-spawn fast-path: the reaction delay only exists to humanise the
+      // cadence of *outgoing intents*. While we are still in the spawn phase
+      // (no living player yet) the only intent we will send is the spawn
+      // itself, which already has its own STEALTH_SPAWN_THINK_MS thinking
+      // timer inside maybeHandleSpawn(). Sleeping again here just chokes the
+      // tick loop while the heaviest pre-spawn work (candidate scoring) is
+      // already trying to fit in a 140 ms tick budget. Skip the jitter when
+      // the match has not started, the socket is closed, or the engine
+      // reports we are still in spawn phase.
+      const phase = runtime.state && runtime.state.matchPhase;
+      const prespawn =
+        phase === "boot" ||
+        phase === "closed" ||
+        phase === "start" ||
+        phase === "spawn";
+      const liveGameView = runtime.hooks && runtime.hooks.gameView;
+      const inSpawnPhaseNow =
+        prespawn ||
+        Boolean(
+          liveGameView &&
+            typeof liveGameView.inSpawnPhase === "function" &&
+            safeCall(() => liveGameView.inSpawnPhase(), false),
+        );
+      if (runtime.enabled && !isHarnessMode() && !inSpawnPhaseNow) {
         const delay =
           STEALTH_REACTION_MIN_MS +
           Math.floor(Math.random() * (STEALTH_REACTION_MAX_MS - STEALTH_REACTION_MIN_MS));
@@ -14835,6 +14966,8 @@
         perimeterToAreaRatio,
         corridorCount,
         gaussianEnemyClusterPenalty,
+        buildSpawnGlobals,
+        getSpawnGlobals,
         // Plan §8 acceptance-test helpers.
         selectPrimaryGoal,
         recordAllianceBreak,
