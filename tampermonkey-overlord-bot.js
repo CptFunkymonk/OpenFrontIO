@@ -734,6 +734,11 @@
       runtime.hooks.tick = 0;
       runtime.hooks.myClientID = data.myClientID || runtime.hooks.myClientID;
       runtime.state.history = new Map();
+      runtime.state._spawned = false;
+      runtime.state._spawnSentTick = null;
+      runtime.state._lastSpawnTile = null;
+      runtime.state._borderCache = null;
+      runtime.state._breaksUsed = 0;
       botLog("Game started. clientID=" + runtime.hooks.myClientID);
     } else if (data.type === "turn") {
       const turn = data.turn || {};
@@ -1053,6 +1058,7 @@
         share: tiles / totalLand,
         tilesPerMin: velocity(smallID, tick, "tiles"),
         troopsPerMin: velocity(smallID, tick, "troops"),
+        goldPerMin: velocity(smallID, tick, "gold"),
         isTraitor: safeCall(() => p.isTraitor(), false),
         isDisconnected: safeCall(() => p.isDisconnected(), false),
         incomingAttacks: safeCall(() => p.incomingAttacks(), []) || [],
@@ -1088,6 +1094,8 @@
         cityLevelsSum: cls,
       });
       bySmallID.set(mySid, me);
+      const meIdx = everyone.indexOf(meEntry);
+      if (meIdx >= 0) everyone[meIdx] = me;
     }
 
     // totals / shares
@@ -2884,10 +2892,19 @@
       runtime.state._spawned = true;
       return false;
     }
-    const tile = chooseSpawnTile(gameView);
+    // Don't spam a different random spawn each tick — request once and wait,
+    // re-requesting only if still unspawned after a while.
+    const sentTick = runtime.state._spawnSentTick;
+    if (sentTick != null && runtime.hooks.tick - sentTick < 40) return false;
+    // Reuse our prior choice if it is still unclaimed; else pick fresh.
+    let tile = runtime.state._lastSpawnTile;
+    const stillFree =
+      tile != null && !safeCall(() => gameView.hasOwner(tile), true);
+    if (!stillFree) tile = chooseSpawnTile(gameView);
     if (tile == null) return false;
     if (IO.sendSpawn(tile)) {
       runtime.state._lastSpawnTile = tile;
+      runtime.state._spawnSentTick = runtime.hooks.tick;
       decisionLog("spawn @ " + tile);
       return true;
     }

@@ -224,6 +224,23 @@ describe("Overlord end-to-end loop", () => {
     expect(typeof spawn.tile).toBe("number");
   });
 
+  it("does not spam multiple spawn tiles within the spawn phase", async () => {
+    const ownership = new Array(W * H).fill(0);
+    const gv = buildMockGame({
+      tick: 50,
+      spawnPhase: true,
+      meSmallID: 1,
+      players: [{ smallID: 1, id: "me", name: "Me", troops: 25000, gold: 0 }],
+      ownership,
+    });
+    setGame(gv);
+    await runtime.test.runModulesForTick();
+    await runtime.test.runModulesForTick();
+    await runtime.test.runModulesForTick();
+    const spawns = captured.filter((i) => i.type === "spawn");
+    expect(spawns.length).toBe(1); // request once, then wait
+  });
+
   it("expands into unclaimed land when it has a frontier", async () => {
     const ownership = new Array(W * H).fill(0);
     // Me owns a 3x3 block surrounded by unclaimed land -> TN frontier.
