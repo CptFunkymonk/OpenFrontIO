@@ -1778,6 +1778,7 @@
 
       const adjacent = (info.adjacentEnemies || []).slice();
       t.adjacentEnemies = adjacent;
+      t.adjacentAllies = (info.adjacentAllies || []).slice();
 
       const ctx = {
         difficulty: world.gameConfig.difficulty,
@@ -1862,10 +1863,11 @@
         }, 0);
         if (!biggest || share > biggest.share) biggest = { members: bloc, share };
       }
-      if (
-        (biggest && biggest.share > world.totals.myShare * 1.5 && biggest.members.length >= 2) ||
-        targeters >= 3
-      ) {
+      const blocReal =
+        biggest &&
+        biggest.members.length >= 2 &&
+        biggest.share >= Math.max(0.15, world.totals.myShare * 2);
+      if (blocReal || targeters >= 3) {
         t.coalitionAgainstMe = true;
         t.coalition = biggest;
       }
@@ -1979,6 +1981,12 @@
       // Appease genuine threats — allying the strong avoids being their target.
       if (isThreat(world, req)) {
         return { accept: true, reason: "appease threat" };
+      }
+      // Cap voluntary alliances (mirror engine): allying every neighbour boxes
+      // us in with no one to expand into. Beyond 3 allies, only appease threats.
+      const allyCount = world.everyone.filter((e) => e.isAlly && !e.isMe).length;
+      if (allyCount >= 3) {
+        return { accept: false, reason: "enough alliances (" + allyCount + ")" };
       }
       // Anti-overgrowth: don't empower a non-threat who will pass us.
       if (projectedToOvertake(world, req, OVERGROW_HORIZON)) {
@@ -2260,6 +2268,11 @@
       entry.borderContacts = contacts;
       info.adjacentEnemies.push(entry);
     }
+    info.adjacentAllies = [];
+    for (const [sid] of adjSids) {
+      const entry = world.bySmallID.get(sid);
+      if (entry && entry.isAlly && !entry.isMe) info.adjacentAllies.push(entry);
+    }
 
     // Inbound nukes targeting our territory.
     const nukeUnits =
@@ -2527,6 +2540,9 @@
       evaluate: (world) => {
         if (!world.me) return { valid: false };
         if (!world.threats.coalitionAgainstMe) return { valid: false };
+        // Only worth diplomacy-warring when there's an actual crown threat —
+        // otherwise (tiny crown, crowded map) it just spams embargoes forever.
+        if (world.totals.crownShare < 0.2) return { valid: false };
         return { valid: true, priority: 76, note: "coalition — isolate crown" };
       },
       run: (world) => runDiplomacyIsolateCrown(world),
@@ -2569,6 +2585,37 @@
         };
       },
       run: (world, ctx) => runNeutralize(world, ctx),
+    },
+    {
+      // Boxed in by our own allies (no TerraNullius frontier, no attackable
+      // neighbours) while sitting on a healthy army — break the weakest
+      // bordering alliance to open a front to expand into.
+      id: "BREAK_TO_EXPAND",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (scanOf(world).bordersTN) return { valid: false };
+        if ((world.threats.adjacentEnemies || []).length > 0)
+          return { valid: false };
+        const adjAllies = world.threats.adjacentAllies || [];
+        if (adjAllies.length === 0) return { valid: false };
+        if (me.troopRatio < 0.5) return { valid: false };
+        if (
+          !DIPLO.safeToBreak(world, adjAllies[0], {
+            breaksUsed: runtime.state._breaksUsed || 0,
+            maxBreaks: 5,
+          })
+        ) {
+          return { valid: false };
+        }
+        return {
+          valid: true,
+          priority: 64,
+          note: "boxed in by allies — break weakest to open a front",
+          context: { adjAllies },
+        };
+      },
+      run: (world, ctx) => runBreakToExpand(world, ctx),
     },
     {
       id: "EXPAND_RUSH",
@@ -2963,6 +3010,17 @@
     return IO.sendBuild(UnitType.MIRV, target);
   }
 
+  function runBreakToExpand(world, ctx) {
+    const adjAllies = (ctx && ctx.adjAllies) || world.threats.adjacentAllies || [];
+    if (adjAllies.length === 0) return runExpand(world);
+    // Break the weakest bordering ally so their territory becomes attackable.
+    const weakest = adjAllies.slice().sort((a, b) => a.troops - b.troops)[0];
+    if (!weakest || !weakest.id) return runExpand(world);
+    runtime.state._breaksUsed = (runtime.state._breaksUsed || 0) + 1;
+    decisionLog("break-to-expand: breaking " + weakest.name);
+    return IO.sendBreakAlliance(weakest.id);
+  }
+
   function runBreakAlly(world, ctx) {
     const ally = ctx && ctx.ally;
     if (!ally || !ally.id) return false;
@@ -2971,6 +3029,12 @@
   }
 
   function runDiplomacyIsolateCrown(world) {
+    const last = runtime.state.cooldowns.isolateCrown || -99999;
+    if (world.tick - last < 50) {
+      runExpand(world);
+      return false;
+    }
+    runtime.state.cooldowns.isolateCrown = world.tick;
     const resp = DIPLO.coalitionResponse(world);
     let acted = false;
     for (const id of resp.embargoTargets) acted = IO.sendEmbargo(id, "start") || acted;
@@ -3440,6 +3504,21 @@
         scan: { bordersTN: false, hasCoast: false },
       }),
       "IDLE",
+    );
+
+    // 9) Boxed in by allies (no TN frontier, no enemies, healthy army) -> break.
+    step(
+      "boxed=>break",
+      world({
+        me: { share: 0.1, troops: 120000, maxTroops: 200000, troopRatio: 0.6, tiles: 5000, incomingTroops: 0 },
+        totals: { myShare: 0.1, crownShare: 0.1, secondShare: 0.1 },
+        threats: {
+          adjacentEnemies: [],
+          adjacentAllies: [{ smallID: 7, name: "Ally", id: "a7", troops: 40000 }],
+        },
+        scan: { bordersTN: false, hasCoast: false },
+      }),
+      "BREAK_TO_EXPAND",
     );
 
     const failed = results.filter((r) => !r.pass);
