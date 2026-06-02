@@ -2056,6 +2056,1082 @@
 
 
   // ═══════════════════════════════════════════════════════════════════════
+  //  H. PLANNER + live scanning + goal execution + run loop.
+  //
+  //  The planner picks ONE primary goal each tick (how to use our troops),
+  //  while always-on secondary routines handle economy building, diplomacy
+  //  acceptance/outreach, betrayal, and nuke defense. Goal evaluate() is pure
+  //  over the world snapshot (unit-tested via runSuite); run() executes via IO.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const GOLD = {
+    ATOM: 750_000,
+    HYDRO: 5_000_000,
+    MIRV: 25_000_000,
+  };
+
+  // Goals that should bank gold (skip economy spend) while active.
+  const GOLD_SAVING_GOALS = new Set([
+    "NUKE_CROWN",
+    "SAM_OVERWHELM",
+    "EMERGENCY_MIRV",
+    "SAVE_FOR_HYDRO",
+  ]);
+
+  // ───────────────────────────────────────────────────────────────────────
+  //  Live scanning helpers (use the GameView; integration-tested via harness)
+  // ───────────────────────────────────────────────────────────────────────
+
+  function normalizeBorderTiles(result) {
+    if (!result) return null;
+    if (result instanceof Set) return result;
+    if (result.borderTiles instanceof Set) return result.borderTiles;
+    if (Array.isArray(result)) return new Set(result);
+    if (Array.isArray(result.borderTiles)) return new Set(result.borderTiles);
+    return null;
+  }
+
+  async function getMyBorderTiles(gameView, myPlayer) {
+    const tick = runtime.hooks.tick;
+    const cache = runtime.state._borderCache;
+    if (cache && tick - cache.tick < 10 && cache.tiles) return cache.tiles;
+    let tiles = null;
+    try {
+      const r = await myPlayer.borderTiles();
+      tiles = normalizeBorderTiles(r);
+    } catch (_) {
+      tiles = null;
+    }
+    if (!tiles) tiles = sampleOwnedBorderTiles(gameView, myPlayer);
+    runtime.state._borderCache = { tick, tiles };
+    return tiles;
+  }
+
+  // Fallback: sample owned tiles & keep those touching a non-owned neighbour.
+  function sampleOwnedBorderTiles(gameView, myPlayer) {
+    const out = new Set();
+    const sid = safeCall(() => myPlayer.smallID(), -1);
+    const w = safeCall(() => gameView.width(), 0);
+    const h = safeCall(() => gameView.height(), 0);
+    if (!w || !h) return out;
+    for (let i = 0; i < 1500 && out.size < 400; i++) {
+      const x = (Math.random() * w) | 0;
+      const y = (Math.random() * h) | 0;
+      if (!safeCall(() => gameView.isValidCoord(x, y), false)) continue;
+      const ref = gameView.ref(x, y);
+      if (!safeCall(() => gameView.isLand(ref), false)) continue;
+      if (safeCall(() => gameView.ownerID(ref), -1) !== sid) continue;
+      for (const n of safeCall(() => gameView.neighbors(ref), [])) {
+        if (safeCall(() => gameView.ownerID(n), sid) !== sid) {
+          out.add(ref);
+          break;
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Live scan of our frontier: adjacent enemies, TN frontier, coast, plus a
+   * scan of inbound nukes/boats and who is targeting us, and the alliance
+   * graph. Returns the info object consumed by THREATS.compute and goals.
+   */
+  async function gatherTickInfo(gameView, world) {
+    const myPlayer = safeCall(() => gameView.myPlayer(), null);
+    const info = {
+      adjacentEnemies: [],
+      bordersTN: false,
+      hasCoast: false,
+      inboundNukes: [],
+      inboundBoats: [],
+      targetedByCount: 0,
+      hotByEnemy: new Map(), // smallID -> border-contact count
+    };
+    if (!myPlayer || !world.me) return info;
+    const mySid = world.me.smallID;
+
+    // Alliance graph edges (smallID -> Set of ally smallIDs).
+    const edges = new Map();
+    for (const e of world.everyone) {
+      const allies = safeCall(() => e.player.allies(), []) || [];
+      const set = new Set();
+      for (const a of allies) {
+        const aSid = safeCall(() => a.smallID(), null);
+        if (aSid != null) set.add(aSid);
+      }
+      if (set.size) edges.set(e.smallID, set);
+      // who targets us?
+      const targets = safeCall(() => e.player.targets(), []) || [];
+      if (targets.some((t) => safeCall(() => t.smallID(), -2) === mySid))
+        info.targetedByCount++;
+    }
+    world.allianceGraph.edges = edges;
+
+    // Border-derived adjacency / frontier / coast.
+    const border = await getMyBorderTiles(gameView, myPlayer);
+    const adjSids = new Map();
+    for (const tile of border) {
+      if (!info.hasCoast && safeCall(() => gameView.isOceanShore(tile), false))
+        info.hasCoast = true;
+      for (const n of safeCall(() => gameView.neighbors(tile), [])) {
+        if (!safeCall(() => gameView.isLand(n), false)) continue;
+        const oid = safeCall(() => gameView.ownerID(n), mySid);
+        if (oid === mySid) continue;
+        if (oid === 0) {
+          if (!safeCall(() => gameView.hasFallout(n), false))
+            info.bordersTN = true;
+          continue;
+        }
+        adjSids.set(oid, (adjSids.get(oid) || 0) + 1);
+      }
+    }
+    info.hotByEnemy = adjSids;
+    for (const [sid, contacts] of adjSids) {
+      const entry = world.bySmallID.get(sid);
+      if (!entry || entry.isMe || entry.isAlly) continue;
+      entry.borderContacts = contacts;
+      info.adjacentEnemies.push(entry);
+    }
+
+    // Inbound nukes targeting our territory.
+    const nukeUnits =
+      safeCall(
+        () =>
+          gameView.units(
+            UnitType.AtomBomb,
+            UnitType.HydrogenBomb,
+            UnitType.MIRVWarhead,
+          ),
+        [],
+      ) || [];
+    for (const u of nukeUnits) {
+      const owner = safeCall(() => u.owner(), null);
+      if (owner && safeCall(() => owner.smallID(), -1) === mySid) continue;
+      const target = safeCall(() => u.targetTile(), undefined);
+      if (target == null) continue;
+      if (safeCall(() => gameView.ownerID(target), -1) === mySid) {
+        info.inboundNukes.push({ unit: u, targetTile: target });
+      }
+    }
+
+    // Inbound boats heading for our coast.
+    const boats =
+      safeCall(() => gameView.units(UnitType.TransportShip), []) || [];
+    for (const u of boats) {
+      const owner = safeCall(() => u.owner(), null);
+      if (!owner || safeCall(() => owner.smallID(), -1) === mySid) continue;
+      if (safeCall(() => myPlayer.isFriendly(owner), false)) continue;
+      const target = safeCall(() => u.targetTile(), undefined);
+      if (target != null && safeCall(() => gameView.ownerID(target), -1) === mySid) {
+        info.inboundBoats.push({ unit: u, targetTile: target });
+      }
+    }
+
+    return info;
+  }
+
+  // --- generic tile finders ---
+  function findOwnedTileOf(gameView, sid, attempts) {
+    const w = safeCall(() => gameView.width(), 0);
+    const h = safeCall(() => gameView.height(), 0);
+    for (let i = 0; i < (attempts || 400); i++) {
+      const x = (Math.random() * w) | 0;
+      const y = (Math.random() * h) | 0;
+      if (!safeCall(() => gameView.isValidCoord(x, y), false)) continue;
+      const ref = gameView.ref(x, y);
+      if (!safeCall(() => gameView.isLand(ref), false)) continue;
+      if (safeCall(() => gameView.ownerID(ref), -1) === sid) return ref;
+    }
+    return null;
+  }
+
+  function findBuildTile(gameView, myPlayer, minDist) {
+    const mySid = safeCall(() => myPlayer.smallID(), -1);
+    const existing =
+      safeCall(() => myPlayer.units().filter((u) => isStructureType(u.type())), []) ||
+      [];
+    minDist = minDist || 15;
+    for (let attempt = 0; attempt < 120; attempt++) {
+      const tile = findOwnedTileOf(gameView, mySid, 1);
+      if (tile == null) continue;
+      let ok = true;
+      for (const s of existing) {
+        const st = safeCall(() => s.tile(), null);
+        if (st == null) continue;
+        if (safeCall(() => gameView.manhattanDist(tile, st), 999) < minDist) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return tile;
+    }
+    return null;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  //  GOAL SPECS — evaluate() is pure over the world; run() executes.
+  // ───────────────────────────────────────────────────────────────────────
+
+  function scanOf(world) {
+    return world.scan || {};
+  }
+  function canAfford(world, cost) {
+    return world.me && world.me.gold >= cost;
+  }
+  function myHostileCrown(world) {
+    const c = world.threats && world.threats.crown;
+    if (!c || c.isMe || c.isAlly) return null;
+    return c;
+  }
+
+  const GOAL_SPECS = [
+    {
+      id: "EMERGENCY_MIRV",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const dying =
+          me.troopRatio < 0.12 &&
+          me.incomingTroops >= me.troops &&
+          me.incomingTroops > 0;
+        if (dying && canAfford(world, GOLD.MIRV))
+          return { valid: true, priority: 98, note: "about to die — MIRV" };
+        return { valid: false };
+      },
+      run: (world) => runEmergencyMirv(world),
+    },
+    {
+      id: "REPEL_INVASION",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const inv = (world.threats.activeInvaders || []).filter(
+          (e) => !e.isAlly,
+        );
+        if (inv.length === 0) return { valid: false };
+        const inbound = world.threats.invasionTroopsInbound || 0;
+        const pressure = inbound / Math.max(1, me.troops);
+        let priority = 88;
+        if (pressure >= 0.5) priority += 4;
+        if (pressure >= 1.0) priority += 4;
+        return {
+          valid: true,
+          priority,
+          note: "repel " + inv[0].name + " p=" + pressure.toFixed(2),
+          context: { invader: inv[0], pressure },
+        };
+      },
+      run: (world, ctx) => runRepel(world, ctx),
+    },
+    {
+      id: "DEFEND_NUKE",
+      evaluate: (world) => {
+        if ((world.threats.inboundNukes || []).length === 0)
+          return { valid: false };
+        return { valid: true, priority: 90, note: "inbound nuke — SAM/relocate" };
+      },
+      run: (world) => runDefendNuke(world),
+    },
+    {
+      id: "CONSOLIDATE_FRONT",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const pressure = me.incomingTroops / Math.max(1, me.troops);
+        if (pressure < 0.6) return { valid: false };
+        return {
+          valid: true,
+          priority: pressure >= 1 ? 94 : 78,
+          note: "front pressure " + (pressure * 100).toFixed(0) + "%",
+        };
+      },
+      run: (world) => runConsolidate(world),
+    },
+    {
+      id: "DEFENSIVE_TURTLE",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const myShare = world.totals.myShare;
+        const second = world.totals.secondShare;
+        if (myShare < 0.3) return { valid: false };
+        if (myShare < second * 1.5) return { valid: false };
+        return { valid: true, priority: 86, note: "dominant — turtle+expand" };
+      },
+      run: (world) => runTurtle(world),
+    },
+    {
+      id: "PREEMPT_INVASION",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        if ((world.threats.activeInvaders || []).length > 0)
+          return { valid: false };
+        const brewing = world.threats.brewingInvaders || [];
+        const early = world.threats.earlyHumanOvermatch;
+        if (brewing.length === 0 && !early) return { valid: false };
+        const invader = brewing[0]
+          ? brewing[0].entry
+          : early
+            ? early.enemy
+            : null;
+        if (!invader) return { valid: false };
+        const ratio = invader.troops / Math.max(1, me.troops);
+        let priority = early ? 91 : 82;
+        if (ratio >= 1.5) priority += 2;
+        if (ratio >= 2.0) priority += 2;
+        return {
+          valid: true,
+          priority,
+          note: "preempt " + invader.name + " r=" + ratio.toFixed(2),
+          context: { invader },
+        };
+      },
+      run: (world, ctx) => runPreempt(world, ctx),
+    },
+    {
+      id: "SAM_OVERWHELM",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const crown = myHostileCrown(world);
+        if (!crown) return { valid: false };
+        if (me.gold < GOLD.ATOM * 3 + GOLD.HYDRO) return { valid: false };
+        const crownSams = safeCall(
+          () => crown.player.units(UnitType.SAMLauncher).length,
+          0,
+        );
+        if (crownSams === 0) return { valid: false };
+        const silos = (me.structures || {})[UnitType.MissileSilo] || 0;
+        if (silos < 3) return { valid: false };
+        return { valid: true, priority: 85, note: "overwhelm SAMs on " + crown.name };
+      },
+      run: (world) => runSamOverwhelm(world),
+    },
+    {
+      id: "NUKE_CROWN",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const crown = myHostileCrown(world);
+        if (!crown) return { valid: false };
+        if (world.totals.crownShare < 0.25) return { valid: false };
+        const silos = (me.structures || {})[UnitType.MissileSilo] || 0;
+        if (silos < 1) return { valid: false };
+        if (!canAfford(world, GOLD.ATOM)) return { valid: false };
+        let priority = 84;
+        if (world.totals.crownShare >= 0.3) priority += 4;
+        if (world.totals.crownShare >= 0.4) priority += 4;
+        return {
+          valid: true,
+          priority,
+          note: "nuke crown " + crown.name,
+          context: { crown },
+        };
+      },
+      run: (world, ctx) => runNukeCrown(world, ctx),
+    },
+    {
+      id: "BREAK_OVERGROWN_ALLY",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const allies = world.everyone.filter((e) => e.isAlly && !e.isMe);
+        for (const ally of allies) {
+          const d = DIPLO.shouldBetrayAlly(world, ally, {
+            breaksUsed: runtime.state._breaksUsed || 0,
+            maxBreaks: 3,
+          });
+          if (d.betray)
+            return {
+              valid: true,
+              priority: 80,
+              note: "betray " + ally.name + ": " + d.reason,
+              context: { ally, reason: d.reason },
+            };
+        }
+        return { valid: false };
+      },
+      run: (world, ctx) => runBreakAlly(world, ctx),
+    },
+    {
+      id: "DIPLOMACY_ISOLATE_CROWN",
+      evaluate: (world) => {
+        if (!world.me) return { valid: false };
+        if (!world.threats.coalitionAgainstMe) return { valid: false };
+        return { valid: true, priority: 76, note: "coalition — isolate crown" };
+      },
+      run: (world) => runDiplomacyIsolateCrown(world),
+    },
+    {
+      id: "SAM_WALL_BUILDUP",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const share = world.totals.myShare;
+        if (share < 0.2 || share > 0.35) return { valid: false };
+        const cities = (me.structures || {})[UnitType.City] || 0;
+        const sams = (me.structureLevels || {})[UnitType.SAMLauncher] || 0;
+        const target = Math.max(2, Math.floor(cities * 0.5));
+        if (sams >= target) return { valid: false };
+        return { valid: true, priority: 82, note: "SAM wall " + sams + "/" + target };
+      },
+      run: (world) => runSamWall(world),
+    },
+    {
+      id: "NEUTRALIZE_RISING_STAR",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const stars = world.threats.risingStars || [];
+        if (stars.length === 0) return { valid: false };
+        const target = stars[0];
+        if (target.isAlly) return { valid: false };
+        if (target.troops > me.troops * 1.2) return { valid: false };
+        // Must be reachable (adjacent or coast for boat).
+        const adjacent = (world.threats.adjacentEnemies || []).some(
+          (e) => e.smallID === target.smallID,
+        );
+        if (!adjacent && !scanOf(world).hasCoast) return { valid: false };
+        return {
+          valid: true,
+          priority: 74,
+          note: "neutralize rising " + target.name,
+          context: { target, adjacent },
+        };
+      },
+      run: (world, ctx) => runNeutralize(world, ctx),
+    },
+    {
+      id: "EXPAND_RUSH",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (!scanOf(world).bordersTN) return { valid: false };
+        if (TACTICS.expansionTroops(world) <= 0) return { valid: false };
+        const share = world.totals.myShare;
+        let priority = 62;
+        if (share < 0.05) priority += 15;
+        else if (share < 0.1) priority += 10;
+        else if (share < 0.25) priority += 5;
+        return { valid: true, priority, note: "expand TN (share " + (share * 100).toFixed(1) + "%)" };
+      },
+      run: (world) => runExpand(world),
+    },
+    {
+      id: "ATTACK_WEAKEST",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const candidates = world.threats.adjacentEnemies || [];
+        const pick = TACTICS.selectAttackTarget(world, candidates);
+        if (!pick) return { valid: false };
+        const troops = TACTICS.attackTroops(world, pick.entry, {
+          retaliating: pick.retaliating,
+        });
+        if (troops <= 0) return { valid: false };
+        return {
+          valid: true,
+          priority: 58,
+          note: "attack " + pick.entry.name + " (" + pick.reason + ")",
+          context: { pick, troops },
+        };
+      },
+      run: (world, ctx) => runAttack(world, ctx),
+    },
+    {
+      id: "NAVAL_LAND_GRAB",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        if (!scanOf(world).hasCoast) return { valid: false };
+        // Need a weaker non-ally to invade by sea.
+        const target = world.everyone.find(
+          (e) => !e.isMe && !e.isAlly && e.troops < me.troops * 0.8,
+        );
+        if (!target) return { valid: false };
+        return {
+          valid: true,
+          priority: 50,
+          note: "naval grab " + target.name,
+          context: { target },
+        };
+      },
+      run: (world, ctx) => runNaval(world, ctx),
+    },
+    {
+      id: "IDLE",
+      evaluate: () => ({ valid: true, priority: 1, note: "idle — grow" }),
+      run: (world) => runIdle(world),
+    },
+  ];
+
+  function selectPrimaryGoal(world) {
+    let best = null;
+    for (const spec of GOAL_SPECS) {
+      const res = safeCall(() => spec.evaluate(world), { valid: false });
+      if (!res || !res.valid) continue;
+      if (!best || res.priority > best.priority) {
+        best = { spec, id: spec.id, priority: res.priority, note: res.note, context: res.context };
+      }
+    }
+    return best;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  //  GOAL run() implementations (send intents via IO + GameView helpers)
+  // ───────────────────────────────────────────────────────────────────────
+
+  function gv() {
+    return runtime.hooks.gameView;
+  }
+  function myP() {
+    return safeCall(() => gv().myPlayer(), null);
+  }
+
+  function runExpand(world) {
+    const troops = TACTICS.expansionTroops(world);
+    if (troops <= 0) return false;
+    return IO.sendAttack(null, troops);
+  }
+
+  function runAttack(world, ctx) {
+    const pick = ctx && ctx.pick;
+    if (!pick) return false;
+    let troops = ctx.troops || TACTICS.attackTroops(world, pick.entry, {
+      retaliating: pick.retaliating,
+    });
+    // Don't over-extend: cap by the safe-commit recommendation.
+    const safe = SIM.safeCommit(world, troops);
+    if (!safe.safe && safe.recommendedMax > 0) {
+      troops = Math.min(troops, safe.recommendedMax);
+    }
+    if (troops <= 0 || !pick.entry.id) return false;
+    return IO.sendAttack(pick.entry.id, troops);
+  }
+
+  function runRepel(world, ctx) {
+    let acted = false;
+    const me = world.me;
+    // Recall doomed outgoing attacks to bring troops home for defense.
+    for (const a of me.outgoingAttacks || []) {
+      if (a.id) acted = IO.sendCancelAttack(a.id) || acted;
+    }
+    // Embargo the invader.
+    const invader = ctx && ctx.invader;
+    if (invader && invader.id) IO.sendEmbargo(invader.id, "start");
+    // Fortify via the build routine (DPs) handled in secondary with underThreat.
+    // If we still out-troop the invader, counter-attack it.
+    if (invader && invader.troops < me.troops) {
+      const troops = TACTICS.attackTroops(world, invader, { retaliating: true });
+      if (troops > 0 && invader.id) acted = IO.sendAttack(invader.id, troops) || acted;
+    }
+    return acted;
+  }
+
+  function runConsolidate(world) {
+    // Pure fortify: recall attacks, hold troops; DP build via secondary.
+    let acted = false;
+    for (const a of world.me.outgoingAttacks || []) {
+      if (a.id) acted = IO.sendCancelAttack(a.id) || acted;
+    }
+    return acted;
+  }
+
+  function runTurtle(world) {
+    // Keep expanding into TN (free land toward the win threshold); defense via
+    // the secondary build routine (which sees crownRising / threat flags).
+    return runExpand(world);
+  }
+
+  function runPreempt(world, ctx) {
+    // Keep grabbing flat-loss TN land while fortifying (build via secondary).
+    // Also try to draw in a co-bordering ally to split the invader's front.
+    const target = DIPLO.pickAllianceRequestTarget(world);
+    if (target && target.id) IO.sendAllianceRequest(target.id);
+    return runExpand(world);
+  }
+
+  function runNeutralize(world, ctx) {
+    if (!ctx || !ctx.target) return false;
+    if (ctx.adjacent) {
+      const troops = TACTICS.attackTroops(world, ctx.target, {});
+      if (troops > 0 && ctx.target.id) return IO.sendAttack(ctx.target.id, troops);
+      return false;
+    }
+    return runNaval(world, { target: ctx.target });
+  }
+
+  async function runNaval(world, ctx) {
+    const target = ctx && ctx.target;
+    if (!target) return false;
+    const gameView = gv();
+    const myPlayer = myP();
+    if (!gameView || !myPlayer) return false;
+    // Find a destination tile owned by the target and a viable spawn.
+    const dstSeed = findOwnedTileOf(gameView, target.smallID, 300);
+    if (dstSeed == null) return false;
+    const spawn = await safeCallAsync(
+      () => myPlayer.bestTransportShipSpawn(dstSeed),
+      false,
+    );
+    const troops = Math.floor((world.me.troops || 0) / 5);
+    if (troops <= 0) return false;
+    const dst = spawn && spawn !== false ? dstSeed : dstSeed;
+    return IO.sendBoat(dst, troops);
+  }
+
+  function findCrownTargetTile(gameView, crown) {
+    return findOwnedTileOf(gameView, crown.smallID, 600);
+  }
+
+  function launchNukeAt(gameView, nukeType, targetTile) {
+    // build_unit's tile is the target landing tile; engine picks nearest silo.
+    return IO.sendBuild(nukeType, targetTile);
+  }
+
+  function runNukeCrown(world, ctx) {
+    const gameView = gv();
+    const crown = (ctx && ctx.crown) || myHostileCrown(world);
+    if (!gameView || !crown) return runExpand(world);
+    const target = findCrownTargetTile(gameView, crown);
+    let launched = false;
+    if (target != null) {
+      if (canAfford(world, GOLD.HYDRO)) {
+        launched = launchNukeAt(gameView, UnitType.HydrogenBomb, target);
+      } else if (canAfford(world, GOLD.ATOM)) {
+        launched = launchNukeAt(gameView, UnitType.AtomBomb, target);
+      }
+      if (crown.id) IO.sendTargetPlayer(crown.id);
+    }
+    // Keep using idle troops for expansion too.
+    runExpand(world);
+    return launched;
+  }
+
+  function runSamOverwhelm(world) {
+    const gameView = gv();
+    const crown = myHostileCrown(world);
+    if (!gameView || !crown) return runExpand(world);
+    const target = findCrownTargetTile(gameView, crown);
+    let launched = false;
+    if (target != null) {
+      // Fire a salvo of atoms to soak SAMs, then a hydrogen through the hole.
+      launchNukeAt(gameView, UnitType.AtomBomb, target);
+      launchNukeAt(gameView, UnitType.AtomBomb, target);
+      launchNukeAt(gameView, UnitType.AtomBomb, target);
+      launched = launchNukeAt(gameView, UnitType.HydrogenBomb, target);
+      if (crown.id) IO.sendTargetPlayer(crown.id);
+    }
+    return launched;
+  }
+
+  function runEmergencyMirv(world) {
+    const gameView = gv();
+    const crown = myHostileCrown(world) || (world.threats.activeInvaders || [])[0];
+    if (!gameView || !crown) return false;
+    const target = findCrownTargetTile(gameView, crown);
+    if (target == null) return false;
+    return IO.sendBuild(UnitType.MIRV, target);
+  }
+
+  function runBreakAlly(world, ctx) {
+    const ally = ctx && ctx.ally;
+    if (!ally || !ally.id) return false;
+    runtime.state._breaksUsed = (runtime.state._breaksUsed || 0) + 1;
+    return IO.sendBreakAlliance(ally.id);
+  }
+
+  function runDiplomacyIsolateCrown(world) {
+    const resp = DIPLO.coalitionResponse(world);
+    let acted = false;
+    for (const id of resp.embargoTargets) acted = IO.sendEmbargo(id, "start") || acted;
+    if (resp.allyTarget && resp.allyTarget.id)
+      acted = IO.sendAllianceRequest(resp.allyTarget.id) || acted;
+    // Keep growing meanwhile.
+    runExpand(world);
+    return acted;
+  }
+
+  function runSamWall(world) {
+    // Defense building handled by the secondary build routine (crownRising
+    // flag pushes SAMs). Keep expanding troops.
+    return runExpand(world);
+  }
+
+  function runDefendNuke(world) {
+    // The secondary build routine (nukeThreat flag) builds/upgrades SAMs.
+    // As a fallback, keep growing; relocation of targeted units is future work.
+    return runExpand(world);
+  }
+
+  function runIdle(world) {
+    if (scanOf(world).bordersTN) return runExpand(world);
+    return false;
+  }
+
+  async function safeCallAsync(fn, fallback) {
+    try {
+      return await fn();
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  //  Secondary routines (run every tick regardless of primary goal)
+  // ───────────────────────────────────────────────────────────────────────
+
+  function buildFlags(world) {
+    const t = world.threats;
+    const crown = t.crown;
+    return {
+      coastAvailable: scanOf(world).hasCoast,
+      underThreat:
+        (t.activeInvaders || []).length > 0 ||
+        (t.brewingInvaders || []).length > 0 ||
+        !!t.earlyHumanOvermatch,
+      nukeThreat: (t.inboundNukes || []).length > 0,
+      crownRising:
+        crown && !crown.isMe && !crown.isAlly && world.totals.crownShare > 0.2,
+      mapShare: world.totals.myShare,
+    };
+  }
+
+  function secondaryEconomyBuild(world) {
+    if (GOLD_SAVING_GOALS.has(runtime.planner.activeGoalId)) return;
+    const pick = TACTICS.pickBuild(world, buildFlags(world));
+    if (!pick || !pick.affordable) return;
+    const gameView = gv();
+    const myPlayer = myP();
+    if (!gameView || !myPlayer) return;
+    const tile = findBuildTile(gameView, myPlayer, 15);
+    if (tile == null) return;
+    IO.sendBuild(pick.type, tile);
+  }
+
+  function secondaryDiplomacy(world) {
+    const me = world.me;
+    if (!me) return;
+    const myPlayer = myP();
+    if (!myPlayer) return;
+    // Accept good incoming alliance requests (re-requesting auto-accepts).
+    for (const e of world.everyone) {
+      if (e.isMe || e.isAlly) continue;
+      const requestingUs = safeCall(
+        () => e.player.isRequestingAllianceWith(myPlayer),
+        false,
+      );
+      if (!requestingUs) continue;
+      const d = DIPLO.shouldAcceptAlliance(world, e);
+      if (d.accept && e.id) IO.sendAllianceRequest(e.id);
+    }
+  }
+
+  function secondaryNukeDefense(world) {
+    // Handled via build flags (nukeThreat -> SAM). Placeholder for relocation.
+    void world;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  //  Spawn phase
+  // ───────────────────────────────────────────────────────────────────────
+
+  function inSpawnPhase(gameView) {
+    return safeCall(() => gameView.inSpawnPhase(), false);
+  }
+
+  function chooseSpawnTile(gameView) {
+    // Score sampled land tiles by nearby unowned land (room to expand) and
+    // distance from other players. Pick the best of a sample.
+    const w = safeCall(() => gameView.width(), 0);
+    const h = safeCall(() => gameView.height(), 0);
+    let best = null;
+    let bestScore = -Infinity;
+    for (let i = 0; i < 800; i++) {
+      const x = (Math.random() * w) | 0;
+      const y = (Math.random() * h) | 0;
+      if (!safeCall(() => gameView.isValidCoord(x, y), false)) continue;
+      const ref = gameView.ref(x, y);
+      if (!safeCall(() => gameView.isLand(ref), false)) continue;
+      if (safeCall(() => gameView.hasOwner(ref), true)) continue;
+      // Score: count unowned land neighbours in a small radius.
+      let room = 0;
+      let enemyNear = 0;
+      for (const n of safeCall(() => gameView.neighbors(ref), [])) {
+        if (safeCall(() => gameView.isLand(n), false)) {
+          if (!safeCall(() => gameView.hasOwner(n), true)) room++;
+          else enemyNear++;
+        }
+      }
+      const score = room * 2 - enemyNear * 3;
+      if (score > bestScore) {
+        bestScore = score;
+        best = ref;
+      }
+    }
+    return best;
+  }
+
+  function maybeSpawn(gameView) {
+    if (runtime.state._spawned) return false;
+    if (!inSpawnPhase(gameView)) return false;
+    const myPlayer = safeCall(() => gameView.myPlayer(), null);
+    const haveTiles = myPlayer && safeCall(() => myPlayer.numTilesOwned(), 0) > 0;
+    if (haveTiles) {
+      runtime.state._spawned = true;
+      return false;
+    }
+    const tile = chooseSpawnTile(gameView);
+    if (tile == null) return false;
+    if (IO.sendSpawn(tile)) {
+      runtime.state._lastSpawnTile = tile;
+      decisionLog("spawn @ " + tile);
+      return true;
+    }
+    return false;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  //  Per-tick orchestration
+  // ───────────────────────────────────────────────────────────────────────
+
+  async function runModulesForTick() {
+    if (!runtime.enabled) return;
+    const gameView = findGameView();
+    if (!gameView) return;
+
+    // Spawn phase handling.
+    if (inSpawnPhase(gameView)) {
+      maybeSpawn(gameView);
+      // Build a snapshot for overlay but don't run combat goals pre-spawn.
+      runtime.world = safeCall(() => buildWorld(gameView), runtime.world);
+      return;
+    }
+
+    const world = buildWorld(gameView);
+    if (!world || !world.me) return;
+    const info = await gatherTickInfo(gameView, world);
+    world.scan = {
+      bordersTN: info.bordersTN,
+      hasCoast: info.hasCoast,
+    };
+    THREATS.compute(world, info);
+    runtime.world = world;
+
+    // Primary goal.
+    const selection = selectPrimaryGoal(world);
+    runtime.planner.activeGoalId = selection ? selection.id : "IDLE";
+    if (selection) {
+      await safeCallAsync(() => selection.spec.run(world, selection.context), null);
+    }
+
+    // Secondary routines.
+    safeCall(() => secondaryDiplomacy(world), null);
+    safeCall(() => secondaryEconomyBuild(world), null);
+    safeCall(() => secondaryNukeDefense(world), null);
+  }
+
+  // Drive the brain from turn messages (server cadence ~100ms), guarded so a
+  // slow tick never overlaps itself.
+  runtime._onTurn = function () {
+    if (runtime.state.processing) return;
+    runtime.state.processing = true;
+    Promise.resolve()
+      .then(() => runModulesForTick())
+      .catch((e) => decisionLog("tick error: " + (e && e.message)))
+      .finally(() => {
+        runtime.state.processing = false;
+      });
+  };
+
+  // ───────────────────────────────────────────────────────────────────────
+  //  Test surface — scenario suite for planner goal selection.
+  // ───────────────────────────────────────────────────────────────────────
+
+  runtime.test.selectPrimaryGoal = selectPrimaryGoal;
+  runtime.test.GOAL_SPECS = GOAL_SPECS;
+  runtime.test.runModulesForTick = runModulesForTick;
+
+  runtime.test.runSuite = function () {
+    const results = [];
+    function world(over) {
+      const me = Object.assign(
+        {
+          smallID: 1,
+          troops: 50000,
+          maxTroops: 200000,
+          troopRatio: 0.25,
+          gold: 0,
+          tiles: 1000,
+          incomingTroops: 0,
+          incomingAttacks: [],
+          outgoingAttacks: [],
+          structures: {},
+          structureLevels: {},
+          share: 0.05,
+        },
+        over.me || {},
+      );
+      const everyone = over.everyone || [me];
+      const bySmallID = new Map();
+      for (const e of everyone) bySmallID.set(e.smallID, e);
+      bySmallID.set(me.smallID, me);
+      return {
+        tick: over.tick || 1500,
+        gameConfig: { difficulty: "Impossible", isTeam: false },
+        me,
+        everyone,
+        bySmallID,
+        totals: Object.assign(
+          {
+            alivePlayers: everyone.length,
+            humanCount: 4,
+            nationCount: 2,
+            botCount: 2,
+            totalLand: 100000,
+            myShare: me.share,
+            crownShare: 0.2,
+            secondShare: 0.1,
+          },
+          over.totals || {},
+        ),
+        rankings: { byTiles: [], byTroops: [] },
+        scan: over.scan || {},
+        threats: Object.assign(
+          {
+            crown: null,
+            risingStars: [],
+            adjacentEnemies: [],
+            activeInvaders: [],
+            brewingInvaders: [],
+            inboundNukes: [],
+            inboundBoats: [],
+            coalitionAgainstMe: false,
+          },
+          over.threats || {},
+        ),
+        allianceGraph: { edges: new Map() },
+      };
+    }
+    function step(name, w, expected) {
+      const sel = selectPrimaryGoal(w);
+      const actual = sel ? sel.id : null;
+      results.push({ name, expected, actual, pass: actual === expected });
+    }
+
+    // 1) Small player with TN frontier, no threats -> EXPAND_RUSH.
+    step(
+      "small+frontier=>expand",
+      world({ scan: { bordersTN: true }, me: { share: 0.03, troops: 80000 } }),
+      "EXPAND_RUSH",
+    );
+    // 2) Active invader, high pressure -> REPEL_INVASION.
+    step(
+      "invader=>repel",
+      world({
+        me: { troops: 50000, incomingTroops: 60000 },
+        threats: {
+          activeInvaders: [{ smallID: 2, name: "X", troops: 200000, isAlly: false }],
+          invasionTroopsInbound: 60000,
+        },
+        scan: { bordersTN: true },
+      }),
+      "REPEL_INVASION",
+    );
+    // 3) Dominant -> DEFENSIVE_TURTLE.
+    step(
+      "dominant=>turtle",
+      world({
+        me: { share: 0.5, troops: 500000, tiles: 50000 },
+        totals: { myShare: 0.5, secondShare: 0.2, crownShare: 0.5 },
+        scan: { bordersTN: true },
+      }),
+      "DEFENSIVE_TURTLE",
+    );
+    // 4) Hostile crown 0.5, silo + atom gold -> NUKE_CROWN.
+    step(
+      "crown=>nuke",
+      world({
+        me: {
+          share: 0.2,
+          troops: 200000,
+          tiles: 8000,
+          gold: 1_200_000,
+          structures: { "Missile Silo": 1 },
+        },
+        totals: { myShare: 0.2, crownShare: 0.5, secondShare: 0.2 },
+        threats: {
+          crown: { smallID: 2, name: "Crown", isMe: false, isAlly: false, player: { units: () => [] } },
+        },
+        scan: { bordersTN: false },
+      }),
+      "NUKE_CROWN",
+    );
+    // 5) Brewing invader, no active -> PREEMPT_INVASION.
+    step(
+      "brewing=>preempt",
+      world({
+        me: { troops: 90000, tiles: 3000 },
+        threats: {
+          brewingInvaders: [
+            { entry: { smallID: 3, name: "B", troops: 140000 }, etaTicks: 100 },
+          ],
+        },
+        scan: { bordersTN: true },
+      }),
+      "PREEMPT_INVASION",
+    );
+    // 6) Coalition against us (no bigger threat) -> DIPLOMACY_ISOLATE_CROWN.
+    step(
+      "coalition=>diplomacy",
+      world({
+        me: { share: 0.12, troops: 100000, tiles: 5000 },
+        totals: { myShare: 0.12, crownShare: 0.2, secondShare: 0.18 },
+        threats: { coalitionAgainstMe: true, coalition: { members: [2, 3] } },
+        scan: { bordersTN: false },
+      }),
+      "DIPLOMACY_ISOLATE_CROWN",
+    );
+    // 7) About to die + MIRV gold -> EMERGENCY_MIRV.
+    step(
+      "dying=>mirv",
+      world({
+        me: {
+          troops: 5000,
+          maxTroops: 200000,
+          troopRatio: 0.025,
+          incomingTroops: 50000,
+          gold: 30_000_000,
+        },
+        threats: {
+          activeInvaders: [{ smallID: 2, name: "X", troops: 300000, isAlly: false }],
+          invasionTroopsInbound: 50000,
+        },
+      }),
+      "EMERGENCY_MIRV",
+    );
+    // 8) Nothing actionable -> IDLE.
+    step(
+      "nothing=>idle",
+      world({
+        me: { troops: 10000, share: 0.4, tiles: 40000 },
+        totals: { myShare: 0.4, secondShare: 0.35, crownShare: 0.4 },
+        scan: { bordersTN: false, hasCoast: false },
+      }),
+      "IDLE",
+    );
+
+    const failed = results.filter((r) => !r.pass);
+    return {
+      results,
+      passed: results.length - failed.length,
+      failed: failed.length,
+    };
+  };
+
+
+  // ═══════════════════════════════════════════════════════════════════════
   //  K. BOOTSTRAP
   // ═══════════════════════════════════════════════════════════════════════
 
