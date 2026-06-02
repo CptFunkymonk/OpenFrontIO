@@ -43,3 +43,16 @@ the userscript at `document_start` in the page's `MAIN` world (so it can hook
 `window.WebSocket` before the game connects and read the live `GameView`) — i.e.
 exactly what Tampermonkey does, but reproducible from the CLI. `overlord.js` is a
 generated copy of the root userscript (run `dev/build-extension.sh` after edits).
+
+## C. Persistent CDP injector (automated/CLI testing)
+
+When `--load-extension` is restricted (recent Chrome), inject via the DevTools
+protocol instead. Start Chrome with a debug port, then run the injector — it
+keeps the userscript injected at document-start across reloads:
+
+```bash
+DISPLAY=:1 google-chrome --no-sandbox --disable-gpu --disable-dev-shm-usage \
+  --remote-debugging-port=9222 --user-data-dir=/tmp/overlord-chrome \
+  http://localhost:9000/ &
+node dev/inject-overlord.cjs 9222 localhost:9000
+```
