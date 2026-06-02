@@ -22,3 +22,4 @@ rl-exports/*.json
 *.log
 *debug*.txt
 eslint_out.txt
+dev/overlord-extension/overlord.js

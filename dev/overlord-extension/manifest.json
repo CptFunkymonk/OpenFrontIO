@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Overlord Bot Loader (dev)",
+  "version": "3.0.0",
+  "description": "Loads tampermonkey-overlord-bot.js into OpenFront pages at document_start in the page's MAIN world — a Tampermonkey-equivalent for local dev/testing.",
+  "content_scripts": [
+    {
+      "matches": ["http://localhost:*/*", "http://127.0.0.1:*/*", "https://openfront.io/*"],
+      "js": ["overlord.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ]
+}
