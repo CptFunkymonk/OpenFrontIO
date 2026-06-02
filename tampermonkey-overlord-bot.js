@@ -1689,6 +1689,373 @@
 
 
   // ═══════════════════════════════════════════════════════════════════════
+  //  E. THREATS — preemption-first threat engine.
+  //
+  //  Augments world.threats using the world snapshot + adjacency/inbound info
+  //  gathered from the live GameView (border scan, unit scan) which the
+  //  per-tick loop passes in (Phase 6). Pure & testable: given the inputs, it
+  //  classifies active/brewing invaders, rising stars, coalitions, and inbound
+  //  nukes/boats, each annotated with SIM-derived time-to-impact.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const THREATS = (function () {
+    const BREW_HORIZON = 400; // ticks: look this far ahead for brewing invaders
+    const EARLY_OVERMATCH_TICK = 900; // "early game" window for human overmatch
+
+    function compute(world, info) {
+      info = info || {};
+      const me = world.me;
+      const t = world.threats; // crown already set by buildWorld
+      if (!me) return t;
+
+      const adjacent = (info.adjacentEnemies || []).slice();
+      t.adjacentEnemies = adjacent;
+
+      const ctx = {
+        difficulty: world.gameConfig.difficulty,
+        totalLand: world.totals.totalLand,
+        horizon: BREW_HORIZON,
+      };
+
+      // ── Active invaders: adjacent hostiles currently attacking us. ──
+      const adjBySid = new Map(adjacent.map((e) => [e.smallID, e]));
+      const activeInvaders = [];
+      let invasionInbound = 0;
+      for (const a of me.incomingAttacks || []) {
+        const atk = world.bySmallID.get(a.attackerID);
+        if (!atk || atk.isMe || atk.isAlly) continue;
+        invasionInbound += a.troops || 0;
+        // Bots are noise unless large; track players & big bot pushes.
+        if (atk.type === PlayerType.Bot && (a.troops || 0) < me.troops * 0.15)
+          continue;
+        if (!activeInvaders.some((x) => x.smallID === atk.smallID))
+          activeInvaders.push(atk);
+      }
+      activeInvaders.sort((x, y) => y.troops - x.troops);
+      t.activeInvaders = activeInvaders;
+      t.invasionTroopsInbound = invasionInbound;
+
+      // ── Brewing invaders: adjacent hostiles not yet attacking who SIM says
+      //    can invade us within the horizon and are accumulating troops. ──
+      const brewing = [];
+      for (const e of adjacent) {
+        if (activeInvaders.some((x) => x.smallID === e.smallID)) continue;
+        if (e.isAlly) continue;
+        const eta = SIM.ticksUntilInvadable(me, e, ctx);
+        // Accumulating (or already capable) and a real contender.
+        const accumulating = (e.troopsPerMin || 0) >= 0;
+        const contender = e.troops >= me.troops * 0.8;
+        if (eta < BREW_HORIZON && accumulating && contender) {
+          brewing.push({ entry: e, etaTicks: eta, smallID: e.smallID, name: e.name, id: e.id, troops: e.troops, troopsPerMin: e.troopsPerMin });
+        }
+      }
+      brewing.sort((x, y) => x.etaTicks - y.etaTicks);
+      t.brewingInvaders = brewing;
+
+      // ── Early human overmatch: an adjacent human ≥1.5× our troops early. ──
+      t.earlyHumanOvermatch = null;
+      if (world.tick <= EARLY_OVERMATCH_TICK) {
+        for (const e of adjacent) {
+          if (e.type === PlayerType.Human && e.troops >= me.troops * 1.5) {
+            const ratio = e.troops / Math.max(1, me.troops);
+            if (
+              !t.earlyHumanOvermatch ||
+              ratio > t.earlyHumanOvermatch.ratio
+            ) {
+              t.earlyHumanOvermatch = { enemy: e, ratio };
+            }
+          }
+        }
+      }
+
+      // ── Rising stars: fast-growing non-allied players we can still beat. ──
+      const rising = [];
+      for (const e of world.everyone) {
+        if (e.isMe || e.isAlly) continue;
+        if ((e.tilesPerMin || 0) <= 0) continue;
+        if (e.troops > me.troops * 1.2) continue; // beatable
+        rising.push(e);
+      }
+      rising.sort((x, y) => (y.tilesPerMin || 0) - (x.tilesPerMin || 0));
+      t.risingStars = rising.slice(0, 5);
+
+      // ── Coalition against me: a bloc of mutually-allied non-allies whose
+      //    combined share dwarfs ours, OR several players targeting us. ──
+      t.coalitionAgainstMe = false;
+      t.coalition = null;
+      const targeters = info.targetedByCount || 0;
+      // Bloc detection from passed alliance edges (smallID -> Set(smallID)).
+      const blocs = detectBlocs(world, me);
+      let biggest = null;
+      for (const bloc of blocs) {
+        const share = bloc.reduce((s, sid) => {
+          const en = world.bySmallID.get(sid);
+          return s + (en ? en.share : 0);
+        }, 0);
+        if (!biggest || share > biggest.share) biggest = { members: bloc, share };
+      }
+      if (
+        (biggest && biggest.share > world.totals.myShare * 1.5 && biggest.members.length >= 2) ||
+        targeters >= 3
+      ) {
+        t.coalitionAgainstMe = true;
+        t.coalition = biggest;
+      }
+
+      // ── Inbound nukes / boats (passed from the unit scan). ──
+      t.inboundNukes = info.inboundNukes || [];
+      t.inboundBoats = info.inboundBoats || [];
+
+      return t;
+    }
+
+    /**
+     * Find connected components ("blocs") among non-me players using the
+     * alliance edges in world.allianceGraph.edges (Map smallID->Set). Only
+     * blocs excluding us are returned.
+     */
+    function detectBlocs(world, me) {
+      const edges = (world.allianceGraph && world.allianceGraph.edges) || new Map();
+      const seen = new Set();
+      const blocs = [];
+      for (const [sid] of edges) {
+        if (sid === me.smallID || seen.has(sid)) continue;
+        const stack = [sid];
+        const comp = [];
+        while (stack.length) {
+          const cur = stack.pop();
+          if (seen.has(cur) || cur === me.smallID) continue;
+          seen.add(cur);
+          comp.push(cur);
+          const nbrs = edges.get(cur);
+          if (nbrs) for (const n of nbrs) if (!seen.has(n) && n !== me.smallID) stack.push(n);
+        }
+        if (comp.length >= 2) blocs.push(comp);
+      }
+      return blocs;
+    }
+
+    return { BREW_HORIZON, compute, detectBlocs };
+  })();
+
+  runtime.threats = THREATS;
+  runtime.test.threats = THREATS;
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  G. DIPLOMACY — make powerful allies, never let them surpass us.
+  //
+  //  Pure decision functions modeled on the engine's Impossible nation
+  //  alliance logic (NationAllianceBehavior) and extended with an
+  //  anti-overgrowth rule grounded in the SIM projector: we refuse to empower
+  //  (or we betray) any ally projected to surpass us, when it's safe to do so.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const DIPLO = (function () {
+    const OVERGROW_HORIZON = 600; // ticks to project ally/our share
+    const THREAT_RATIO = 1.5; // a partner this much stronger is a "threat"
+
+    function nonBotCount(world) {
+      return world.totals.humanCount + world.totals.nationCount;
+    }
+
+    function estMax(world, entry) {
+      return MATH.maxTroops({
+        tiles: entry.tiles,
+        cityLevelsSum: 0,
+        type: entry.type,
+        difficulty: world.gameConfig.difficulty,
+      });
+    }
+
+    /** Will `entry` overtake our map share within the horizon (by velocity)? */
+    function projectedToOvertake(world, entry, horizon) {
+      horizon = horizon || OVERGROW_HORIZON;
+      const ctx = {
+        difficulty: world.gameConfig.difficulty,
+        totalLand: world.totals.totalLand,
+      };
+      const myFuture = SIM.projectPlayer(
+        Object.assign({}, world.me, { reserveRatio: undefined }),
+        horizon,
+        Object.assign({}, ctx, { maxTroopsOverride: world.me.maxTroops }),
+      );
+      const theirFuture = SIM.projectPlayer(entry, horizon, ctx);
+      // Compare projected tiles (map share proxy).
+      return theirFuture.tiles > myFuture.tiles;
+    }
+
+    function isThreat(world, entry) {
+      const me = world.me;
+      return (
+        entry.troops > me.troops * THREAT_RATIO ||
+        estMax(world, entry) > me.maxTroops * THREAT_RATIO ||
+        entry.tiles > me.tiles * THREAT_RATIO
+      );
+    }
+
+    /**
+     * Should we ACCEPT an incoming alliance request from `req`?
+     * Returns { accept, reason }.
+     */
+    function shouldAcceptAlliance(world, req) {
+      const me = world.me;
+      if (!me) return { accept: false, reason: "no me" };
+      if (req.isTraitor) return { accept: false, reason: "traitor" };
+
+      const nb = nonBotCount(world);
+      // Don't feed the crown: reject players already allied to a big fraction
+      // of the field (mirrors Impossible nation logic).
+      if (nb >= 4 && req.allianceCount >= 0.25 * nb) {
+        return { accept: false, reason: "feeding crown" };
+      }
+      // Appease genuine threats — allying the strong avoids being their target.
+      if (isThreat(world, req)) {
+        return { accept: true, reason: "appease threat" };
+      }
+      // Anti-overgrowth: don't empower a non-threat who will pass us.
+      if (projectedToOvertake(world, req, OVERGROW_HORIZON)) {
+        return { accept: false, reason: "would overgrow us" };
+      }
+      // Early game: alliances reduce fronts; accept peers readily.
+      if (world.tick < 1200) {
+        return { accept: true, reason: "early peer alliance" };
+      }
+      // Otherwise accept a reasonably-sized peer (a useful shield).
+      if (req.troops >= me.troops * 0.4) {
+        return { accept: true, reason: "peer shield" };
+      }
+      return { accept: false, reason: "too weak to matter" };
+    }
+
+    /**
+     * Pick the best player to REQUEST an alliance with: strong enough to be a
+     * real shield, not already friendly, not a traitor, not projected to
+     * overgrow us, and not already over-allied. Returns the entry or null.
+     */
+    function pickAllianceRequestTarget(world) {
+      const me = world.me;
+      if (!me) return null;
+      const nb = nonBotCount(world);
+      const candidates = world.everyone.filter((e) => {
+        if (e.isMe || e.isAlly) return false;
+        if (e.type === PlayerType.Bot) return false;
+        if (e.isTraitor) return false;
+        if (nb >= 4 && e.allianceCount >= 0.25 * nb) return false; // crown-feeder
+        if (projectedToOvertake(world, e, OVERGROW_HORIZON)) return false;
+        return true;
+      });
+      // Prefer the strongest acceptable peer (best shield) that isn't so strong
+      // they're a runaway. Sort by troops desc, then tiles.
+      candidates.sort((a, b) => b.troops - a.troops || b.tiles - a.tiles);
+      return candidates[0] || null;
+    }
+
+    /**
+     * Is it safe to break an alliance right now? Breaking incurs the traitor
+     * debuff (defense ×0.5 for 30s), so it's unsafe under heavy incoming
+     * pressure or when the ally is our only buffer against a stronger field.
+     */
+    function safeToBreak(world, ally, opts) {
+      opts = opts || {};
+      const me = world.me;
+      const pressure = me.incomingTroops / Math.max(1, me.troops);
+      if (pressure > 0.25) return false;
+      // Respect a break budget to avoid diplomacy thrash.
+      if (opts.breaksUsed != null && opts.maxBreaks != null) {
+        if (opts.breaksUsed >= opts.maxBreaks) return false;
+      }
+      // Don't break our only shield against a clearly stronger neighbour.
+      const adjacent = (world.threats && world.threats.adjacentEnemies) || [];
+      const strongAdjacent = adjacent.filter((e) => e.troops > me.troops);
+      if (strongAdjacent.length >= 2) return false;
+      return true;
+    }
+
+    /**
+     * Should we BETRAY `ally`? Returns { betray, reason }.
+     * Triggers: weak/MIRV'd ally we can absorb, traitor ally, or anti-overgrowth
+     * (ally projected to surpass us) when it's safe to break.
+     */
+    function shouldBetrayAlly(world, ally, opts) {
+      const me = world.me;
+      if (!me) return { betray: false, reason: "no me" };
+
+      // Weak / MIRV'd ally we can absorb (mirrors engine maybeBetray).
+      const aMax = estMax(world, ally);
+      const aOutgoing = ally.outgoingTroops || 0;
+      if (
+        ally.troops + aOutgoing < aMax * 0.2 &&
+        ally.troops < me.troops &&
+        safeToBreak(world, ally, opts)
+      ) {
+        return { betray: true, reason: "weak/MIRV'd ally — absorb" };
+      }
+      // Traitor ally not much stronger than us.
+      if (ally.isTraitor && ally.troops < me.troops * 1.2 && safeToBreak(world, ally, opts)) {
+        return { betray: true, reason: "traitor ally" };
+      }
+      // Anti-overgrowth: ally will surpass us -> cut them down before they win.
+      if (projectedToOvertake(world, ally, OVERGROW_HORIZON) && safeToBreak(world, ally, opts)) {
+        return { betray: true, reason: "anti-overgrowth (ally surpassing us)" };
+      }
+      return { betray: false, reason: "keep ally" };
+    }
+
+    /**
+     * Response to a coalition forming against us: embargo the bloc & crown,
+     * and ally the crown's strongest rival to split the field. Returns
+     * { embargoTargets:[ids], allyTarget:entry|null }.
+     */
+    function coalitionResponse(world) {
+      const me = world.me;
+      const t = world.threats;
+      const embargoTargets = [];
+      let allyTarget = null;
+      if (!t || !t.coalitionAgainstMe) return { embargoTargets, allyTarget };
+
+      const crown = t.crown;
+      if (crown && !crown.isMe && !crown.isAlly) {
+        if (crown.id) embargoTargets.push(crown.id);
+      }
+      if (t.coalition && t.coalition.members) {
+        for (const sid of t.coalition.members) {
+          const en = world.bySmallID.get(sid);
+          if (en && en.id && !en.isMe && !en.isAlly) embargoTargets.push(en.id);
+        }
+      }
+      // Ally the strongest player who is NOT in the bloc and NOT the crown.
+      const blocSet = new Set((t.coalition && t.coalition.members) || []);
+      const rivals = world.everyone.filter(
+        (e) =>
+          !e.isMe &&
+          !e.isAlly &&
+          e.type !== PlayerType.Bot &&
+          !blocSet.has(e.smallID) &&
+          (!crown || e.smallID !== crown.smallID),
+      );
+      rivals.sort((a, b) => b.troops - a.troops);
+      allyTarget = rivals[0] || null;
+      return { embargoTargets, allyTarget };
+    }
+
+    return {
+      OVERGROW_HORIZON,
+      THREAT_RATIO,
+      projectedToOvertake,
+      isThreat,
+      shouldAcceptAlliance,
+      pickAllianceRequestTarget,
+      safeToBreak,
+      shouldBetrayAlly,
+      coalitionResponse,
+    };
+  })();
+
+  runtime.diplo = DIPLO;
+  runtime.test.diplo = DIPLO;
+
+
+  // ═══════════════════════════════════════════════════════════════════════
   //  K. BOOTSTRAP
   // ═══════════════════════════════════════════════════════════════════════
 
