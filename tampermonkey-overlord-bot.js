@@ -2968,6 +2968,47 @@
     };
   }
 
+  /**
+   * Plan §10/E2 — place a defensive structure (DefensePost) on the hot border
+   * tile facing `threatSid`, so the engine's ×5 DefensePost defense bonus lands
+   * exactly where the invader pushes. Scans our cached border tiles for one
+   * adjacent to the threat, respecting structureMinDist from existing builds.
+   */
+  function findDefensiveBuildTile(gameView, myPlayer, threatSid, minDist) {
+    const cache = runtime.state._borderCache;
+    const border = cache && cache.tiles ? Array.from(cache.tiles) : null;
+    if (!border || border.length === 0) return null;
+    minDist = minDist || 15;
+    const existing =
+      safeCall(
+        () => myPlayer.units().filter((u) => isStructureType(u.type())),
+        [],
+      ) || [];
+    const farEnough = (tile) => {
+      for (const su of existing) {
+        const st = safeCall(() => su.tile(), null);
+        if (st == null) continue;
+        if (safeCall(() => gameView.manhattanDist(tile, st), 999) < minDist)
+          return false;
+      }
+      return true;
+    };
+    let fallback = null;
+    for (const tile of border) {
+      let facesThreat = false;
+      for (const n of safeCall(() => gameView.neighbors(tile), [])) {
+        if (safeCall(() => gameView.ownerID(n), -1) === threatSid) {
+          facesThreat = true;
+          break;
+        }
+      }
+      if (!facesThreat) continue;
+      if (fallback == null) fallback = tile;
+      if (farEnough(tile)) return tile;
+    }
+    return fallback;
+  }
+
   function secondaryEconomyBuild(world) {
     if (GOLD_SAVING_GOALS.has(runtime.planner.activeGoalId)) return;
     const pick = TACTICS.pickBuild(world, buildFlags(world));
@@ -2975,7 +3016,19 @@
     const gameView = gv();
     const myPlayer = myP();
     if (!gameView || !myPlayer) return;
-    const tile = findBuildTile(gameView, myPlayer, 15);
+    let tile = null;
+    // Defensive structures go on the hot border facing the strongest threat.
+    if (pick.type === UnitType.DefensePost) {
+      const threat =
+        (world.threats.activeInvaders || [])[0] ||
+        ((world.threats.brewingInvaders || [])[0] || {}).entry ||
+        (world.threats.earlyHumanOvermatch &&
+          world.threats.earlyHumanOvermatch.enemy);
+      if (threat) {
+        tile = findDefensiveBuildTile(gameView, myPlayer, threat.smallID, 15);
+      }
+    }
+    if (tile == null) tile = findBuildTile(gameView, myPlayer, 15);
     if (tile == null) return;
     IO.sendBuild(pick.type, tile);
   }
@@ -3157,6 +3210,7 @@
   runtime.test.enemySamInterceptsPath = enemySamInterceptsPath;
   runtime.test.pickClearCrownTarget = pickClearCrownTarget;
   runtime.test.bestNukeTargetTile = bestNukeTargetTile;
+  runtime.test.findDefensiveBuildTile = findDefensiveBuildTile;
   runtime.test.selectPrimaryGoal = selectPrimaryGoal;
   runtime.test.GOAL_SPECS = GOAL_SPECS;
   runtime.test.runModulesForTick = runModulesForTick;
