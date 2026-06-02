@@ -2768,6 +2768,67 @@
     return { tile: fallback, clear: false };
   }
 
+  function enemyStructureTiles(targetPlayer) {
+    const units =
+      safeCall(() => targetPlayer.units.apply(targetPlayer, STRUCTURE_TYPES), []) ||
+      [];
+    const out = [];
+    for (const u of units) {
+      const tile = safeCall(() => u.tile(), null);
+      if (tile == null) continue;
+      out.push({ tile, type: safeCall(() => u.type(), null) });
+    }
+    return out;
+  }
+
+  /**
+   * Plan §10/E1 — value-weighted nuke targeting. Picks the enemy STRUCTURE
+   * tile that maximizes destroyed value within the warhead's outer blast
+   * radius, weighting Cities highest (city levels drive the enemy's troop cap
+   * + income, so wrecking a city cluster cripples them most). Prefers a tile
+   * whose flight path from our nearest silo is SAM-clear. Falls back to any
+   * owned tile when the enemy has no visible structures.
+   * Returns { tile, clear }.
+   */
+  function bestNukeTargetTile(gameView, targetPlayer, nukeType, src) {
+    const structs = enemyStructureTiles(targetPlayer);
+    if (structs.length === 0) {
+      const sid = safeCall(() => targetPlayer.smallID(), -1);
+      const fb = findOwnedTileOf(gameView, sid, 600);
+      return { tile: fb, clear: fb == null ? false : !enemySamInterceptsPath(gameView, src, fb) };
+    }
+    const magType =
+      nukeType === UnitType.MIRV ? UnitType.MIRVWarhead : nukeType;
+    const outer = safeCall(() => MATH.nukeMagnitude(magType).outer, 30);
+    const r2 = outer * outer;
+    const valueOf = (type) => (type === UnitType.City ? 3 : 1);
+    let best = null,
+      bestScore = -1,
+      bestClear = null,
+      bestClearScore = -1;
+    for (const s of structs) {
+      let score = 0;
+      const sx = safeCall(() => gameView.x(s.tile), 0);
+      const sy = safeCall(() => gameView.y(s.tile), 0);
+      for (const o of structs) {
+        const dx = safeCall(() => gameView.x(o.tile), 0) - sx;
+        const dy = safeCall(() => gameView.y(o.tile), 0) - sy;
+        if (dx * dx + dy * dy <= r2) score += valueOf(o.type);
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        best = s.tile;
+      }
+      if (!enemySamInterceptsPath(gameView, src, s.tile) && score > bestClearScore) {
+        bestClearScore = score;
+        bestClear = s.tile;
+      }
+    }
+    return bestClear != null
+      ? { tile: bestClear, clear: true }
+      : { tile: best, clear: false };
+  }
+
   function launchNukeAt(gameView, nukeType, targetTile) {
     // build_unit's tile is the target landing tile; engine picks nearest silo.
     return IO.sendBuild(nukeType, targetTile);
@@ -2778,13 +2839,20 @@
     const myPlayer = myP();
     const crown = (ctx && ctx.crown) || myHostileCrown(world);
     if (!gameView || !crown) return runExpand(world);
-    const choice = pickClearCrownTarget(gameView, myPlayer, crown);
+    const nukeType = canAfford(world, GOLD.HYDRO)
+      ? UnitType.HydrogenBomb
+      : UnitType.AtomBomb;
+    const src = nearestSiloTile(gameView, myPlayer);
+    const crownPlayer = crown.player || (crown.id ? crown : null);
+    const choice = crownPlayer && crownPlayer.units
+      ? bestNukeTargetTile(gameView, crownPlayer, nukeType, src)
+      : pickClearCrownTarget(gameView, myPlayer, crown);
     let launched = false;
     if (choice.tile != null) {
       if (!choice.clear) {
-        // The crown is SAM-walled on every sampled approach. Don't feed a lone
-        // warhead to their interceptors — SAM_OVERWHELM (3 atoms + a hydrogen)
-        // is the planner's answer once we can afford it. Hold and keep growing.
+        // The crown is SAM-walled on every approach to its high-value cluster.
+        // Don't feed a lone warhead to their interceptors — SAM_OVERWHELM
+        // (3 atoms + a hydrogen) is the planner's answer once affordable.
         decisionLog("nuke crown: SAM-covered, holding for overwhelm");
         runExpand(world);
         return false;
@@ -2796,7 +2864,6 @@
       }
       if (crown.id) IO.sendTargetPlayer(crown.id);
     }
-    // Keep using idle troops for expansion too.
     runExpand(world);
     return launched;
   }
@@ -2822,7 +2889,18 @@
     const gameView = gv();
     const crown = myHostileCrown(world) || (world.threats.activeInvaders || [])[0];
     if (!gameView || !crown) return false;
-    const target = findCrownTargetTile(gameView, crown);
+    const crownPlayer = crown.player || (crown.id ? crown : null);
+    let target = null;
+    if (crownPlayer && crownPlayer.units) {
+      const choice = bestNukeTargetTile(
+        gameView,
+        crownPlayer,
+        UnitType.MIRV,
+        nearestSiloTile(gameView, myP()),
+      );
+      target = choice.tile;
+    }
+    if (target == null) target = findCrownTargetTile(gameView, crown);
     if (target == null) return false;
     return IO.sendBuild(UnitType.MIRV, target);
   }
@@ -3078,6 +3156,7 @@
 
   runtime.test.enemySamInterceptsPath = enemySamInterceptsPath;
   runtime.test.pickClearCrownTarget = pickClearCrownTarget;
+  runtime.test.bestNukeTargetTile = bestNukeTargetTile;
   runtime.test.selectPrimaryGoal = selectPrimaryGoal;
   runtime.test.GOAL_SPECS = GOAL_SPECS;
   runtime.test.runModulesForTick = runModulesForTick;
