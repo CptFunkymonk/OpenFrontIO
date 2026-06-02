@@ -2577,6 +2577,12 @@
           (e) => e.smallID === target.smallID,
         );
         if (!adjacent && !scanOf(world).hasCoast) return { valid: false };
+        // If the rising star isn't on our border but we DO have adjacent
+        // enemies, prefer eating those by land (ATTACK_WEAKEST) rather than
+        // dribbling capped boats at a distant target.
+        if (!adjacent && (world.threats.adjacentEnemies || []).length > 0) {
+          return { valid: false };
+        }
         return {
           valid: true,
           priority: 74,
@@ -2645,9 +2651,10 @@
           retaliating: pick.retaliating,
         });
         if (troops <= 0) return { valid: false };
+        const noFrontier = !scanOf(world).bordersTN;
         return {
           valid: true,
-          priority: 58,
+          priority: noFrontier ? 66 : 58,
           note: "attack " + pick.entry.name + " (" + pick.reason + ")",
           context: { pick, troops },
         };
@@ -2783,6 +2790,17 @@
     const gameView = gv();
     const myPlayer = myP();
     if (!gameView || !myPlayer) return false;
+    // Respect the transport-ship cap and a cooldown — don't spam boat intents
+    // every tick (the engine caps active transports at boatMaxNumber anyway).
+    const maxBoats = safeCall(() => gameView.config().boatMaxNumber(), 3);
+    const ships = safeCall(
+      () => myPlayer.units(UnitType.TransportShip).length,
+      0,
+    );
+    if (ships >= maxBoats) return false;
+    const lastBoat = runtime.state.cooldowns.boat || -99999;
+    if (world.tick - lastBoat < 30) return false;
+    runtime.state.cooldowns.boat = world.tick;
     // Find a destination tile owned by the target and a viable spawn.
     const dstSeed = findOwnedTileOf(gameView, target.smallID, 300);
     if (dstSeed == null) return false;

@@ -86,12 +86,12 @@ async function main() {
     }
   });
   ws.on("close", () => {
-    console.log("[injector] disconnected");
-    process.exit(0);
+    console.log("[injector] disconnected; reconnecting in 2s");
+    setTimeout(main, 2000);
   });
   ws.on("error", (e) => {
     console.error("[injector] error", e.message);
-    process.exit(1);
+    try { ws.close(); } catch (_) {}
   });
 }
 main();
