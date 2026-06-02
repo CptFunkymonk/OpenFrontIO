@@ -2836,6 +2836,32 @@
       const d = DIPLO.shouldAcceptAlliance(world, e);
       if (d.accept && e.id) IO.sendAllianceRequest(e.id);
     }
+    // Proactively court a powerful (but non-overgrowing) ally when we have
+    // few — strong shields without empowering a future winner. Only while in a
+    // peaceful/economic posture (so we never court a player we're attacking;
+    // PREEMPT and DIPLOMACY_ISOLATE_CROWN do their own targeted outreach).
+    const PEACEFUL_GOALS = new Set([
+      "EXPAND_RUSH",
+      "IDLE",
+      "SAM_WALL_BUILDUP",
+      "DEFENSIVE_TURTLE",
+    ]);
+    const allyCount = world.everyone.filter((p) => p.isAlly && !p.isMe).length;
+    const lastReq = runtime.state.cooldowns.allianceReq || -99999;
+    if (
+      PEACEFUL_GOALS.has(runtime.planner.activeGoalId) &&
+      allyCount < 2 &&
+      world.tick - lastReq > 300
+    ) {
+      const target = DIPLO.pickAllianceRequestTarget(world);
+      if (target && target.id) {
+        const sent = IO.sendAllianceRequest(target.id);
+        if (sent) {
+          runtime.state.cooldowns.allianceReq = world.tick;
+          decisionLog("courting ally " + target.name);
+        }
+      }
+    }
   }
 
   function secondaryNukeDefense(world) {

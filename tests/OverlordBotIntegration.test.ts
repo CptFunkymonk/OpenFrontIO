@@ -306,6 +306,29 @@ describe("Overlord end-to-end loop", () => {
     expect(atk.troops).toBeGreaterThan(0);
   });
 
+  it("proactively courts a strong non-adjacent peer while expanding", async () => {
+    const ownership = new Array(W * H).fill(0);
+    // Me with a TN frontier (-> EXPAND_RUSH) and a strong peer far away.
+    fillBlock(ownership, 1, 10, 10, 3, 3);
+    fillBlock(ownership, 2, 0, 0, 3, 3);
+    const gv = buildMockGame({
+      tick: 1000,
+      meSmallID: 1,
+      players: [
+        { smallID: 1, id: "me", name: "Me", troops: 90000, gold: 0 },
+        { smallID: 2, id: "peer", name: "Peer", troops: 120000, gold: 0 },
+      ],
+      ownership,
+    });
+    setGame(gv);
+    await runtime.test.runModulesForTick();
+    expect(runtime.planner.activeGoalId).toBe("EXPAND_RUSH");
+    const req = captured.find(
+      (i) => i.type === "allianceRequest" && i.recipient === "peer",
+    );
+    expect(req, "should court the strong non-adjacent peer").toBeTruthy();
+  });
+
   it("survives many ticks without throwing", async () => {
     const ownership = new Array(W * H).fill(0);
     fillBlock(ownership, 1, 10, 10, 3, 3);
