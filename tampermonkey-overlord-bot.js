@@ -1138,6 +1138,312 @@
   runtime._buildWorld = buildWorld;
 
   // ═══════════════════════════════════════════════════════════════════════
+  //  F. TACTICS — calculated sizing + target/build selection.
+  //
+  //  These are pure decision functions over the WORLD snapshot. They size
+  //  attacks/expansions from the exact engine math (MATH.*) and pick targets
+  //  using a strategy ladder modeled on the engine's Impossible-difficulty
+  //  nation AI (AiAttackBehavior) but grounded in our optimal-ratio math.
+  //  Execution (tile finding, async border queries, sending) lives in the
+  //  goal run() functions (Phase 6); here we only DECIDE.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const TACTICS = (function () {
+    function clamp01(v, min, max) {
+      return Math.min(Math.max(v, min), max);
+    }
+
+    /**
+     * Reserve ratio to keep when EXPANDING into TerraNullius. TN attacks cost
+     * a flat loss per tile regardless of troop count (proven in MATH), so
+     * expansion can never "waste" troops — we keep only a thin defensive pool.
+     * This is the central fix for the v2 under-expansion failure: we expand
+     * aggressively while small instead of hoarding behind a high reserve.
+     */
+    function reserveForExpansion(world) {
+      const me = world.me;
+      if (!me) return 0.3;
+      const ratio = me.troopRatio;
+      const share = world.totals.myShare;
+
+      let reserve = 0.15;
+      if (share < 0.05) reserve = 0.08;
+      else if (share < 0.1) reserve = 0.1;
+      else if (share < 0.25) reserve = 0.15;
+      else reserve = 0.22;
+
+      const pressure = me.incomingTroops / Math.max(1, me.troops);
+      if (pressure > 0.5) reserve = Math.max(reserve, 0.4);
+      else if (pressure > 0.25) reserve = Math.max(reserve, 0.3);
+
+      if (ratio < 0.15) reserve = Math.max(reserve, 0.25);
+
+      return clamp01(reserve, 0.05, 0.7);
+    }
+
+    /**
+     * Reserve ratio when ATTACKING a player. Higher than expansion because PvP
+     * troops can be lost to retreat/over-extension; we keep a defensive pool.
+     */
+    function reserveForCombat(world) {
+      const me = world.me;
+      if (!me) return 0.35;
+      const ratio = me.troopRatio;
+      const share = world.totals.myShare;
+
+      let reserve = 0.35;
+      if (ratio < 0.2) reserve = 0.5;
+      else if (ratio < 0.4) reserve = 0.42;
+      else if (ratio > 0.8) reserve = 0.25;
+
+      if (share > 0.4) reserve = Math.min(reserve, 0.25);
+      return clamp01(reserve, 0.12, 0.7);
+    }
+
+    function availableTroops(world, reserveRatio) {
+      const me = world.me;
+      if (!me) return 0;
+      return Math.floor(me.troops - me.maxTroops * reserveRatio);
+    }
+
+    /** Troops to commit to a TerraNullius expansion this tick. */
+    function expansionTroops(world) {
+      const avail = availableTroops(world, reserveForExpansion(world));
+      return avail > 0 ? avail : 0;
+    }
+
+    /**
+     * Troops to commit to attacking a specific enemy entry, using the exact
+     * saturation-point math. Returns 0 when not worth it.
+     */
+    function attackTroops(world, enemyEntry, opts) {
+      opts = opts || {};
+      const reserve =
+        opts.reserveRatio != null
+          ? opts.reserveRatio
+          : reserveForCombat(world);
+      const avail = availableTroops(world, reserve);
+      return MATH.optimalAttackTroops(avail, enemyEntry.troops, {
+        retaliating: !!opts.retaliating,
+        minAbsolute: opts.minAbsolute,
+      });
+    }
+
+    function estimateMaxTroops(world, entry) {
+      // We can't see enemy city levels; approximate from tiles + their type.
+      return MATH.maxTroops({
+        tiles: entry.tiles,
+        cityLevelsSum: 0,
+        type: entry.type,
+        difficulty: world.gameConfig.difficulty,
+      });
+    }
+
+    /**
+     * Select the best attack target from a candidate list (adjacent enemies +
+     * bordering bots). Strategy ladder mirrors the engine's Impossible nation
+     * AI ordering, refined with our math:
+     *   retaliate > weak bots > very weak > traitor > AFK > victim > weakest.
+     * Returns { entry, reason, retaliating } or null.
+     */
+    function selectAttackTarget(world, candidates) {
+      const me = world.me;
+      if (!me || !candidates || candidates.length === 0) return null;
+      const myTroops = me.troops;
+
+      const sorted = candidates.slice().sort((a, b) => a.troops - b.troops);
+
+      // 1) Retaliate: biggest non-bot incoming attacker that is adjacent.
+      let biggestAttacker = null;
+      let biggestTroops = 0;
+      for (const a of me.incomingAttacks || []) {
+        if (a.troops <= biggestTroops) continue;
+        const atkEntry = world.bySmallID.get(a.attackerID);
+        if (!atkEntry) continue;
+        if (atkEntry.type === PlayerType.Bot) continue;
+        if (!candidates.some((c) => c.smallID === atkEntry.smallID)) continue;
+        biggestTroops = a.troops;
+        biggestAttacker = atkEntry;
+      }
+      if (biggestAttacker) {
+        return {
+          entry: biggestAttacker,
+          reason: "retaliate",
+          retaliating: true,
+        };
+      }
+
+      // 2) Weak bots.
+      const bots = sorted.filter((c) => c.type === PlayerType.Bot);
+      if (bots.length > 0) {
+        return { entry: bots[0], reason: "farm bot", retaliating: false };
+      }
+
+      // 3) Very weak enemy: < 15% of their own maxTroops AND < 1.2x us.
+      for (const c of sorted) {
+        const cMax = estimateMaxTroops(world, c);
+        if (c.troops < cMax * 0.15 && c.troops < myTroops * 1.2) {
+          return { entry: c, reason: "very weak", retaliating: false };
+        }
+      }
+
+      // 4) Traitor not much stronger than us.
+      for (const c of sorted) {
+        if (c.isTraitor && c.troops < myTroops * 1.2) {
+          return { entry: c, reason: "traitor", retaliating: false };
+        }
+      }
+
+      // 5) AFK / disconnected < 3x us.
+      for (const c of sorted) {
+        if (c.isDisconnected && c.troops < myTroops * 3) {
+          return { entry: c, reason: "afk", retaliating: false };
+        }
+      }
+
+      // 6) Victim: under 50%+ of their troops in incoming attacks & < 1.2x us.
+      for (const c of sorted) {
+        if (c.troops > myTroops * 1.2) continue;
+        if ((c.incomingTroops || 0) > c.troops * 0.5) {
+          return { entry: c, reason: "victim", retaliating: false };
+        }
+      }
+
+      // 7) Weakest enemy strictly weaker than us.
+      if (sorted[0] && sorted[0].troops < myTroops) {
+        return { entry: sorted[0], reason: "weakest", retaliating: false };
+      }
+      return null;
+    }
+
+    /**
+     * Choose the next structure to build by ROI, given current counts, gold
+     * and situational flags. Each candidate carries a numeric priority (lower
+     * = build sooner). Threat flags reprioritize: a nuke threat makes SAMs
+     * top priority; a ground threat lifts DefensePosts above economy.
+     *
+     * flags: { coastAvailable, underThreat, crownRising, nukeThreat, mapShare }
+     * Returns { type, cost, reason, affordable } or null.
+     */
+    function pickBuild(world, flags) {
+      const me = world.me;
+      if (!me) return null;
+      flags = flags || {};
+      const gold = me.gold;
+      const s = me.structures || {};
+      const cities = s[UnitType.City] || 0;
+      const ports = s[UnitType.Port] || 0;
+      const factories = s[UnitType.Factory] || 0;
+      const dps = s[UnitType.DefensePost] || 0;
+      const silos = s[UnitType.MissileSilo] || 0;
+      const sams = s[UnitType.SAMLauncher] || 0;
+      const pf = ports + factories;
+
+      const candidates = [];
+
+      // City — best early ROI (raises pop cap + troop income). Cheap until #4.
+      if (cities < 12) {
+        candidates.push({
+          type: UnitType.City,
+          cost: MATH.cityCost(cities),
+          reason: "city #" + (cities + 1) + " (cap+income)",
+          prio: 20,
+        });
+      }
+      // Port — trade-ship gold (huge). Needs a coast.
+      if (flags.coastAvailable && ports < 3 && cities >= 1) {
+        candidates.push({
+          type: UnitType.Port,
+          cost: MATH.portCost(pf),
+          reason: "port #" + (ports + 1) + " (trade gold)",
+          prio: 30,
+        });
+      }
+      // Factory — train gold; pair with cities.
+      if (factories < Math.max(1, Math.floor(cities / 2)) && cities >= 2) {
+        candidates.push({
+          type: UnitType.Factory,
+          cost: MATH.factoryCost(pf),
+          reason: "factory #" + (factories + 1) + " (train gold)",
+          prio: 40,
+        });
+      }
+      // Defense posts — ×5 defense. Reactive/preemptive.
+      const wantDPs = flags.underThreat ? cities + 2 : Math.floor(cities / 2);
+      if (dps < wantDPs) {
+        candidates.push({
+          type: UnitType.DefensePost,
+          cost: MATH.defensePostCost(dps),
+          reason: "defense post (x5 hold)",
+          // Under a real ground threat, fortifying beats another economy
+          // building (DPs are cheap and multiply our hold ×5).
+          prio: flags.underThreat ? 15 : 50,
+        });
+      }
+      // Missile silos — needed to launch nukes; build as the crown rises.
+      if ((flags.crownRising || (flags.mapShare || 0) > 0.15) && silos < 3) {
+        candidates.push({
+          type: UnitType.MissileSilo,
+          cost: MATH.missileSiloCost(),
+          reason: "silo (nuke capability)",
+          prio: flags.crownRising ? 35 : 60,
+        });
+      }
+      // SAM launchers — defend vs incoming nukes / pre-crown wall.
+      const wantSams = flags.nukeThreat ? 2 : Math.floor(cities / 3);
+      if (
+        (flags.nukeThreat || flags.crownRising) &&
+        sams < Math.max(1, wantSams)
+      ) {
+        candidates.push({
+          type: UnitType.SAMLauncher,
+          cost: MATH.samCost(sams),
+          reason: "SAM (nuke defense)",
+          // An inbound nuke is an emergency — SAM jumps to the top.
+          prio: flags.nukeThreat ? 5 : 70,
+        });
+      }
+
+      if (candidates.length === 0) return null;
+      candidates.sort((a, b) => a.prio - b.prio);
+
+      // Highest-priority affordable build wins.
+      for (const b of candidates) {
+        if (gold >= b.cost)
+          return {
+            type: b.type,
+            cost: b.cost,
+            reason: b.reason,
+            affordable: true,
+          };
+      }
+      // Otherwise advise banking for the highest-priority build.
+      const top = candidates[0];
+      return {
+        type: top.type,
+        cost: top.cost,
+        reason: "save for " + top.reason,
+        affordable: false,
+      };
+    }
+
+    return {
+      reserveForExpansion,
+      reserveForCombat,
+      availableTroops,
+      expansionTroops,
+      attackTroops,
+      selectAttackTarget,
+      estimateMaxTroops,
+      pickBuild,
+    };
+  })();
+
+  runtime.tactics = TACTICS;
+  runtime.test.tactics = TACTICS;
+
+
+  // ═══════════════════════════════════════════════════════════════════════
   //  K. BOOTSTRAP
   // ═══════════════════════════════════════════════════════════════════════
 
