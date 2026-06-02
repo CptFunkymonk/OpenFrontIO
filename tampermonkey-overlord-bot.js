@@ -572,11 +572,13 @@
     velocityWindowTicks: 300, // window for tiles/min & troops/min
     ticksPerMinute: 600, // 10 ticks/sec * 60
 
-    // Stealth (Phase 7) — placeholders; populated later.
+    // Stealth / throttle (Phase 7). Lenient by design so it never starves our
+    // own expansion/economy: a generous per-tick major-intent cap and (by
+    // default) no min-gap. Toggle/tune at runtime via CONFIG.stealth.
     stealth: {
       enabled: true,
-      minIntentGapMs: 90,
-      maxMajorPer2s: 6,
+      minIntentGapMs: 0, // 0 = no inter-intent delay (avoid starving multi-intent ticks)
+      maxMajorPerTick: 8, // cap only genuinely excessive bursts within one tick
     },
   };
 
@@ -3129,6 +3131,238 @@
       failed: failed.length,
     };
   };
+
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  I. STEALTH / THROTTLE — optional human-like intent pacing.
+  //
+  //  Default OFF so it can never starve our own expansion/economy (the v2 bot
+  //  occasionally dropped useful intents at the gate). When enabled it only
+  //  trims genuinely excessive bursts: a per-tick major-intent cap plus an
+  //  optional minimum gap between sends. Identical-intent de-dupe already
+  //  happens upstream in sendIntent().
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const MAJOR_INTENT_TYPES = new Set([
+    "attack",
+    "boat",
+    "build_unit",
+    "upgrade_structure",
+    "breakAlliance",
+    "allianceRequest",
+    "donate_gold",
+    "donate_troops",
+    "move_warship",
+    "delete_unit",
+    "targetPlayer",
+  ]);
+
+  const stealthState = {
+    lastIntentMs: 0,
+    majorThisTick: 0,
+    tickOfCounter: -1,
+  };
+  runtime.state.stealth = stealthState;
+
+  function isMajorIntent(intent) {
+    return MAJOR_INTENT_TYPES.has(intent.type);
+  }
+
+  runtime._stealthBlocks = function (intent) {
+    const cfg = CONFIG.stealth;
+    if (!cfg.enabled || TEST_MODE) return false;
+    // Reset the per-tick counter when the tick advances.
+    if (stealthState.tickOfCounter !== runtime.hooks.tick) {
+      stealthState.tickOfCounter = runtime.hooks.tick;
+      stealthState.majorThisTick = 0;
+    }
+    const now = Date.now();
+    if (cfg.minIntentGapMs > 0 && now - stealthState.lastIntentMs < cfg.minIntentGapMs) {
+      // Never block spawn (single, critical) or the first major action a tick.
+      if (intent.type !== "spawn" && stealthState.majorThisTick > 0) return true;
+    }
+    if (isMajorIntent(intent) && stealthState.majorThisTick >= cfg.maxMajorPerTick) {
+      return true;
+    }
+    return false;
+  };
+
+  runtime._recordIntent = function (intent) {
+    stealthState.lastIntentMs = Date.now();
+    if (isMajorIntent(intent)) stealthState.majorThisTick++;
+  };
+
+  runtime.test.stealth = {
+    isMajorIntent,
+    state: stealthState,
+    blocks: (intent) => runtime._stealthBlocks(intent),
+    record: (intent) => runtime._recordIntent(intent),
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  J. OBSERVABILITY — compact UI overlay + decision log (browser only).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  function buildOverlay() {
+    if (TEST_MODE) return;
+    if (typeof document === "undefined" || !document.body) return;
+    if (document.getElementById("overlord-panel")) return;
+    const panel = document.createElement("div");
+    panel.id = "overlord-panel";
+    panel.innerHTML = `
+      <style>
+        #overlord-panel{position:fixed;top:10px;right:10px;width:300px;
+          background:rgba(10,12,24,.94);border:1px solid rgba(120,90,255,.4);
+          border-radius:10px;color:#dfe4f5;font-family:system-ui,sans-serif;
+          font-size:12px;z-index:2147483646;backdrop-filter:blur(12px);
+          box-shadow:0 8px 32px rgba(0,0,0,.5);overflow:hidden;user-select:none}
+        #overlord-panel .hd{background:linear-gradient(135deg,#2a1a52,#16182f);
+          padding:7px 11px;display:flex;justify-content:space-between;
+          align-items:center;cursor:move}
+        #overlord-panel .ti{font-weight:800;background:linear-gradient(90deg,#a78bfa,#6ea8ff);
+          -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+        #overlord-panel button{background:rgba(255,255,255,.07);
+          border:1px solid rgba(255,255,255,.14);color:#aab;border-radius:4px;
+          padding:1px 8px;font-size:11px;cursor:pointer}
+        #overlord-panel button.on{background:rgba(60,210,120,.2);color:#7fe8a0}
+        #overlord-panel .bd{padding:8px 11px;max-height:60vh;overflow:auto}
+        #overlord-panel .gl{font-size:14px;font-weight:700;color:#9fd0ff;margin-bottom:2px}
+        #overlord-panel .nt{font-size:10px;color:#8a93b8;margin-bottom:6px;word-break:break-word}
+        #overlord-panel .row{display:flex;justify-content:space-between;padding:1px 0;
+          border-bottom:1px solid rgba(255,255,255,.03)}
+        #overlord-panel .row span:first-child{color:#8893bb}
+        #overlord-panel .row span:last-child{font-weight:600;color:#cdd6f4}
+        #overlord-panel .lg{margin-top:6px;font-family:monospace;font-size:10px;
+          color:#8893bb;max-height:120px;overflow:auto;background:rgba(0,0,0,.25);
+          border-radius:4px;padding:4px 6px}
+        #overlord-panel .sec{font-size:9px;text-transform:uppercase;letter-spacing:1px;
+          color:#6b74a0;margin:7px 0 2px}
+      </style>
+      <div class="hd" id="overlord-drag">
+        <span class="ti">OVERLORD v${BOT_VERSION}</span>
+        <span><button id="overlord-tog" class="on">ON</button></span>
+      </div>
+      <div class="bd">
+        <div class="gl" id="overlord-goal">—</div>
+        <div class="nt" id="overlord-note"></div>
+        <div class="sec">Me</div>
+        <div class="row"><span>Tiles / Share</span><span id="overlord-tiles">—</span></div>
+        <div class="row"><span>Troops / Max</span><span id="overlord-troops">—</span></div>
+        <div class="row"><span>Gold</span><span id="overlord-gold">—</span></div>
+        <div class="row"><span>In / Out atk</span><span id="overlord-atk">—</span></div>
+        <div class="sec">World</div>
+        <div class="row"><span>Alive</span><span id="overlord-alive">—</span></div>
+        <div class="row"><span>Crown share</span><span id="overlord-crown">—</span></div>
+        <div class="row"><span>Threats</span><span id="overlord-threats">—</span></div>
+        <div class="row"><span>Intents s/c</span><span id="overlord-intents">—</span></div>
+        <div class="sec">Decisions</div>
+        <div class="lg" id="overlord-log"></div>
+      </div>`;
+    document.body.appendChild(panel);
+    const tog = document.getElementById("overlord-tog");
+    tog.addEventListener("click", () => {
+      runtime.enabled = !runtime.enabled;
+      tog.textContent = runtime.enabled ? "ON" : "OFF";
+      tog.className = runtime.enabled ? "on" : "";
+    });
+    makeDraggable(panel, document.getElementById("overlord-drag"));
+  }
+
+  function makeDraggable(el, handle) {
+    let ox = 0, oy = 0, drag = false;
+    handle.addEventListener("mousedown", (e) => {
+      drag = true;
+      ox = e.clientX - el.getBoundingClientRect().left;
+      oy = e.clientY - el.getBoundingClientRect().top;
+      e.preventDefault();
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!drag) return;
+      el.style.left = e.clientX - ox + "px";
+      el.style.top = e.clientY - oy + "px";
+      el.style.right = "auto";
+    });
+    document.addEventListener("mouseup", () => (drag = false));
+  }
+
+  function refreshOverlay() {
+    if (TEST_MODE || typeof document === "undefined") return;
+    const set = (id, v) => {
+      const e = document.getElementById(id);
+      if (e) e.textContent = v;
+    };
+    const w = runtime.world;
+    set("overlord-goal", runtime.planner.activeGoalId || "—");
+    if (w && w.me) {
+      const me = w.me;
+      set(
+        "overlord-tiles",
+        fmt(me.tiles) + " / " + (w.totals.myShare * 100).toFixed(1) + "%",
+      );
+      set("overlord-troops", fmtTroops(me.troops) + " / " + fmtTroops(me.maxTroops));
+      set("overlord-gold", fmt(me.gold));
+      set(
+        "overlord-atk",
+        fmtTroops(me.incomingTroops || 0) + " / " + fmtTroops(me.outgoingTroops || 0),
+      );
+      set("overlord-alive", String(w.totals.alivePlayers));
+      set("overlord-crown", (w.totals.crownShare * 100).toFixed(1) + "%");
+      const t = w.threats;
+      set(
+        "overlord-threats",
+        "inv " +
+          (t.activeInvaders || []).length +
+          " brew " +
+          (t.brewingInvaders || []).length +
+          (t.coalitionAgainstMe ? " COAL" : "") +
+          ((t.inboundNukes || []).length ? " ☢" + t.inboundNukes.length : ""),
+      );
+    }
+    set(
+      "overlord-intents",
+      runtime.state.intentsSent + " / " + runtime.state.intentsConfirmed,
+    );
+    const log = document.getElementById("overlord-log");
+    if (log) {
+      const recent = runtime.state.decisionLog.slice(-16);
+      log.textContent = recent.join("\n");
+      log.scrollTop = log.scrollHeight;
+    }
+  }
+
+  function installHotkeys() {
+    if (TEST_MODE || typeof document === "undefined") return;
+    document.addEventListener("keydown", (e) => {
+      const tag = (e.target && e.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "o" || e.key === "O") {
+        const p = document.getElementById("overlord-panel");
+        if (p) p.style.display = p.style.display === "none" ? "" : "none";
+      } else if (e.key === "b" || e.key === "B") {
+        runtime.enabled = !runtime.enabled;
+        const tog = document.getElementById("overlord-tog");
+        if (tog) {
+          tog.textContent = runtime.enabled ? "ON" : "OFF";
+          tog.className = runtime.enabled ? "on" : "";
+        }
+      }
+    });
+  }
+
+  function setupUI() {
+    if (TEST_MODE || typeof document === "undefined") return;
+    const boot = () => {
+      buildOverlay();
+      installHotkeys();
+      setInterval(refreshOverlay, 500);
+    };
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", boot);
+    } else {
+      boot();
+    }
+  }
+  setupUI();
 
 
   // ═══════════════════════════════════════════════════════════════════════
