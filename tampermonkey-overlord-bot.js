@@ -2695,6 +2695,79 @@
     return findOwnedTileOf(gameView, crown.smallID, 600);
   }
 
+  function nearestSiloTile(gameView, myPlayer) {
+    const silos =
+      safeCall(
+        () =>
+          myPlayer
+            .units(UnitType.MissileSilo)
+            .filter((u) => !safeCall(() => u.isUnderConstruction(), false)),
+        [],
+      ) || [];
+    if (silos.length === 0) return null;
+    return safeCall(() => silos[0].tile(), null);
+  }
+
+  /**
+   * Plan §3.6 — SAM-trajectory avoidance. Samples the straight-line flight
+   * path from `srcTile` (silo) to `dstTile` (target) and returns true if any
+   * non-allied enemy SAM's coverage radius (samRange(level)) intersects the
+   * path — i.e. the warhead would likely be intercepted. A straight-line
+   * proxy for the parabola is sufficient for SAM-proximity screening.
+   */
+  function enemySamInterceptsPath(gameView, srcTile, dstTile) {
+    if (srcTile == null || dstTile == null) return false;
+    const sx = safeCall(() => gameView.x(srcTile), 0);
+    const sy = safeCall(() => gameView.y(srcTile), 0);
+    const dx = safeCall(() => gameView.x(dstTile), 0) - sx;
+    const dy = safeCall(() => gameView.y(dstTile), 0) - sy;
+    const samples = 24;
+    for (let step = 0; step <= samples; step++) {
+      const t = step / samples;
+      const px = Math.round(sx + dx * t);
+      const py = Math.round(sy + dy * t);
+      if (!safeCall(() => gameView.isValidCoord(px, py), false)) continue;
+      const pt = gameView.ref(px, py);
+      const sams =
+        safeCall(
+          () =>
+            gameView.nearbyUnits(pt, MATH.MAX_SAM_RANGE, UnitType.SAMLauncher),
+          [],
+        ) || [];
+      for (const s of sams) {
+        const owner = safeCall(() => s.unit.owner(), null);
+        if (!owner) continue;
+        if (safeCall(() => owner.isMe(), false)) continue;
+        const mine = myP();
+        if (mine && safeCall(() => mine.isFriendly(owner), false)) continue;
+        const lvl = safeCall(() => s.unit.level(), 1);
+        const range = MATH.samRange(lvl);
+        const dsq = s.distSquared != null ? s.distSquared : range * range + 1;
+        if (dsq <= range * range) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Pick a crown-owned target tile whose flight path from our nearest silo is
+   * NOT covered by an enemy SAM. Samples several candidates. Returns
+   * { tile, clear }. `clear=false` means every sampled tile is SAM-covered.
+   */
+  function pickClearCrownTarget(gameView, myPlayer, crown) {
+    const src = nearestSiloTile(gameView, myPlayer);
+    let fallback = null;
+    for (let i = 0; i < 14; i++) {
+      const tile = findOwnedTileOf(gameView, crown.smallID, 1);
+      if (tile == null) continue;
+      if (fallback == null) fallback = tile;
+      if (!enemySamInterceptsPath(gameView, src, tile)) {
+        return { tile, clear: true };
+      }
+    }
+    return { tile: fallback, clear: false };
+  }
+
   function launchNukeAt(gameView, nukeType, targetTile) {
     // build_unit's tile is the target landing tile; engine picks nearest silo.
     return IO.sendBuild(nukeType, targetTile);
@@ -2702,15 +2775,24 @@
 
   function runNukeCrown(world, ctx) {
     const gameView = gv();
+    const myPlayer = myP();
     const crown = (ctx && ctx.crown) || myHostileCrown(world);
     if (!gameView || !crown) return runExpand(world);
-    const target = findCrownTargetTile(gameView, crown);
+    const choice = pickClearCrownTarget(gameView, myPlayer, crown);
     let launched = false;
-    if (target != null) {
+    if (choice.tile != null) {
+      if (!choice.clear) {
+        // The crown is SAM-walled on every sampled approach. Don't feed a lone
+        // warhead to their interceptors — SAM_OVERWHELM (3 atoms + a hydrogen)
+        // is the planner's answer once we can afford it. Hold and keep growing.
+        decisionLog("nuke crown: SAM-covered, holding for overwhelm");
+        runExpand(world);
+        return false;
+      }
       if (canAfford(world, GOLD.HYDRO)) {
-        launched = launchNukeAt(gameView, UnitType.HydrogenBomb, target);
+        launched = launchNukeAt(gameView, UnitType.HydrogenBomb, choice.tile);
       } else if (canAfford(world, GOLD.ATOM)) {
-        launched = launchNukeAt(gameView, UnitType.AtomBomb, target);
+        launched = launchNukeAt(gameView, UnitType.AtomBomb, choice.tile);
       }
       if (crown.id) IO.sendTargetPlayer(crown.id);
     }
@@ -2994,6 +3076,8 @@
   //  Test surface — scenario suite for planner goal selection.
   // ───────────────────────────────────────────────────────────────────────
 
+  runtime.test.enemySamInterceptsPath = enemySamInterceptsPath;
+  runtime.test.pickClearCrownTarget = pickClearCrownTarget;
   runtime.test.selectPrimaryGoal = selectPrimaryGoal;
   runtime.test.GOAL_SPECS = GOAL_SPECS;
   runtime.test.runModulesForTick = runModulesForTick;
