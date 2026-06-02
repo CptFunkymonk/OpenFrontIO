@@ -725,6 +725,26 @@
     window.WebSocket = Wrapped;
   }
 
+  function attachLocalBridge() {
+    if (typeof window === "undefined") return false;
+    if (runtime.hooks.localBridge) return true;
+    const bridge = window.__openFrontLocalTransport;
+    if (!bridge || bridge.isLocal !== true || typeof bridge.addMessageListener !== "function") {
+      return false;
+    }
+    runtime.hooks.localBridge = bridge;
+    runtime.hooks.isLocal = true;
+    try {
+      runtime.hooks._bridgeUnsub = bridge.addMessageListener((msg) => {
+        try {
+          handleServerMessage(msg);
+        } catch (_) {}
+      });
+    } catch (_) {}
+    botLog("Local transport bridge attached (singleplayer/replay).");
+    return true;
+  }
+
   function handleServerMessage(data) {
     if (!data || typeof data !== "object") return;
     if (data.type === "lobby_info") {
@@ -732,7 +752,8 @@
     } else if (data.type === "start") {
       runtime.hooks.gameStarted = true;
       runtime.hooks.tick = 0;
-      runtime.hooks.myClientID = data.myClientID || runtime.hooks.myClientID;
+      runtime.hooks.myClientID =
+        data.myClientID || data.clientID || runtime.hooks.myClientID;
       runtime.state.history = new Map();
       runtime.state._spawned = false;
       runtime.state._spawnSentTick = null;
@@ -769,6 +790,44 @@
     );
   }
 
+  // Scan an object's own properties (and one nested level) for a GameView-like
+  // object. The real client stores it nested, e.g. <attacks-display>.renderRoot.game.
+  function deepFindGameView(src) {
+    let names;
+    try {
+      names = Object.getOwnPropertyNames(src);
+    } catch (_) {
+      return null;
+    }
+    for (const k of names) {
+      let v;
+      try {
+        v = src[k];
+      } catch (_) {
+        continue;
+      }
+      if (isGameViewLike(v)) return v;
+      if (v && typeof v === "object") {
+        let childNames;
+        try {
+          childNames = Object.getOwnPropertyNames(v);
+        } catch (_) {
+          continue;
+        }
+        for (const ck of childNames) {
+          let cv;
+          try {
+            cv = v[ck];
+          } catch (_) {
+            continue;
+          }
+          if (isGameViewLike(cv)) return cv;
+        }
+      }
+    }
+    return null;
+  }
+
   function findGameView() {
     const cached = runtime.hooks.gameView;
     if (cached) {
@@ -777,51 +836,40 @@
     }
     if (typeof document === "undefined") return null;
 
-    // 1) canvas-attached references
-    try {
-      for (const c of document.querySelectorAll("canvas")) {
-        for (const key of Object.keys(c)) {
-          const val = c[key];
-          if (isGameViewLike(val)) {
-            runtime.hooks.gameView = val;
-            botLog("GameView found via canvas property");
-            return val;
-          }
-          if (val && typeof val === "object" && isGameViewLike(val.gameView)) {
-            runtime.hooks.gameView = val.gameView;
-            return val.gameView;
-          }
-        }
-      }
-    } catch (_) {}
-
-    // 2) window globals
+    // 1) window globals
     try {
       for (const key of ["__gameView", "gameView", "__gv", "game"]) {
         if (isGameViewLike(window[key])) {
           runtime.hooks.gameView = window[key];
-          botLog("GameView found on window." + key);
           return window[key];
         }
       }
     } catch (_) {}
 
-    // 3) walk DOM elements + shadow roots
+    // 2) canvases
+    try {
+      for (const c of document.querySelectorAll("canvas")) {
+        const v = deepFindGameView(c);
+        if (v) {
+          runtime.hooks.gameView = v;
+          botLog("GameView found via canvas");
+          return v;
+        }
+      }
+    } catch (_) {}
+
+    // 3) all elements + their shadow/render roots (lit components store the
+    //    GameView nested, e.g. el.renderRoot.game).
     try {
       for (const el of document.querySelectorAll("*")) {
-        const sources = el.shadowRoot ? [el, el.shadowRoot] : [el];
+        const sources = [el];
+        if (el.shadowRoot) sources.push(el.shadowRoot);
         for (const src of sources) {
-          for (const k of Object.getOwnPropertyNames(src)) {
-            const v = safeCall(() => src[k], null);
-            if (isGameViewLike(v)) {
-              runtime.hooks.gameView = v;
-              botLog("GameView found via DOM element");
-              return v;
-            }
-            if (v && typeof v === "object" && isGameViewLike(v.gameView)) {
-              runtime.hooks.gameView = v.gameView;
-              return v.gameView;
-            }
+          const v = deepFindGameView(src);
+          if (v) {
+            runtime.hooks.gameView = v;
+            botLog("GameView found via <" + (el.tagName || "el").toLowerCase() + ">");
+            return v;
           }
         }
       }
@@ -836,6 +884,14 @@
 
   // --- intent senders (Phase 7 adds the stealth gate in front of sendIntent) ---
   function rawSend(obj) {
+    // Singleplayer / replay: the client uses an in-process LocalServer and
+    // exposes window.__openFrontLocalTransport instead of a WebSocket. Route
+    // ClientMessages (e.g. {type:"intent", intent}) through that bridge.
+    const bridge = runtime.hooks.localBridge;
+    if (bridge && typeof bridge.send === "function") {
+      safeCall(() => bridge.send(obj), null);
+      return true;
+    }
     const sock = runtime.hooks.socket;
     if (!sock) return false;
     if (NativeWebSocket && sock.readyState !== NativeWebSocket.OPEN) {
@@ -1145,6 +1201,8 @@
 
   runtime.test.buildWorld = buildWorld;
   runtime.test.findGameView = findGameView;
+  runtime.test.attachLocalBridge = attachLocalBridge;
+  runtime._attachLocalBridge = attachLocalBridge;
   runtime._buildWorld = buildWorld;
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -3615,6 +3673,9 @@
       buildOverlay();
       installHotkeys();
       setInterval(refreshOverlay, 500);
+      // Singleplayer uses the local transport bridge (no WebSocket); poll for it.
+      attachLocalBridge();
+      setInterval(attachLocalBridge, 500);
     };
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", boot);
