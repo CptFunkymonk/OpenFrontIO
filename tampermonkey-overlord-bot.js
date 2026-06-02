@@ -1444,6 +1444,251 @@
 
 
   // ═══════════════════════════════════════════════════════════════════════
+  //  D. SIM — forward simulator (chess-engine-style lookahead).
+  //
+  //  A lightweight deterministic projector (NOT a full re-sim of the game). It
+  //  integrates the engine's exact troop-growth math forward, grows tiles by
+  //  measured velocity, and accrues gold by measured/known income. The planner
+  //  and threat engine query it to reason about FUTURE board states:
+  //    - when can a neighbour invade us viably?
+  //    - will the crown reach the win threshold before we can stop them?
+  //    - if we commit X troops now, what is our defensive trough?
+  //
+  //  All functions are pure over the inputs (no GameView calls), so they are
+  //  unit-tested directly.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const SIM = (function () {
+    const DEFAULT_HORIZON = 600; // ticks (~60s) default lookahead
+    const MAX_HORIZON = 1800; // hard cap for perf
+
+    /**
+     * Estimate a player's reserve fraction (troops they keep back rather than
+     * committing to attacks). We can't read enemy intent, so we use a typical
+     * Impossible-nation value; for ourselves the planner passes the real one.
+     */
+    function assumedReserveRatio(entry) {
+      if (!entry) return 0.35;
+      // Bots commit almost everything; humans/nations hold a reserve.
+      return entry.type === PlayerType.Bot ? 0.1 : 0.35;
+    }
+
+    /**
+     * Per-tick gold income estimate for a player. Prefer measured velocity
+     * (gold/min from history), fall back to the passive base rate.
+     */
+    function goldIncomePerTick(entry, gameConfigInfo) {
+      const perMin = entry.goldPerMin;
+      if (typeof perMin === "number" && perMin > 0) {
+        return perMin / 600;
+      }
+      const mult = (gameConfigInfo && gameConfigInfo.goldMultiplier) || 1;
+      return MATH.goldAdditionRate(entry.type, mult);
+    }
+
+    /**
+     * Project a single player forward `ticks` ticks. Tiles grow linearly by
+     * measured velocity (clamped to [0, totalLand]); maxTroops is recomputed
+     * from projected tiles each step; troops integrate via the exact
+     * troopIncrease math; gold accrues by income.
+     *
+     * @returns time series endpoints {troops, tiles, gold, maxTroops}
+     */
+    function projectPlayer(entry, ticks, ctx) {
+      ctx = ctx || {};
+      ticks = Math.min(Math.max(0, Math.floor(ticks)), MAX_HORIZON);
+      const type = entry.type;
+      const difficulty = ctx.difficulty || Difficulty.Medium;
+      const totalLand = ctx.totalLand || Infinity;
+      const cityLevelsSum = entry.cityLevelsSum || 0; // known only for self
+      const tilesPerTick = (entry.tilesPerMin || 0) / 600;
+      const goldPerTick = goldIncomePerTick(entry, {
+        goldMultiplier: ctx.goldMultiplier,
+      });
+
+      let troops = entry.troops || 0;
+      let tiles = entry.tiles || 0;
+      let gold = entry.gold || 0;
+
+      const maxAt = (tl) =>
+        ctx.maxTroopsOverride != null
+          ? ctx.maxTroopsOverride
+          : MATH.maxTroops({
+              tiles: Math.max(0, tl),
+              cityLevelsSum,
+              type,
+              difficulty,
+            });
+
+      // Step per tick (bounded by MAX_HORIZON). Cheap: a handful of players.
+      for (let i = 0; i < ticks; i++) {
+        tiles = Math.min(totalLand, Math.max(0, tiles + tilesPerTick));
+        const max = maxAt(tiles);
+        troops += MATH.troopIncrease({ troops, max, type, difficulty });
+        gold += goldPerTick;
+      }
+      return { troops, tiles, gold, maxTroops: maxAt(tiles) };
+    }
+
+    /** Convenience: a player's projected troops after `ticks`. */
+    function troopsAfter(entry, ticks, ctx) {
+      return projectPlayer(entry, ticks, ctx).troops;
+    }
+
+    /** A player's currently committable troops (above their assumed reserve). */
+    function committableTroops(entry, ctx) {
+      const max =
+        (ctx && ctx.maxTroopsOverride) ||
+        MATH.maxTroops({
+          tiles: entry.tiles || 0,
+          cityLevelsSum: entry.cityLevelsSum || 0,
+          type: entry.type,
+          difficulty: (ctx && ctx.difficulty) || Difficulty.Medium,
+        });
+      const reserve =
+        entry.reserveRatio != null
+          ? entry.reserveRatio
+          : assumedReserveRatio(entry);
+      return Math.max(0, (entry.troops || 0) - max * reserve);
+    }
+
+    /**
+     * How many ticks until `enemy` can invade `me` viably — i.e. their
+     * committable troops reach `factor`× my defending troops. Projects both
+     * forward tick-by-tick. Returns 0 if already true, Infinity if never
+     * within the horizon.
+     *
+     * factor defaults to 1.0 (the engine's max-conquest-speed saturation point
+     * vs a defender: atkTroops >= defenderTroops).
+     */
+    function ticksUntilInvadable(me, enemy, ctx) {
+      ctx = ctx || {};
+      const horizon = Math.min(ctx.horizon || DEFAULT_HORIZON, MAX_HORIZON);
+      const factor = ctx.factor != null ? ctx.factor : 1.0;
+      const difficulty = ctx.difficulty || Difficulty.Medium;
+      const totalLand = ctx.totalLand || Infinity;
+
+      // Local mutable copies.
+      let meTroops = me.troops || 0;
+      let meTiles = me.tiles || 0;
+      const meMax = (tl) =>
+        me.maxTroops != null && tl === (me.tiles || 0)
+          ? me.maxTroops
+          : MATH.maxTroops({
+              tiles: Math.max(0, tl),
+              cityLevelsSum: me.cityLevelsSum || 0,
+              type: me.type || PlayerType.Human,
+              difficulty,
+            });
+      const meTilesPerTick = (me.tilesPerMin || 0) / 600;
+
+      let enTroops = enemy.troops || 0;
+      let enTiles = enemy.tiles || 0;
+      const enReserve =
+        enemy.reserveRatio != null
+          ? enemy.reserveRatio
+          : assumedReserveRatio(enemy);
+      const enTilesPerTick = (enemy.tilesPerMin || 0) / 600;
+      const enMax = (tl) =>
+        MATH.maxTroops({
+          tiles: Math.max(0, tl),
+          cityLevelsSum: 0,
+          type: enemy.type || PlayerType.Human,
+          difficulty,
+        });
+
+      const enCommittable = () => Math.max(0, enTroops - enMax(enTiles) * enReserve);
+
+      if (enCommittable() >= meTroops * factor) return 0;
+
+      for (let t = 1; t <= horizon; t++) {
+        meTiles = Math.min(totalLand, Math.max(0, meTiles + meTilesPerTick));
+        enTiles = Math.min(totalLand, Math.max(0, enTiles + enTilesPerTick));
+        meTroops += MATH.troopIncrease({
+          troops: meTroops,
+          max: meMax(meTiles),
+          type: me.type || PlayerType.Human,
+          difficulty,
+        });
+        enTroops += MATH.troopIncrease({
+          troops: enTroops,
+          max: enMax(enTiles),
+          type: enemy.type || PlayerType.Human,
+          difficulty,
+        });
+        if (enCommittable() >= meTroops * factor) return t;
+      }
+      return Infinity;
+    }
+
+    /**
+     * Ticks until the crown reaches the win tile-threshold at their measured
+     * tile velocity. Infinity if not growing toward it.
+     */
+    function crownWinEta(world) {
+      const crown = world.threats && world.threats.crown;
+      if (!crown) return Infinity;
+      const winPct = MATH.percentageTilesOwnedToWin(world.gameConfig.isTeam);
+      const targetTiles = (winPct / 100) * world.totals.totalLand;
+      if (crown.tiles >= targetTiles) return 0;
+      const perTick = (crown.tilesPerMin || 0) / 600;
+      if (perTick <= 0) return Infinity;
+      return Math.ceil((targetTiles - crown.tiles) / perTick);
+    }
+
+    /**
+     * Given we want to commit `commitTroops` to an offensive action, compute
+     * our defensive trough and whether the most dangerous adjacent enemy could
+     * exploit it within their reaction window. Returns:
+     *   { trough, dangerousEnemy, safe, recommendedMax }
+     * where recommendedMax is the largest commit that keeps trough above the
+     * danger threshold.
+     */
+    function safeCommit(world, commitTroops, ctx) {
+      ctx = ctx || {};
+      const me = world.me;
+      if (!me) return { trough: 0, safe: false, recommendedMax: 0 };
+      const adjacents = (world.threats && world.threats.adjacentEnemies) || [];
+      // The biggest immediate striker among adjacent enemies.
+      let danger = null;
+      let dangerCommittable = 0;
+      for (const e of adjacents) {
+        const c = committableTroops(e, {
+          difficulty: world.gameConfig.difficulty,
+        });
+        if (c > dangerCommittable) {
+          dangerCommittable = c;
+          danger = e;
+        }
+      }
+      // We must keep enough troops that an adjacent enemy can't conquer us at
+      // max speed, i.e. keep troops >= dangerCommittable (the 1.0× point).
+      const defenseFloor = dangerCommittable;
+      const trough = (me.troops || 0) - commitTroops;
+      const safe = trough >= defenseFloor;
+      const recommendedMax = Math.max(0, (me.troops || 0) - defenseFloor);
+      return { trough, dangerousEnemy: danger, defenseFloor, safe, recommendedMax };
+    }
+
+    return {
+      DEFAULT_HORIZON,
+      MAX_HORIZON,
+      assumedReserveRatio,
+      goldIncomePerTick,
+      projectPlayer,
+      troopsAfter,
+      committableTroops,
+      ticksUntilInvadable,
+      crownWinEta,
+      safeCommit,
+    };
+  })();
+
+  runtime.sim = SIM;
+  runtime.test.sim = SIM;
+
+
+  // ═══════════════════════════════════════════════════════════════════════
   //  K. BOOTSTRAP
   // ═══════════════════════════════════════════════════════════════════════
 
