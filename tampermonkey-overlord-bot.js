@@ -563,6 +563,24 @@
   })();
 
   // ═══════════════════════════════════════════════════════════════════════
+  //  CONFIG (tunable levers — retuned in Phase 8)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const CONFIG = {
+    // World-model sampling.
+    historyMaxSamples: 64, // per-player ring buffer length
+    velocityWindowTicks: 300, // window for tiles/min & troops/min
+    ticksPerMinute: 600, // 10 ticks/sec * 60
+
+    // Stealth (Phase 7) — placeholders; populated later.
+    stealth: {
+      enabled: true,
+      minIntentGapMs: 90,
+      maxMajorPer2s: 6,
+    },
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════
   //  RUNTIME (grows across phases). Exposed on window for tests/devtools.
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -571,16 +589,37 @@
     enabled: true,
     testMode: TEST_MODE,
     math: MATH,
+    config: CONFIG,
     enums: { UnitType, PlayerType, Difficulty, TerrainType },
-    // Filled in by later phases:
+
     world: null,
     planner: { activeGoalId: null },
-    hooks: { socket: null, gameView: null, myClientID: null },
-    state: {},
-    // Test surface (scenario suite wired in Phase 6).
+    hooks: {
+      socket: null,
+      gameView: null,
+      myClientID: null,
+      gameStarted: false,
+      tick: 0,
+    },
+    state: {
+      history: new Map(), // smallID -> [{tick, tiles, troops, gold}]
+      cooldowns: {},
+      intentsSent: 0,
+      intentsConfirmed: 0,
+      lastIntentSignature: null,
+      log: [],
+      decisionLog: [],
+      processing: false,
+    },
+    stats: {
+      gameConfigCache: null,
+    },
     test: {
       math: MATH,
-      runSuite: null,
+      runSuite: null, // wired in Phase 6
+      // exposed so tests can drive modules without a live socket:
+      buildWorld: null,
+      findGameView: null,
     },
   };
 
@@ -589,16 +628,526 @@
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  //  K. BOOTSTRAP (minimal for Phase 1 — full loop wired in later phases)
+  //  SHARED HELPERS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  function safeCall(fn, fallback) {
+    try {
+      const v = fn();
+      return v === undefined ? fallback : v;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function fmt(n) {
+    if (n == null) return "0";
+    n = Number(n);
+    const sign = n < 0 ? "-" : "";
+    n = Math.abs(n);
+    if (n >= 1e9) return sign + (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return sign + (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return sign + (n / 1e3).toFixed(1) + "K";
+    return sign + String(Math.round(n));
+  }
+
+  function fmtTroops(n) {
+    return fmt(Number(n || 0) / TROOP_DISPLAY_DIVISOR);
+  }
+
+  function botLog(msg) {
+    const entry = "[Overlord] " + msg;
+    runtime.state.log.push(entry);
+    if (runtime.state.log.length > 300) runtime.state.log.shift();
+    if (!TEST_MODE && typeof console !== "undefined") console.log(entry);
+  }
+
+  function decisionLog(msg) {
+    const entry = "T" + runtime.hooks.tick + " " + msg;
+    runtime.state.decisionLog.push(entry);
+    if (runtime.state.decisionLog.length > 200)
+      runtime.state.decisionLog.shift();
+  }
+
+  function isStructureType(t) {
+    return STRUCTURE_SET.has(t);
+  }
+  function isNukeType(t) {
+    return NUKE_SET.has(t);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  A. NET / IO — WebSocket hook, message router, GameView discovery,
+  //     intent senders. (Intent gate/stealth attaches in Phase 7.)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const NativeWebSocket =
+    typeof window !== "undefined" ? window.WebSocket : null;
+
+  function installWebSocketHook() {
+    if (typeof window === "undefined" || !window.WebSocket) return;
+    const Native = window.WebSocket;
+    function Wrapped(url, protocols) {
+      const ws = protocols ? new Native(url, protocols) : new Native(url);
+      const urlStr = typeof url === "string" ? url : String(url);
+      const isGameSocket =
+        !urlStr.includes("/lobbies") && !urlStr.includes("/matchmaking");
+      if (isGameSocket) {
+        botLog("Game socket intercepted: " + urlStr);
+        runtime.hooks.socket = ws;
+        ws.addEventListener("message", (event) => {
+          let data;
+          try {
+            data = JSON.parse(event.data);
+          } catch (_) {
+            return; // binary / non-JSON
+          }
+          handleServerMessage(data);
+        });
+        ws.addEventListener("close", () => {
+          if (runtime.hooks.socket === ws) {
+            runtime.hooks.socket = null;
+            runtime.hooks.gameStarted = false;
+            botLog("Game socket closed");
+          }
+        });
+      }
+      return ws;
+    }
+    Wrapped.prototype = Native.prototype;
+    for (const k of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) {
+      try {
+        Object.defineProperty(Wrapped, k, { value: Native[k] });
+      } catch (_) {}
+    }
+    window.WebSocket = Wrapped;
+  }
+
+  function handleServerMessage(data) {
+    if (!data || typeof data !== "object") return;
+    if (data.type === "lobby_info") {
+      runtime.hooks.myClientID = data.myClientID || runtime.hooks.myClientID;
+    } else if (data.type === "start") {
+      runtime.hooks.gameStarted = true;
+      runtime.hooks.tick = 0;
+      runtime.hooks.myClientID = data.myClientID || runtime.hooks.myClientID;
+      runtime.state.history = new Map();
+      botLog("Game started. clientID=" + runtime.hooks.myClientID);
+    } else if (data.type === "turn") {
+      const turn = data.turn || {};
+      if (typeof turn.turnNumber === "number")
+        runtime.hooks.tick = turn.turnNumber;
+      if (Array.isArray(turn.intents)) {
+        for (const intent of turn.intents) {
+          if (intent && intent.clientID === runtime.hooks.myClientID) {
+            runtime.state.intentsConfirmed++;
+          }
+        }
+      }
+      // Phase 6 wires the planner here. Until then this is a no-op tick.
+      if (typeof runtime._onTurn === "function") {
+        safeCall(() => runtime._onTurn(), null);
+      }
+    }
+  }
+
+  // --- GameView discovery (multi-strategy, validated). ---
+  function isGameViewLike(v) {
+    return (
+      v &&
+      typeof v === "object" &&
+      typeof v.ticks === "function" &&
+      typeof v.myPlayer === "function" &&
+      (typeof v.playerViews === "function" || typeof v.players === "function")
+    );
+  }
+
+  function findGameView() {
+    const cached = runtime.hooks.gameView;
+    if (cached) {
+      if (safeCall(() => (cached.ticks(), true), false)) return cached;
+      runtime.hooks.gameView = null;
+    }
+    if (typeof document === "undefined") return null;
+
+    // 1) canvas-attached references
+    try {
+      for (const c of document.querySelectorAll("canvas")) {
+        for (const key of Object.keys(c)) {
+          const val = c[key];
+          if (isGameViewLike(val)) {
+            runtime.hooks.gameView = val;
+            botLog("GameView found via canvas property");
+            return val;
+          }
+          if (val && typeof val === "object" && isGameViewLike(val.gameView)) {
+            runtime.hooks.gameView = val.gameView;
+            return val.gameView;
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 2) window globals
+    try {
+      for (const key of ["__gameView", "gameView", "__gv", "game"]) {
+        if (isGameViewLike(window[key])) {
+          runtime.hooks.gameView = window[key];
+          botLog("GameView found on window." + key);
+          return window[key];
+        }
+      }
+    } catch (_) {}
+
+    // 3) walk DOM elements + shadow roots
+    try {
+      for (const el of document.querySelectorAll("*")) {
+        const sources = el.shadowRoot ? [el, el.shadowRoot] : [el];
+        for (const src of sources) {
+          for (const k of Object.getOwnPropertyNames(src)) {
+            const v = safeCall(() => src[k], null);
+            if (isGameViewLike(v)) {
+              runtime.hooks.gameView = v;
+              botLog("GameView found via DOM element");
+              return v;
+            }
+            if (v && typeof v === "object" && isGameViewLike(v.gameView)) {
+              runtime.hooks.gameView = v.gameView;
+              return v.gameView;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  function getGameView() {
+    return findGameView();
+  }
+
+  // --- intent senders (Phase 7 adds the stealth gate in front of sendIntent) ---
+  function rawSend(obj) {
+    const sock = runtime.hooks.socket;
+    if (!sock) return false;
+    if (NativeWebSocket && sock.readyState !== NativeWebSocket.OPEN) {
+      // In harness, FakeWebSocket.OPEN === 1 and readyState === 1.
+      if (sock.readyState !== 1) return false;
+    }
+    safeCall(() => sock.send(JSON.stringify(obj)), null);
+    return true;
+  }
+
+  function sendIntent(intent) {
+    if (!runtime.enabled) return false;
+    const signature = intent.type + ":" + JSON.stringify(intent);
+    if (runtime.state.lastIntentSignature === signature) return false;
+    // Phase 7: stealth gate hook.
+    if (typeof runtime._stealthBlocks === "function") {
+      if (runtime._stealthBlocks(intent)) return false;
+    }
+    const ok = rawSend({ type: "intent", intent });
+    if (ok) {
+      runtime.state.intentsSent++;
+      runtime.state.lastIntentSignature = signature;
+      if (typeof runtime._recordIntent === "function")
+        safeCall(() => runtime._recordIntent(intent), null);
+      decisionLog("SENT " + intent.type);
+    }
+    return ok;
+  }
+
+  const IO = {
+    sendSpawn: (tile) => sendIntent({ type: "spawn", tile }),
+    sendAttack: (targetID, troops) =>
+      sendIntent({
+        type: "attack",
+        targetID: targetID,
+        troops: Math.max(1, Math.floor(troops)),
+      }),
+    sendBoat: (dst, troops) =>
+      sendIntent({
+        type: "boat",
+        troops: Math.max(1, Math.floor(troops)),
+        dst,
+      }),
+    sendBuild: (unit, tile, rocketDirectionUp) => {
+      const intent = { type: "build_unit", unit, tile };
+      if (rocketDirectionUp !== undefined)
+        intent.rocketDirectionUp = rocketDirectionUp;
+      return sendIntent(intent);
+    },
+    sendUpgrade: (unitId, unit) =>
+      sendIntent({ type: "upgrade_structure", unit, unitId }),
+    sendAllianceRequest: (recipient) =>
+      sendIntent({ type: "allianceRequest", recipient }),
+    sendAllianceReject: (requestor) =>
+      sendIntent({ type: "allianceReject", requestor }),
+    sendBreakAlliance: (recipient) =>
+      sendIntent({ type: "breakAlliance", recipient }),
+    sendAllianceExtension: (recipient) =>
+      sendIntent({ type: "allianceExtension", recipient }),
+    sendTargetPlayer: (target) => sendIntent({ type: "targetPlayer", target }),
+    sendEmbargo: (targetID, action) =>
+      sendIntent({ type: "embargo", targetID, action }),
+    sendEmbargoAll: (action) => sendIntent({ type: "embargo_all", action }),
+    sendDonateGold: (recipient, gold) =>
+      sendIntent({ type: "donate_gold", recipient, gold: Math.floor(gold) }),
+    sendDonateTroops: (recipient, troops) =>
+      sendIntent({
+        type: "donate_troops",
+        recipient,
+        troops: Math.floor(troops),
+      }),
+    sendCancelAttack: (attackID) =>
+      sendIntent({ type: "cancel_attack", attackID }),
+    sendCancelBoat: (unitID) => sendIntent({ type: "cancel_boat", unitID }),
+    sendMoveWarship: (unitId, tile) =>
+      sendIntent({ type: "move_warship", unitId, tile }),
+    sendDeleteUnit: (unitId) => sendIntent({ type: "delete_unit", unitId }),
+  };
+  runtime.io = IO;
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  C. WORLD — per-tick snapshot of the board (shares, velocities,
+  //     alliance graph, rankings). Threats (E) augment this in Phase 5.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  function getGameConfigInfo(gameView) {
+    // Difficulty / team-mode / goldMultiplier from the live config when present.
+    const cfg = safeCall(() => gameView.config(), null);
+    const gc = cfg ? safeCall(() => cfg.gameConfig(), null) : null;
+    return {
+      difficulty: (gc && gc.difficulty) || Difficulty.Medium,
+      isTeam:
+        gc && gc.gameMode
+          ? gc.gameMode === "Team" || gc.gameMode === "team"
+          : false,
+      goldMultiplier: (gc && gc.goldMultiplier) || 1,
+    };
+  }
+
+  function cityLevelsSum(player) {
+    const cities = safeCall(() => player.units(UnitType.City), []) || [];
+    let sum = 0;
+    for (const c of cities) {
+      if (safeCall(() => c.isUnderConstruction(), false)) continue;
+      sum += safeCall(() => c.level(), 1);
+    }
+    return sum;
+  }
+
+  function countStructures(player) {
+    const counts = {};
+    const levels = {};
+    for (const t of STRUCTURE_TYPES) {
+      const units = safeCall(() => player.units(t), []) || [];
+      let n = 0;
+      let lvl = 0;
+      for (const u of units) {
+        if (safeCall(() => u.isUnderConstruction(), false)) continue;
+        n++;
+        lvl += safeCall(() => u.level(), 1);
+      }
+      counts[t] = n;
+      levels[t] = lvl;
+    }
+    return { counts, levels };
+  }
+
+  function sumAttackTroops(attacks) {
+    let s = 0;
+    if (!attacks) return 0;
+    for (const a of attacks) s += a.troops || 0;
+    return s;
+  }
+
+  function recordHistory(smallID, tick, tiles, troops, gold) {
+    let arr = runtime.state.history.get(smallID);
+    if (!arr) {
+      arr = [];
+      runtime.state.history.set(smallID, arr);
+    }
+    arr.push({ tick, tiles, troops, gold });
+    if (arr.length > CONFIG.historyMaxSamples) arr.shift();
+  }
+
+  function velocity(smallID, tick, field) {
+    const arr = runtime.state.history.get(smallID);
+    if (!arr || arr.length < 2) return 0;
+    // Find oldest sample within the velocity window.
+    let oldest = arr[0];
+    for (const s of arr) {
+      if (tick - s.tick <= CONFIG.velocityWindowTicks) {
+        oldest = s;
+        break;
+      }
+    }
+    const last = arr[arr.length - 1];
+    const dt = last.tick - oldest.tick;
+    if (dt <= 0) return 0;
+    return ((last[field] - oldest[field]) / dt) * CONFIG.ticksPerMinute;
+  }
+
+  /**
+   * Build the world snapshot from a (live or mock) GameView. Pure w.r.t. the
+   * gameView; mutates runtime.state.history for velocity tracking.
+   */
+  function buildWorld(gameView) {
+    if (!gameView) return null;
+    const tick = safeCall(() => gameView.ticks(), runtime.hooks.tick) || 0;
+    const gcInfo = getGameConfigInfo(gameView);
+    const myPlayer = safeCall(() => gameView.myPlayer(), null);
+
+    const playersRaw =
+      safeCall(() => gameView.playerViews(), null) ||
+      safeCall(() => gameView.players(), []) ||
+      [];
+    const players = playersRaw.filter((p) => safeCall(() => p.isAlive(), false));
+
+    const totalLand = Math.max(1, safeCall(() => gameView.numLandTiles(), 1));
+
+    let humanCount = 0;
+    let nationCount = 0;
+    let botCount = 0;
+
+    const everyone = [];
+    const bySmallID = new Map();
+
+    for (const p of players) {
+      const smallID = safeCall(() => p.smallID(), -1);
+      const type = safeCall(() => p.type(), PlayerType.Human);
+      if (type === PlayerType.Human) humanCount++;
+      else if (type === PlayerType.Nation) nationCount++;
+      else if (type === PlayerType.Bot) botCount++;
+
+      const tiles = safeCall(() => p.numTilesOwned(), 0);
+      const troops = safeCall(() => p.troops(), 0);
+      const gold = Number(safeCall(() => p.gold(), 0) || 0);
+      const isMe = myPlayer
+        ? safeCall(() => p.smallID() === myPlayer.smallID(), false)
+        : false;
+      const isAlly =
+        myPlayer && !isMe
+          ? safeCall(() => myPlayer.isFriendly(p), false)
+          : false;
+
+      recordHistory(smallID, tick, tiles, troops, gold);
+
+      const entry = {
+        player: p,
+        smallID,
+        id: safeCall(() => p.id(), null),
+        name: safeCall(() => p.name(), "?"),
+        type,
+        team: safeCall(() => p.team(), null),
+        isMe,
+        isAlly,
+        isEnemy: !isMe && !isAlly,
+        tiles,
+        troops,
+        gold,
+        share: tiles / totalLand,
+        tilesPerMin: velocity(smallID, tick, "tiles"),
+        troopsPerMin: velocity(smallID, tick, "troops"),
+        isTraitor: safeCall(() => p.isTraitor(), false),
+        isDisconnected: safeCall(() => p.isDisconnected(), false),
+        incomingAttacks: safeCall(() => p.incomingAttacks(), []) || [],
+        outgoingAttacks: safeCall(() => p.outgoingAttacks(), []) || [],
+        allianceCount: safeCall(() => (p.alliances() || []).length, 0),
+      };
+      entry.incomingTroops = sumAttackTroops(entry.incomingAttacks);
+      entry.outgoingTroops = sumAttackTroops(entry.outgoingAttacks);
+      everyone.push(entry);
+      bySmallID.set(smallID, entry);
+    }
+
+    // me summary (with structures + maxTroops via MATH)
+    let me = null;
+    if (myPlayer) {
+      const mySid = safeCall(() => myPlayer.smallID(), -1);
+      const meEntry = bySmallID.get(mySid);
+      const { counts, levels } = countStructures(myPlayer);
+      const cls = cityLevelsSum(myPlayer);
+      const maxTroops =
+        safeCall(() => gameView.config().maxTroops(myPlayer), 0) ||
+        MATH.maxTroops({
+          tiles: meEntry ? meEntry.tiles : 0,
+          cityLevelsSum: cls,
+          type: PlayerType.Human,
+          difficulty: gcInfo.difficulty,
+        });
+      me = Object.assign({}, meEntry, {
+        maxTroops,
+        troopRatio: maxTroops > 0 ? meEntry.troops / maxTroops : 0,
+        structures: counts,
+        structureLevels: levels,
+        cityLevelsSum: cls,
+      });
+      bySmallID.set(mySid, me);
+    }
+
+    // totals / shares
+    const sortedByTiles = everyone.slice().sort((a, b) => b.tiles - a.tiles);
+    const sortedByTroops = everyone.slice().sort((a, b) => b.troops - a.troops);
+    const crown = sortedByTiles[0] || null;
+    const second = sortedByTiles[1] || null;
+    const myShare = me ? me.share : 0;
+
+    const world = {
+      tick,
+      gameConfig: gcInfo,
+      me,
+      meSmallID: me ? me.smallID : -1,
+      everyone,
+      bySmallID,
+      totals: {
+        alivePlayers: players.length,
+        humanCount,
+        nationCount,
+        botCount,
+        totalLand,
+        myShare,
+        crownShare: crown ? crown.share : 0,
+        secondShare: second ? second.share : 0,
+      },
+      rankings: {
+        byTiles: sortedByTiles,
+        byTroops: sortedByTroops,
+      },
+      // Augmented by the threat engine (Phase 5).
+      threats: {
+        crown,
+        crownSmallID: crown ? crown.smallID : null,
+        risingStars: [],
+        adjacentEnemies: [],
+        activeInvaders: [],
+        brewingInvaders: [],
+        inboundNukes: [],
+        inboundBoats: [],
+        coalitionAgainstMe: false,
+      },
+      allianceGraph: { edges: new Map(), coalitionThreat: false },
+    };
+    return world;
+  }
+
+  runtime.test.buildWorld = buildWorld;
+  runtime.test.findGameView = findGameView;
+  runtime._buildWorld = buildWorld;
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  K. BOOTSTRAP
   // ═══════════════════════════════════════════════════════════════════════
 
   function init() {
-    // Net/IO + UI + loop are installed in later phases. For now we only
-    // expose the runtime so the math-parity tests can run. In a real browser
-    // (non-test) we log readiness.
+    installWebSocketHook();
     if (!TEST_MODE && typeof console !== "undefined") {
-      console.log("[Overlord] v" + BOT_VERSION + " math module loaded.");
+      botLog("v" + BOT_VERSION + " loaded (Phase 2: net/IO + world model).");
     }
+    // The per-tick planner loop is wired in Phase 6. We do not start any
+    // setInterval until then; turns drive the brain via runtime._onTurn.
   }
 
   init();
