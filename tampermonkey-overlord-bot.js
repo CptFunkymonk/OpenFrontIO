@@ -1229,24 +1229,17 @@
      * aggressively while small instead of hoarding behind a high reserve.
      */
     function reserveForExpansion(world) {
+      // Returns the fraction of CURRENT troops to KEEP home as a standing
+      // defensive army; we expand with the rest. Using current troops (not the
+      // pop cap) lets us both expand early (avoids the under-expansion trap)
+      // AND never leave ourselves defenceless (the glass-cannon failure).
       const me = world.me;
-      if (!me) return 0.3;
-      const ratio = me.troopRatio;
-      const share = world.totals.myShare;
-
-      let reserve = 0.15;
-      if (share < 0.05) reserve = 0.08;
-      else if (share < 0.1) reserve = 0.1;
-      else if (share < 0.25) reserve = 0.15;
-      else reserve = 0.22;
-
+      if (!me) return 0.25;
       const pressure = me.incomingTroops / Math.max(1, me.troops);
-      if (pressure > 0.5) reserve = Math.max(reserve, 0.4);
-      else if (pressure > 0.25) reserve = Math.max(reserve, 0.3);
-
-      if (ratio < 0.15) reserve = Math.max(reserve, 0.25);
-
-      return clamp01(reserve, 0.05, 0.7);
+      let reserve = 0.18; // keep 18% of cap home; commit the surplus to land
+      if (pressure > 0.5) reserve = Math.max(reserve, 0.5);
+      else if (pressure > 0.25) reserve = Math.max(reserve, 0.35);
+      return clamp01(reserve, 0.12, 0.75);
     }
 
     /**
@@ -1254,21 +1247,22 @@
      * troops can be lost to retreat/over-extension; we keep a defensive pool.
      */
     function reserveForCombat(world) {
+      // Fraction of CURRENT troops to keep home when committing a PvP attack.
       const me = world.me;
       if (!me) return 0.35;
-      const ratio = me.troopRatio;
       const share = world.totals.myShare;
-
-      let reserve = 0.35;
-      if (ratio < 0.2) reserve = 0.5;
-      else if (ratio < 0.4) reserve = 0.42;
-      else if (ratio > 0.8) reserve = 0.25;
-
-      if (share > 0.4) reserve = Math.min(reserve, 0.25);
-      return clamp01(reserve, 0.12, 0.7);
+      const pressure = me.incomingTroops / Math.max(1, me.troops);
+      let reserve = 0.35; // keep 35% of cap home when committing PvP attacks
+      if (pressure > 0.4) reserve = Math.max(reserve, 0.45);
+      if (share > 0.4) reserve = Math.min(reserve, 0.3);
+      return clamp01(reserve, 0.2, 0.7);
     }
 
     function availableTroops(world, reserveRatio) {
+      // Keep reserveRatio * pop-cap home. Crucially this floors our standing
+      // army at a fraction of the CAP (which grows with territory), so repeated
+      // expansion can't drain us to zero (the glass-cannon death) — once troops
+      // fall to the reserve we stop until they regenerate.
       const me = world.me;
       if (!me) return 0;
       return Math.floor(me.troops - me.maxTroops * reserveRatio);
@@ -1813,7 +1807,7 @@
         const eta = SIM.ticksUntilInvadable(me, e, ctx);
         // Accumulating (or already capable) and a real contender.
         const accumulating = (e.troopsPerMin || 0) >= 0;
-        const contender = e.troops >= me.troops * 0.8;
+        const contender = e.troops >= me.troops * 1.1;
         if (eta < BREW_HORIZON && accumulating && contender) {
           brewing.push({ entry: e, etaTicks: eta, smallID: e.smallID, name: e.name, id: e.id, troops: e.troops, troopsPerMin: e.troopsPerMin });
         }
@@ -2552,6 +2546,8 @@
       evaluate: (world) => {
         const me = world.me;
         if (!me) return { valid: false };
+        // Pre-crown SAM walls only matter in a real multi-player nuke era.
+        if (world.totals.alivePlayers < 5) return { valid: false };
         const share = world.totals.myShare;
         if (share < 0.2 || share > 0.35) return { valid: false };
         const cities = (me.structures || {})[UnitType.City] || 0;
@@ -2630,11 +2626,11 @@
         if (!me) return { valid: false };
         if (!scanOf(world).bordersTN) return { valid: false };
         if (TACTICS.expansionTroops(world) <= 0) return { valid: false };
+        const lastExpand = runtime.state.cooldowns.expand || -999;
+        if (world.tick - lastExpand < 5) return { valid: false };
         const share = world.totals.myShare;
-        let priority = 62;
-        if (share < 0.05) priority += 15;
-        else if (share < 0.1) priority += 10;
-        else if (share < 0.25) priority += 5;
+        let priority = 76; // win the land-grab race; yields to REPEL/CONSOLIDATE (86+)
+        if (share < 0.05) priority += 6;
         return { valid: true, priority, note: "expand TN (share " + (share * 100).toFixed(1) + "%)" };
       },
       run: (world) => runExpand(world),
@@ -2654,7 +2650,7 @@
         const noFrontier = !scanOf(world).bordersTN;
         return {
           valid: true,
-          priority: noFrontier ? 66 : 58,
+          priority: noFrontier ? 84 : 58,
           note: "attack " + pick.entry.name + " (" + pick.reason + ")",
           context: { pick, troops },
         };
@@ -2714,6 +2710,7 @@
   function runExpand(world) {
     const troops = TACTICS.expansionTroops(world);
     if (troops <= 0) return false;
+    runtime.state.cooldowns.expand = world.tick;
     return IO.sendAttack(null, troops);
   }
 
@@ -3076,7 +3073,8 @@
   }
 
   function runIdle(world) {
-    if (scanOf(world).bordersTN) return runExpand(world);
+    // Hold and let troops regenerate; expansion is driven by EXPAND_RUSH only
+    // (gated by reserve + cooldown) so we never dribble our army into TN.
     return false;
   }
 

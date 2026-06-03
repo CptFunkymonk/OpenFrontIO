@@ -76,7 +76,7 @@ function makeWorld(opts: any) {
 }
 
 describe("TACTICS sizing", () => {
-  it("expands aggressively while small (low reserve, high commit)", () => {
+  it("expands while small but keeps a standing defensive army", () => {
     const me = {
       smallID: 1,
       troops: 100000,
@@ -89,11 +89,14 @@ describe("TACTICS sizing", () => {
     };
     const world = makeWorld({ me, myShare: 0.03 });
     const reserve = TACTICS.reserveForExpansion(world);
-    expect(reserve).toBeLessThanOrEqual(0.1); // tiny player -> thin reserve
+    // Cap-based reserve: keep a fraction of the pop-cap home so repeated
+    // expansion can't drain the army to zero (the glass-cannon failure).
+    expect(reserve).toBeGreaterThanOrEqual(0.15);
+    expect(reserve).toBeLessThanOrEqual(0.3);
     const troops = TACTICS.expansionTroops(world);
-    // available = 100000 - 200000*reserve. With reserve 0.08 -> 84000.
     expect(troops).toBe(Math.floor(100000 - 200000 * reserve));
-    expect(troops).toBeGreaterThan(80000);
+    expect(troops).toBeGreaterThan(0);
+    expect(troops).toBeLessThan(100000); // never commit everything
   });
 
   it("holds more in reserve under invasion pressure", () => {
@@ -108,7 +111,7 @@ describe("TACTICS sizing", () => {
       gold: 0,
     };
     const world = makeWorld({ me, myShare: 0.03 });
-    expect(TACTICS.reserveForExpansion(world)).toBeGreaterThanOrEqual(0.4);
+    expect(TACTICS.reserveForExpansion(world)).toBeGreaterThanOrEqual(0.5);
   });
 
   it("sizes a player attack at the optimal saturation point", () => {
