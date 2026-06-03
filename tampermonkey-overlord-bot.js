@@ -1236,10 +1236,15 @@
       const me = world.me;
       if (!me) return 0.25;
       const pressure = me.incomingTroops / Math.max(1, me.troops);
-      let reserve = 0.32; // keep 32% of cap home -> higher troop density to hold
+      const share = world.totals.myShare;
+      let reserve;
+      if (share < 0.03) reserve = 0.12; // tiny: claim space before we're boxed in
+      else if (share < 0.08) reserve = 0.2;
+      else if (share < 0.2) reserve = 0.28;
+      else reserve = 0.35; // established: keep density to hold
       if (pressure > 0.5) reserve = Math.max(reserve, 0.55);
       else if (pressure > 0.25) reserve = Math.max(reserve, 0.42);
-      return clamp01(reserve, 0.2, 0.75);
+      return clamp01(reserve, 0.1, 0.75);
     }
 
     /**
@@ -2673,8 +2678,9 @@
         if (!scanOf(world).bordersTN) return { valid: false };
         if (TACTICS.expansionTroops(world) <= 0) return { valid: false };
         const lastExpand = runtime.state.cooldowns.expand || -999;
-        if (world.tick - lastExpand < 18) return { valid: false };
         const share = world.totals.myShare;
+        const expandGap = share < 0.1 ? 6 : 18;
+        if (world.tick - lastExpand < expandGap) return { valid: false };
         let priority = 76; // win the land-grab race; yields to REPEL/CONSOLIDATE (86+)
         if (share < 0.05) priority += 6;
         return { valid: true, priority, note: "expand TN (share " + (share * 100).toFixed(1) + "%)" };
@@ -3265,10 +3271,11 @@
     ]);
     const allyCount = world.everyone.filter((p) => p.isAlly && !p.isMe).length;
     const lastReq = runtime.state.cooldowns.allianceReq || -99999;
+    const wantAllies = world.totals.alivePlayers > 4 ? 3 : 2;
     if (
       PEACEFUL_GOALS.has(runtime.planner.activeGoalId) &&
-      allyCount < 2 &&
-      world.tick - lastReq > 300
+      allyCount < wantAllies &&
+      world.tick - lastReq > 150
     ) {
       const target = DIPLO.pickAllianceRequestTarget(world);
       if (target && target.id) {
@@ -3317,7 +3324,11 @@
           else enemyNear++;
         }
       }
-      const score = room * 2 - enemyNear * 3;
+      const w0 = safeCall(() => gameView.width(), 100);
+      const h0 = safeCall(() => gameView.height(), 100);
+      const edgeDist = Math.min(x, y, w0 - 1 - x, h0 - 1 - y);
+      const edgeBonus = edgeDist < 8 ? 6 : edgeDist < 20 ? 3 : 0;
+      const score = room * 2 - enemyNear * 4 + edgeBonus;
       if (score > bestScore) {
         bestScore = score;
         best = ref;

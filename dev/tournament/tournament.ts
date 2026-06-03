@@ -302,7 +302,7 @@ async function runOneGame(
     mapName,
     {
       gameMap: GameMapType.Asia, // overridden by mapName file load
-      difficulty: Difficulty.Impossible,
+      difficulty: (Difficulty as any)[process.env.DIFF || "Impossible"] || Difficulty.Impossible,
       gameMode: GameMode.FFA,
       gameType: GameType.Singleplayer,
       nations: "disabled",
