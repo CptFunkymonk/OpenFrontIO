@@ -1236,10 +1236,10 @@
       const me = world.me;
       if (!me) return 0.25;
       const pressure = me.incomingTroops / Math.max(1, me.troops);
-      let reserve = 0.18; // keep 18% of cap home; commit the surplus to land
-      if (pressure > 0.5) reserve = Math.max(reserve, 0.5);
-      else if (pressure > 0.25) reserve = Math.max(reserve, 0.35);
-      return clamp01(reserve, 0.12, 0.75);
+      let reserve = 0.32; // keep 32% of cap home -> higher troop density to hold
+      if (pressure > 0.5) reserve = Math.max(reserve, 0.55);
+      else if (pressure > 0.25) reserve = Math.max(reserve, 0.42);
+      return clamp01(reserve, 0.2, 0.75);
     }
 
     /**
@@ -2666,7 +2666,7 @@
         if (!scanOf(world).bordersTN) return { valid: false };
         if (TACTICS.expansionTroops(world) <= 0) return { valid: false };
         const lastExpand = runtime.state.cooldowns.expand || -999;
-        if (world.tick - lastExpand < 5) return { valid: false };
+        if (world.tick - lastExpand < 18) return { valid: false };
         const share = world.totals.myShare;
         let priority = 76; // win the land-grab race; yields to REPEL/CONSOLIDATE (86+)
         if (share < 0.05) priority += 6;

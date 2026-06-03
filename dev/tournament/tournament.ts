@@ -311,6 +311,7 @@ async function runOneGame(
       infiniteTroops: false,
       instantBuild: false,
       randomSpawn: false,
+      goldMultiplier: Number(process.env.GOLDX || "10"),
     },
     [],
     REPO + "/tests/util",
