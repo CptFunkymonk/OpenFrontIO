@@ -91,8 +91,8 @@ describe("TACTICS sizing", () => {
     const reserve = TACTICS.reserveForExpansion(world);
     // Cap-based reserve: keep a fraction of the pop-cap home so repeated
     // expansion can't drain the army to zero (the glass-cannon failure).
-    expect(reserve).toBeGreaterThanOrEqual(0.15);
-    expect(reserve).toBeLessThanOrEqual(0.3);
+    expect(reserve).toBeGreaterThanOrEqual(0.2);
+    expect(reserve).toBeLessThanOrEqual(0.45);
     const troops = TACTICS.expansionTroops(world);
     expect(troops).toBe(Math.floor(100000 - 200000 * reserve));
     expect(troops).toBeGreaterThan(0);

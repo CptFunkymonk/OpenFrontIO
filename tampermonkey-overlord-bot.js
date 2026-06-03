@@ -1444,11 +1444,15 @@
       }
       // Missile silos — needed to launch nukes; build as the crown rises.
       if ((flags.crownRising || (flags.mapShare || 0) > 0.15) && silos < 3) {
+        // Once we have a few cities, build silos BEFORE more cities (prio 18 <
+        // city 20) so we actually field nuke capability to cripple the crown.
+        const siloPrio =
+          flags.crownRising && cities >= 3 ? 18 : flags.crownRising ? 35 : 60;
         candidates.push({
           type: UnitType.MissileSilo,
           cost: MATH.missileSiloCost(),
           reason: "silo (nuke capability)",
-          prio: flags.crownRising ? 35 : 60,
+          prio: siloPrio,
         });
       }
       // SAM launchers — defend vs incoming nukes / pre-crown wall.
@@ -2431,7 +2435,10 @@
         const second = world.totals.secondShare;
         if (myShare < 0.3) return { valid: false };
         if (myShare < second * 1.5) return { valid: false };
-        return { valid: true, priority: 86, note: "dominant — turtle+expand" };
+        // Low priority: when we're ahead we want to PRESS (expand/attack) to the
+        // 80% win, not turtle and let the opponent recover. This only wins the
+        // selection when no offensive goal is available.
+        return { valid: true, priority: 40, note: "dominant — hold/press" };
       },
       run: (world) => runTurtle(world),
     },
@@ -2490,7 +2497,7 @@
         if (!me) return { valid: false };
         const crown = myHostileCrown(world);
         if (!crown) return { valid: false };
-        if (world.totals.crownShare < 0.25) return { valid: false };
+        if (world.totals.crownShare < 0.2) return { valid: false };
         const silos = (me.structures || {})[UnitType.MissileSilo] || 0;
         if (silos < 1) return { valid: false };
         if (!canAfford(world, GOLD.ATOM)) return { valid: false };
@@ -2797,9 +2804,16 @@
   }
 
   function runTurtle(world) {
-    // Keep expanding into TN (free land toward the win threshold); defense via
-    // the secondary build routine (which sees crownRising / threat flags).
-    return runExpand(world);
+    if (scanOf(world).bordersTN) return runExpand(world);
+    // No empty land left — close the game out by grinding the weakest enemy.
+    const me = world.me;
+    const adj = (world.threats.adjacentEnemies || []).filter((e) => !e.isAlly);
+    if (me && adj.length > 0) {
+      const target = adj.reduce((b, c) => (b === null || c.troops < b.troops ? c : b), null);
+      const troops = TACTICS.attackTroops(world, target, { retaliating: true, reserveRatio: 0.3 });
+      if (troops > 0 && target.id) return IO.sendAttack(target.id, troops);
+    }
+    return false;
   }
 
   function runPreempt(world, ctx) {
@@ -3493,13 +3507,13 @@
     );
     // 3) Dominant -> DEFENSIVE_TURTLE.
     step(
-      "dominant=>turtle",
+      "dominant+frontier=>press(expand)",
       world({
         me: { share: 0.5, troops: 500000, tiles: 50000 },
         totals: { myShare: 0.5, secondShare: 0.2, crownShare: 0.5 },
         scan: { bordersTN: true },
       }),
-      "DEFENSIVE_TURTLE",
+      "EXPAND_RUSH",
     );
     // 4) Hostile crown 0.5, silo + atom gold -> NUKE_CROWN.
     step(

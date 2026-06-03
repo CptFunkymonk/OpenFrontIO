@@ -378,12 +378,15 @@ async function runOneGame(
 
     if (process.env.TIMELINE && game.ticks() % 100 === 0) {
       const inc = safe(() => ourCore.incomingAttacks().reduce((a: number, x: any) => a + x.troops(), 0), 0);
+      const cnt = (t: any) => safe(() => ourCore.units(t).length, 0);
+      const foe = game.players().find((p: any) => p !== ourCore);
+      const UT: any = runtime.enums.UnitType;
       console.log(
         `  t=${game.ticks()} tiles=${safe(() => ourCore.numTilesOwned(), 0)} ` +
-          `troops=${Math.round(safe(() => ourCore.troops(), 0) / 10)} ` +
-          `goal=${runtime.planner.activeGoalId} inc=${Math.round(inc / 10)} ` +
-          `alive=${game.players().filter((p: any) => p.isAlive()).length} ` +
-          `intents=${runtime.state.intentsSent}`,
+          `troops=${Math.round(safe(() => ourCore.troops(), 0) / 10)} gold=${Math.round(Number(safe(() => ourCore.gold(), 0)))} ` +
+          `cities=${cnt(UT.City)} silos=${cnt(UT.MissileSilo)} atoms=${cnt(UT.AtomBomb)} ` +
+          `goal=${runtime.planner.activeGoalId} foeTiles=${foe ? safe(() => foe.numTilesOwned(), 0) : 0} ` +
+          `inc=${Math.round(inc / 10)}`,
       );
     }
     const winner = game.getWinner();
