@@ -2559,6 +2559,45 @@
       run: (world) => runSamWall(world),
     },
     {
+      // EASY_NATION_GRAB (learned from the superhuman bot): once TerraNullius
+      // dries up, keep growing by rolling over bordering Nations/Bots — they
+      // never form alliances and have a low defensive ceiling. Fire when we
+      // can actually commit a winning attack (sized by the saturation math).
+      id: "EASY_NATION_GRAB",
+      evaluate: (world) => {
+        const me = world.me;
+        if (!me) return { valid: false };
+        const adj = world.threats.adjacentEnemies || [];
+        const cands = adj.filter(
+          (e) =>
+            e &&
+            !e.isAlly &&
+            (e.type === PlayerType.Nation || e.type === PlayerType.Bot) &&
+            (e.troops < me.troops * 0.85 || (e.tiles || 0) > 30),
+        );
+        if (cands.length === 0) return { valid: false };
+        // Weakest first — easy wins.
+        const target = cands.reduce(
+          (b, c) => (b === null || c.troops < b.troops ? c : b),
+          null,
+        );
+        const troops = TACTICS.attackTroops(world, target, {
+          retaliating: true,
+          reserveRatio: 0.25,
+        });
+        if (troops <= 0) return { valid: false };
+        // Higher when there is no TerraNullius left (must attack to grow).
+        const noFrontier = !scanOf(world).bordersTN;
+        return {
+          valid: true,
+          priority: noFrontier ? 83 : 70,
+          note: "easy nation grab " + target.name,
+          context: { pick: { entry: target, reason: "easy-nation", retaliating: false }, troops },
+        };
+      },
+      run: (world, ctx) => runAttack(world, ctx),
+    },
+    {
       id: "NEUTRALIZE_RISING_STAR",
       evaluate: (world) => {
         const me = world.me;
@@ -3073,8 +3112,21 @@
   }
 
   function runIdle(world) {
-    // Hold and let troops regenerate; expansion is driven by EXPAND_RUSH only
-    // (gated by reserve + cooldown) so we never dribble our army into TN.
+    // If we're sitting on an army with a bordering enemy and no TerraNullius to
+    // grab, commit to grinding the weakest neighbour rather than hoarding while
+    // they out-grow us.
+    const me = world.me;
+    if (me && !scanOf(world).bordersTN && me.troopRatio > 0.45) {
+      const adj = (world.threats.adjacentEnemies || []).filter((e) => !e.isAlly);
+      if (adj.length > 0) {
+        const target = adj.reduce((b, c) => (b === null || c.troops < b.troops ? c : b), null);
+        const troops = TACTICS.attackTroops(world, target, {
+          retaliating: true,
+          reserveRatio: 0.3,
+        });
+        if (troops > 0 && target.id) return IO.sendAttack(target.id, troops);
+      }
+    }
     return false;
   }
 
