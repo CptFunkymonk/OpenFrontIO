@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.14.1
+// @version      2.14.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.14.1";
+  const BOT_VERSION = "2.14.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -1860,23 +1860,6 @@
   }
 
   function sendBoat(dst, troops, opts) {
-    // Guard: never launch a transport ship at our own territory. When the bot
-    // is dominant and conquering fast, a naval target picked from a soft-target
-    // / structure-tile list can become our OWN tile by the time the intent
-    // fires (we captured it since classification). The engine then rejects the
-    // boat ("cannot find start tile" / "send ship to self"), burning the
-    // limited boat slot (boatMaxNumber=3) and a naval cooldown for nothing —
-    // which throttles overseas expansion. Skip cleanly so the caller moves on
-    // to a real overseas target instead.
-    const guardView = getGameView();
-    const guardMe = getMyLivingPlayer();
-    if (guardView && guardMe) {
-      const dstOwner = safeCall(() => guardView.ownerID(dst), null);
-      if (dstOwner !== null && dstOwner === guardMe.smallID()) {
-        decisionLog("naval skip: destination is our own territory");
-        return false;
-      }
-    }
     const ok = sendIntent({
       type: "boat",
       dst,
