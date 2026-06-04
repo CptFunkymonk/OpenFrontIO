@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.13.0
+// @version      2.14.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.13.0";
+  const BOT_VERSION = "2.14.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -5960,12 +5960,28 @@
         // of equivalent cost. Force-unlock up to 3 ports when coastal.
         if (hasCoast && count < 3) return true;
         return hasCoast && count < Math.max(1, Math.floor(cities * portCoef));
-      case UnitType.DefensePost:
+      case UnitType.DefensePost: {
+        if (!dpUnlock) return false;
+        // v2.14: break the early-game survival deadlock. DefensePosts give a
+        // 5x defence bonus for only 50k gold — the cheapest way to hold a
+        // border against a stronger neighbour. The old gate required
+        // `cities >= dpCityGate` (>=2 cities), but on crowded maps the bot
+        // often can't afford its first 125k city before a stronger nation
+        // invades, so it died with ZERO structures. When we're actually under
+        // threat (active/brewing invasion, or an overwhelming neighbour),
+        // allow a small DefensePost wall regardless of city count.
+        const underThreat =
+          (runtime.world.threats.activeInvaders || []).length > 0 ||
+          (runtime.world.threats.brewingInvaders || []).length > 0 ||
+          Boolean(runtime.world.threats.overwhelmingNeighbor);
+        if (underThreat) {
+          return count < Math.max(3, Math.floor(cities * dpCoef) + 2);
+        }
         return (
-          dpUnlock &&
           cities >= dpCityGate &&
           count < Math.max(1, Math.floor(cities * dpCoef))
         );
+      }
       case UnitType.MissileSilo: {
         if (!nukesEnabled) return false;
         if (cities < 2) return false;
@@ -10962,7 +10978,14 @@
         if (samCount >= targetSams) return { valid: false };
         return {
           valid: true,
-          priority: 82,
+          // v2.14: lowered 82 -> 76 so active conquest (EASY_NATION_GRAB up to
+          // 80, TERRA_NULLIUS_RUSH ~81) out-prioritises speculative SAM-wall
+          // building in the 20-35% share window. Building SAMs while a rival
+          // nation keeps grabbing land was a losing trade — we'd turtle to
+          // rank 2. Still above pure idle/economy so we DO build SAMs when
+          // there's nothing better to do (and still below all threat-prep
+          // goals PREEMPT 82 / REPEL >=88 so defence always wins).
+          priority: 76,
           note: `pre-crown SAM wall ${samCount}/${targetSams}`,
         };
       },
@@ -11058,14 +11081,18 @@
         // conquering and turtled on SAMs at 20-35% share — letting a rival
         // nation out-snowball it and win the FFA. When we clearly dominate an
         // adjacent nation, eating it (more land => more pop cap + loot gold
-        // for cities) is worth far more than another SAM. Cap at 84 so it
-        // beats SAM_WALL_BUILDUP (82) but stays below the survival goals
-        // (REPEL_INVASION >=88, CONSOLIDATE_FRONT 94) and STEAMROLL (90).
+        // for cities) is worth far more than another SAM. Cap at 80 so it
+        // beats SAM_WALL_BUILDUP (lowered to 76 in v2.14) but stays BELOW the
+        // threat-prep / survival goals (PREEMPT_INVASION 82, REPEL >=88,
+        // CONSOLIDATE_FRONT 94) and STEAMROLL (90). Crucially it must lose to
+        // PREEMPT_INVASION: if a strong neighbour is winding up against us we
+        // need DefensePosts on that border, not a speculative conquest that
+        // leaves home open (this was an over-aggression regression in v2.13).
         const advRatio = me.troops / Math.max(1, target.troops);
         let priority = 63;
-        if (advRatio >= 1.3) priority = 74;
-        if (advRatio >= 1.8) priority = 80;
-        if (advRatio >= 2.5) priority = 84;
+        if (advRatio >= 1.3) priority = 72;
+        if (advRatio >= 1.8) priority = 78;
+        if (advRatio >= 2.5) priority = 80;
         return {
           valid: true,
           priority,
