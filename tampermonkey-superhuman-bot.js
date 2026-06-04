@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.15.0
+// @version      2.14.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.15.0";
+  const BOT_VERSION = "2.14.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -4816,48 +4816,6 @@
     return worst;
   }
 
-  /**
-   * Strongest non-friendly, non-bot player ANYWHERE in the game expressed as a
-   * multiple of our current troops (not just adjacent — see
-   * worstAdjacentEnemyTroopRatio for the adjacency-restricted version). This is
-   * the "keep up with the Joneses" signal: if a nation across the map is
-   * fielding 5x our army, we are chronically under-built and must bank troops
-   * toward a competitive standing army instead of frittering them on attacks.
-   * Returns 0 when we have no troops or there is no qualifying player.
-   */
-  function strongestEnemyTroopRatio(player) {
-    const myTroops = safeCall(() => Number(player.troops()), 0) || 0;
-    if (myTroops < 1) return 0;
-    const everyone =
-      (runtime.world && runtime.world.everyone) || [];
-    let worst = 0;
-    for (const entry of everyone) {
-      if (!entry || entry.isMe || entry.isFriendly) continue;
-      if (entry.type === PlayerType.Bot) continue;
-      const theirTroops = Number(entry.troops) || 0;
-      const ratio = theirTroops / myTroops;
-      if (ratio > worst) worst = ratio;
-    }
-    return worst;
-  }
-
-  /**
-   * Reserve floor driven by the strongest player in the game (global). When we
-   * are badly out-armed we keep a larger standing army: attacks then commit
-   * only genuine surplus (and weak PvP targets still get exactly the saturating
-   * payload), so our army climbs toward the pop cap instead of sitting at ~20%
-   * while a rival nation snowballs to 5x our troops and rolls us. Modest by
-   * design (max 0.6) so we still expand into free terra nullius and conquer
-   * weak neighbours — we just stop dumping the whole army on every attack.
-   */
-  function globalArmyReserveFloor(player) {
-    const ratio = strongestEnemyTroopRatio(player);
-    if (ratio >= 3.0) return 0.6;
-    if (ratio >= 2.0) return 0.5;
-    if (ratio >= 1.5) return 0.42;
-    return 0;
-  }
-
   function computeReserveRatio(player, maxTroops) {
     const ratio = maxTroops > 0 ? player.troops() / maxTroops : 0;
     let reserve = 0.35;
@@ -5849,22 +5807,12 @@
     // Plan §2.3 cap for the proactive combat path: mid-game players
     // are fine with baseReserve, but early-game (currentRatio < 0.2)
     // the 0.55 baseline forces 0 commits. Cap at 0.5 × currentRatio.
-    //
-    // v2.15: army-building floor. When a rival nation anywhere fields a far
-    // bigger army, do NOT apply the frittering `currentRatio*0.5` cap — keep
-    // the full reserve so proactive attacks commit only genuine surplus and
-    // our standing army climbs toward a competitive size. calculateAttackTroops
-    // still sends exactly the saturating payload against a weak target, so we
-    // keep conquering weak neighbours for land + loot; we just stop dumping the
-    // whole army on every attack and getting rolled by the eventual big
-    // invader (the bot used to sit at ~20% of its pop cap at 60k tiles). This
-    // is gated on the GLOBAL strongest player (not terra-nullius expansion, so
-    // free-land grabbing stays aggressive).
-    const armyFloor = globalArmyReserveFloor(me);
-    const proactiveReserve =
-      armyFloor > 0
-        ? Math.max(armyFloor, cappedReserveRatio(me, maxTroops, reserveRatio, 0.08))
-        : cappedReserveRatio(me, maxTroops, reserveRatio, 0.08);
+    const proactiveReserve = cappedReserveRatio(
+      me,
+      maxTroops,
+      reserveRatio,
+      0.08,
+    );
     for (const info of adjacentEnemies) {
       const enemy = info.player;
       const troops = calculateAttackTroops(me, enemy, proactiveReserve, maxTroops);
