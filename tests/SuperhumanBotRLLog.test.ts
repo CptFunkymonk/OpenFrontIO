@@ -151,7 +151,7 @@ describe("tampermonkey-superhuman-bot RL Decision Logger — config snapshot", (
     const { buildConfigSnapshot } = runtime.test.internals;
     const snap = buildConfigSnapshot();
 
-    expect(snap.botVersion).toBe("2.14.0");
+    expect(snap.botVersion).toBe("2.14.1");
     expect(snap.schemaVersion).toBeGreaterThanOrEqual(1);
 
     // Must include every critical lever constant the downstream analyst
@@ -308,7 +308,7 @@ describe("tampermonkey-superhuman-bot RL Decision Logger — dump", () => {
     const raw = dumpRlJson();
     const parsed = JSON.parse(raw);
     expect(parsed.schemaVersion).toBeGreaterThanOrEqual(1);
-    expect(parsed.botVersion).toBe("2.14.0");
+    expect(parsed.botVersion).toBe("2.14.1");
     expect(parsed.level).toBe("compact");
     expect(typeof parsed.generatedAtMs).toBe("number");
     expect(parsed.summary).toBeDefined();

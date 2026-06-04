@@ -384,9 +384,9 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     );
   });
 
-  it("exposes a BOT_VERSION constant bumped to 2.14.0", () => {
+  it("exposes a BOT_VERSION constant bumped to 2.14.1", () => {
     const runtime = loadUserscript();
-    expect(runtime.test.internals.BOT_VERSION).toBe("2.14.0");
+    expect(runtime.test.internals.BOT_VERSION).toBe("2.14.1");
   });
 });
 
