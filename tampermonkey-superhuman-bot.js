@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.15.0
+// @version      2.14.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.15.0";
+  const BOT_VERSION = "2.14.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -8869,94 +8869,6 @@
    *
    * Returns true iff at least one alliance-request intent was dispatched.
    */
-  /**
-   * v2.15: proactive early alliances with strong adjacent NATIONS (FFA).
-   *
-   * The biggest single cause of early losses in FFA-vs-nations is a stronger
-   * adjacent neighbour invading us before we can establish ourselves — and the
-   * bot never tried to defuse it diplomatically, because `openingDiplomacyBlast`
-   * is Human-only (in FFA the bot is the only Human) and `maybeDiplomacy` only
-   * runs from defensive-goal dispatchers (not during the early TERRA_NULLIUS
-   * expansion phase when alliances would help most).
-   *
-   * This runs every tick from the main loop. After the spawn phase (nations
-   * auto-reject alliance requests created during it), it asks the STRONGEST
-   * adjacent non-bot neighbour that out-troops us to ally. We can't profitably
-   * conquer a neighbour that already out-troops us, so cutting that front is
-   * pure upside — it stops the invasion that would otherwise kill us, while we
-   * keep conquering WEAKER neighbours for land + loot. Capped at 2 proactive
-   * allies so we always have targets left, and the existing BETRAY_ALLY goal
-   * breaks these once we're strong enough to roll them.
-   */
-  async function maybeAllyStrongNeighbors(me) {
-    const gameView = getGameView();
-    if (!gameView || !me) return false;
-    const tick = gameView.ticks();
-    const spawnTurns = safeCall(
-      () => gameView.config().numSpawnPhaseTurns(),
-      100,
-    );
-    // Nations reject any request created during the spawn phase; wait it out.
-    if (tick <= spawnTurns + 5) return false;
-    const last = runtime.state._lastProactiveAllyTick || -999;
-    if (tick - last < 60) return false;
-
-    // Don't over-ally — keep at most 2 proactive allies so we still have
-    // neighbours to conquer (and don't strangle our own growth).
-    const currentAllies = safeCall(() => getAllies(), []);
-    if (currentAllies.length >= 2) return false;
-
-    const adj = runtime.world.threats.adjacentEnemies || [];
-    const myTroops = safeCall(() => me.troops(), 1) || 1;
-    const candidates = adj
-      .filter(
-        (e) =>
-          e &&
-          !e.isFriendly &&
-          !e.isAlly &&
-          !e.isClanmate &&
-          e.type !== PlayerType.Bot &&
-          (Number(e.troops) || 0) > myTroops * 1.2,
-      )
-      .sort((a, b) => (Number(b.troops) || 0) - (Number(a.troops) || 0));
-    if (candidates.length === 0) return false;
-
-    const target = candidates[0];
-    const targetID =
-      target.id ||
-      (target.player && safeCall(() => target.player.id(), null));
-    if (!targetID) return false;
-
-    // Confirm the request is actually legal (not already pending/embargoed)
-    // by probing one of their tiles, mirroring maybeDiplomacy.
-    const tile = sampleTilesForOwner(target.smallID, 1, {
-      requireLand: true,
-      maxSamples: 80,
-    })[0];
-    if (tile === undefined) return false;
-    const actions = await queryPlayerActions(tile, null);
-    if (
-      !actions ||
-      !actions.interaction ||
-      !actions.interaction.canSendAllianceRequest
-    ) {
-      return false;
-    }
-
-    if (sendAllianceRequest(targetID)) {
-      runtime.state._lastProactiveAllyTick = tick;
-      runtime.state.lastAction =
-        "requesting early alliance with " + (target.name || "neighbour");
-      reasonLog(
-        "DIPLOMACY",
-        `Allying with strong neighbour ${target.name || "?"} to cut a front; betray once we can roll them.`,
-        `they have ${fmtTroops(Number(target.troops) || 0)} vs our ${fmtTroops(myTroops)}`,
-      );
-      return true;
-    }
-    return false;
-  }
-
   function openingDiplomacyBlast(me) {
     const blastState = runtime.state.openingBlast;
     if (!blastState || blastState.fired) return false;
@@ -12120,11 +12032,6 @@
     // before they can coalesce into a bloc against us. Cheap no-op
     // after the first successful send.
     safeCall(() => openingDiplomacyBlast(me), null);
-
-    // v2.15: proactive early alliances with strong adjacent nations (FFA) to
-    // cut the front that most often kills us early. Runs regardless of the
-    // active goal (the early-expansion goals never call maybeDiplomacy).
-    await maybeAllyStrongNeighbors(me).catch(() => {});
 
     // Plan §2.10: team-mode donation. No-op outside team games.
     safeCall(() => maybeDonateToStrugglingTeammate(me), null);
