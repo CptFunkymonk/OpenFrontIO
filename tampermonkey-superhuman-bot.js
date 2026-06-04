@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.14.0
+// @version      2.15.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.14.0";
+  const BOT_VERSION = "2.15.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -4827,10 +4827,20 @@
 
   function computeReserveRatio(player, maxTroops) {
     const ratio = maxTroops > 0 ? player.troops() / maxTroops : 0;
-    let reserve = 0.35;
-    if (ratio < 0.2) reserve = 0.55;
-    else if (ratio < 0.4) reserve = 0.45;
-    else if (ratio > 0.8) reserve = 0.22;
+    // v2.15: base reserve lowered (0.35->0.30 etc.) so the default "balanced"
+    // mode commits more troops to expansion/conquest. This captures the SOUND
+    // half of why aggressive mode A/B-won more (4/6 vs 3/6 on Easy FFA): lower
+    // reserve = win the snowball race. We deliberately do NOT copy aggressive's
+    // +12 goal-priority boost, which is the UNSOUND half (it overrides
+    // survival goals like PREEMPT_INVASION / MIRV_LAST_RESORT). The v2.11
+    // threat-hoard below still raises the reserve when a stronger neighbour is
+    // actually at our border, so this only frees troops when it's safe. (cf.
+    // the v2.15 army-BANKING experiment which RAISED reserve and regressed
+    // 50%->17% — the inverse direction here is the validated one.)
+    let reserve = 0.3;
+    if (ratio < 0.2) reserve = 0.48;
+    else if (ratio < 0.4) reserve = 0.4;
+    else if (ratio > 0.8) reserve = 0.2;
 
     if (runtime.mode === "aggressive") reserve -= 0.08;
     if (runtime.mode === "turtle") reserve += 0.12;
