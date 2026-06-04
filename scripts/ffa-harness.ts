@@ -71,6 +71,7 @@ interface HarnessOptions {
   quiet: boolean;
   trace: number;
   difficulty: string;
+  timer: number;
 }
 
 const DEFAULTS: HarnessOptions = {
@@ -85,6 +86,7 @@ const DEFAULTS: HarnessOptions = {
   quiet: false,
   trace: 0,
   difficulty: "Medium",
+  timer: 0,
 };
 
 function parseArgs(argv: string[]): HarnessOptions {
@@ -128,6 +130,11 @@ function parseArgs(argv: string[]): HarnessOptions {
         break;
       case "--difficulty":
         opts.difficulty = next();
+        break;
+      case "--timer":
+        // Game timer in minutes. When set, the engine declares the current
+        // map leader the winner once the timer expires (timed-FFA format).
+        opts.timer = parseInt(next(), 10);
         break;
       case "--quiet":
         opts.quiet = true;
@@ -350,6 +357,7 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     infiniteTroops: false,
     instantBuild: false,
     randomSpawn: false,
+    ...(opts.timer > 0 ? { maxTimerValue: opts.timer } : {}),
   } as GameConfig;
 
   const config = await getGameLogicConfig(gameConfig, new UserSettings());
