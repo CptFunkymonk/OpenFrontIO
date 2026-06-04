@@ -301,6 +301,15 @@
   //   window.__superhumanBotDebug.debugFlags.intel = true;
   const runtime = {
     enabled: true,
+    // NOTE: "aggressive" mode A/B-wins more on Easy FFA (4/6 vs balanced 3/6 on
+    // the harness) by out-snowballing, BUT its blunt +12/-8 priority modifiers
+    // override survival-critical goals — in the scripted suite it skips
+    // PREEMPT_INVASION (brewing invader), MIRV_LAST_RESORT (coalition owns 45%),
+    // and SAM_OVERWHELM. That neglect is harmless vs weak Easy nations but
+    // unsound on Medium/Hard/multiplayer, so we keep "balanced" as the safe
+    // default. Aggressive stays user-selectable from the overlay. A future
+    // surgical pass (boost only conquest goals, never override threat-response
+    // goals) could make a refined aggressive the default.
     mode: "balanced",
     processing: false,
     lastProcessedTick: -1,
