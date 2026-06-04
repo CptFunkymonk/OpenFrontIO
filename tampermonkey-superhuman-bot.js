@@ -14979,6 +14979,10 @@
         sendRawMessage,
         installLocalTransportBridge,
         handleServerMessage,
+        // Per-tick brain entry point. Exposed so the headless FFA harness can
+        // drive the bot deterministically (one call per engine tick) instead
+        // of relying on the setInterval loop.
+        runModulesForTick,
         buildOrderForArchetype,
         reasonLog,
         UnitType,
