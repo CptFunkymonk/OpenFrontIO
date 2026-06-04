@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.10.1
+// @version      2.11.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.10.1";
+  const BOT_VERSION = "2.11.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -4789,6 +4789,33 @@
     return candidates[0].center;
   }
 
+  /**
+   * Strongest adjacent non-friendly enemy expressed as a multiple of our
+   * current troops. >1 means a bordering enemy out-troops us. Bots are
+   * ignored (they are weak filler); Nations and Humans count. Returns 0 when
+   * we have no troops or no qualifying neighbour. Drives the defensive
+   * troop-hoard logic so we stop bleeding our army into offense when a much
+   * stronger neighbour is staring at our border.
+   */
+  function worstAdjacentEnemyTroopRatio(player) {
+    const myTroops = safeCall(() => Number(player.troops()), 0) || 0;
+    if (myTroops < 1) return 0;
+    const adj =
+      (runtime.world &&
+        runtime.world.threats &&
+        runtime.world.threats.adjacentEnemies) ||
+      [];
+    let worst = 0;
+    for (const entry of adj) {
+      if (!entry || entry.isFriendly || entry.isDisconnected) continue;
+      if (entry.type === PlayerType.Bot) continue;
+      const theirTroops = Number(entry.troops) || 0;
+      const ratio = theirTroops / myTroops;
+      if (ratio > worst) worst = ratio;
+    }
+    return worst;
+  }
+
   function computeReserveRatio(player, maxTroops) {
     const ratio = maxTroops > 0 ? player.troops() / maxTroops : 0;
     let reserve = 0.35;
@@ -4798,7 +4825,19 @@
 
     if (runtime.mode === "aggressive") reserve -= 0.08;
     if (runtime.mode === "turtle") reserve += 0.12;
-    return clamp(reserve, 0.12, 0.72);
+
+    // Threat-aware defensive hoard. When a much stronger non-bot neighbour
+    // borders us, stop pouring our army into expansion — sit on troops so the
+    // standing army regrows toward the cap and the defender bonus saturates.
+    // This is the #1 reason the bot used to peak then collapse on crowded
+    // maps: it over-committed to offense and got counter-invaded while
+    // troop-starved. Weak/no neighbour (e.g. small maps) => no change.
+    const enemyRatio = worstAdjacentEnemyTroopRatio(player);
+    if (enemyRatio >= 2.5) reserve = Math.max(reserve, 0.85);
+    else if (enemyRatio >= 1.7) reserve = Math.max(reserve, 0.7);
+    else if (enemyRatio >= 1.25) reserve = Math.max(reserve, 0.55);
+
+    return clamp(reserve, 0.12, 0.9);
   }
 
   /**
@@ -4816,8 +4855,19 @@
   function cappedReserveRatio(player, maxTroops, desiredReserve, floor) {
     const fallbackFloor = typeof floor === "number" ? floor : 0.08;
     const currentRatio = maxTroops > 0 ? player.troops() / maxTroops : 0;
-    const cap = Math.max(fallbackFloor, currentRatio * 0.5);
     const desired = Math.max(fallbackFloor, desiredReserve);
+
+    // Defensive override: when a much stronger non-bot neighbour borders us we
+    // WANT to starve offense and hoard. The usual `currentRatio * 0.5` cap
+    // exists to keep us aggressive even below the desired reserve, but applying
+    // it while out-gunned re-commits our shrinking army into attacks and feeds
+    // the collapse spiral. Honour the full desired reserve in that case so
+    // `available` goes (near) zero and the army regrows.
+    if (worstAdjacentEnemyTroopRatio(player) >= 1.25) {
+      return desired;
+    }
+
+    const cap = Math.max(fallbackFloor, currentRatio * 0.5);
     return Math.min(cap, desired);
   }
 
