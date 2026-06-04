@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.11.0
+// @version      2.12.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.11.0";
+  const BOT_VERSION = "2.12.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -10887,6 +10887,43 @@
       onAct: async () => false,
     },
     {
+      // STEAMROLL_CROWN — the dominant crown closing out the game. When we
+      // hold a commanding map share with a clear lead and are NOT under an
+      // actual invasion, we must convert our overwhelming army into the
+      // conquest needed to reach the 80% win line instead of sitting in a
+      // defensive turtle / SAM-wall loop. This is the single biggest reason
+      // the bot used to peak at ~30% share and stall there for thousands of
+      // ticks: every defensive goal (DEFENSIVE_TURTLE 86, SAM_WALL_BUILDUP
+      // 82) out-prioritised conquest once we were ahead. Priority 90 clears
+      // those but stays below the genuine emergency responses (REPEL ≥88
+      // escalating to 98, CONSOLIDATE_FRONT 94 at extreme pressure, MIRV
+      // last resort), so a real threat still pre-empts the steamroll.
+      id: "STEAMROLL_CROWN",
+      horizonTicks: 120,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const myShare = world.totals.myShare;
+        const secondShare = world.totals.secondShare;
+        // Dominant: large share AND a clear lead over the next player.
+        if (myShare < 0.3) return { valid: false };
+        if (myShare < secondShare * 1.5) return { valid: false };
+        // Don't steamroll while actively being invaded — survival first.
+        if ((world.threats.activeInvaders || []).length > 0) {
+          return { valid: false };
+        }
+        // Already won? Nothing left to do.
+        if (myShare >= 0.8) return { valid: false };
+        return {
+          valid: true,
+          priority: 90,
+          note: `steamroll — share=${(myShare * 100).toFixed(0)}% (closing to 80%)`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
       id: "DEFENSIVE_TURTLE",
       horizonTicks: 200,
       evaluate: () => {
@@ -12023,6 +12060,19 @@
         // Force handled=true unconditionally so the legacy fallback
         // can never fire offensive combat during the traitor lock.
         handled = true;
+        break;
+      case "STEAMROLL_CROWN":
+        // v2.12.0: dominant crown closing out the game. Relentlessly
+        // convert our overwhelming army into conquest — land combat first,
+        // then empty-land grabs, river crossings, and overseas naval
+        // invasions to reach the remaining nations. Only if nothing can be
+        // attacked this tick do we fall back to economy/upkeep.
+        handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeExpand(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
+        if (!handled) handled = await maybeNaval(me);
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeDiplomacy(me);
         break;
       case "SAM_WALL_BUILDUP":
         handled = await runGoal_SamWallBuildup(me);
@@ -14215,7 +14265,10 @@
     scenario1.threats.crownSmallID = 2;
     step("crown50-atom -> NUKE_CROWN", scenario1, "NUKE_CROWN", true);
 
-    // Scenario 2: we're the crown ourselves -> DEFENSIVE_TURTLE.
+    // Scenario 2: we're the dominant crown and NOT under invasion ->
+    // STEAMROLL_CROWN (close out the game) rather than turtle. v2.12.0:
+    // a safe crown must keep conquering to reach the 80% win line; the old
+    // behaviour stalled at ~30% share in a defensive turtle loop.
     const scenario2 = buildTestWorld({
       totals: {
         alivePlayers: 3,
@@ -14229,7 +14282,40 @@
         secondShare: 0.15,
       },
     });
-    step("we-are-crown -> DEFENSIVE_TURTLE", scenario2, "DEFENSIVE_TURTLE");
+    step("we-are-crown-safe -> STEAMROLL_CROWN", scenario2, "STEAMROLL_CROWN");
+
+    // Scenario 2b: dominant crown but actively being invaded -> survival
+    // (REPEL_INVASION) outranks the steamroll; STEAMROLL_CROWN is invalid
+    // while activeInvaders is non-empty.
+    const scenario2b = buildTestWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.35,
+        myShare: 0.35,
+        secondShare: 0.15,
+      },
+    });
+    scenario2b.me.incomingTroops = 60_000;
+    scenario2b.threats.invasionTroopsInbound = 60_000;
+    scenario2b.threats.activeInvaders = [
+      {
+        smallID: 88,
+        name: "Invader",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 90_000,
+        invasionIncoming: 60_000,
+        invasionPressure: 1.5,
+        strength: 110_000,
+      },
+    ];
+    step("we-are-crown-invaded -> REPEL_INVASION", scenario2b, "REPEL_INVASION");
 
     // Scenario 3: we own 27% -> SAM_WALL_BUILDUP.
     const scenario3 = buildTestWorld({

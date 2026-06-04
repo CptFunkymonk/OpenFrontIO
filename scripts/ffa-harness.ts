@@ -70,6 +70,7 @@ interface HarnessOptions {
   rl: boolean;
   quiet: boolean;
   trace: number;
+  difficulty: string;
 }
 
 const DEFAULTS: HarnessOptions = {
@@ -83,6 +84,7 @@ const DEFAULTS: HarnessOptions = {
   rl: false,
   quiet: false,
   trace: 0,
+  difficulty: "Medium",
 };
 
 function parseArgs(argv: string[]): HarnessOptions {
@@ -123,6 +125,9 @@ function parseArgs(argv: string[]): HarnessOptions {
         break;
       case "--trace":
         opts.trace = parseInt(next(), 10);
+        break;
+      case "--difficulty":
+        opts.difficulty = next();
         break;
       case "--quiet":
         opts.quiet = true;
@@ -315,7 +320,7 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     gameMapSize: GameMapSize.Normal,
     gameMode: GameMode.FFA,
     gameType: GameType.Singleplayer,
-    difficulty: Difficulty.Hard,
+    difficulty: (Difficulty as any)[opts.difficulty] ?? Difficulty.Medium,
     nations: opts.nations,
     donateGold: false,
     donateTroops: false,
@@ -671,7 +676,7 @@ async function main() {
   console.log(
     `\n=== SUMMARY: ${wins}/${outcomes.length} wins ` +
       `(${((wins / outcomes.length) * 100).toFixed(0)}%) ` +
-      `map=${opts.map} bots=${opts.bots} nations=${opts.nations} mode=${opts.mode} ===`,
+      `map=${opts.map} bots=${opts.bots} nations=${opts.nations} mode=${opts.mode} diff=${opts.difficulty} ===`,
   );
 
   // Write outcomes to rl-exports for later analysis.
