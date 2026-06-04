@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.15.0
+// @version      2.14.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.15.0";
+  const BOT_VERSION = "2.14.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -6247,22 +6247,19 @@
     const candidateTiles = getOwnedCandidateTiles(me, 20);
     let order = buildOrderForArchetype(runtime.world.archetype);
 
-    // Plan §2.9 — port-chain precedence. v2.15: the FIRST 1-2 ports now come
-    // BEFORE cities when coastal. A trade ship is worth up to ~75k gold (vs the
-    // flat 100/tick base income), so the first port is by far the strongest
-    // economic unlock — it pays for itself in ~2 trades and the resulting gold
-    // funds everything else (more ports, cities, defence). Cities only raise
-    // the troop pop-cap, which is NOT the binding constraint early (the bot
-    // runs well below its cap), so banking troop-cap before income is
-    // backwards. We still cap the early port rush at 2 so we don't neglect the
-    // pop-cap entirely, then the original "ports over the 3rd city" rule
-    // (portCount<3 && cityCount>=2) takes over for the rest of the chain.
+    // Plan §2.9 — port-chain precedence. Plan wording: "prioritise
+    // ports even over the 3rd city." Cities 1 and 2 still come first
+    // (each city dumps +250k onto maxTroops, which is more than the
+    // marginal gold per tick we'd get from a port early on). Past the
+    // 2nd city the next 125k is better spent on a port: trade-ship
+    // gold compounds via proximityBonusPortsNb, and a port pays back
+    // its own cost faster than a 3rd city of equivalent price.
     const hasCoast = runtime.state.borderCache.tiles.some((tile) =>
       safeCall(() => getGameView().isOceanShore(tile), false),
     );
     const portCount = getUnitLevelCount(me, UnitType.Port);
     const cityCount = getUnitLevelCount(me, UnitType.City);
-    if (hasCoast && (portCount < 2 || (portCount < 3 && cityCount >= 2))) {
+    if (hasCoast && portCount < 3 && cityCount >= 2) {
       const reordered = [UnitType.Port];
       for (const t of order) {
         if (t !== UnitType.Port) reordered.push(t);
