@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.12.0
+// @version      2.13.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.12.0";
+  const BOT_VERSION = "2.13.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -11052,9 +11052,23 @@
           (best, c) => (best === null || c.troops < best.troops ? c : best),
           null,
         );
+        // v2.13.0: scale priority with how badly we out-troop the weakest
+        // adjacent nation. The old flat 63 lost to SAM_WALL_BUILDUP (82) and
+        // DEFENSE_NETWORK, so once terra nullius dried up the bot stopped
+        // conquering and turtled on SAMs at 20-35% share — letting a rival
+        // nation out-snowball it and win the FFA. When we clearly dominate an
+        // adjacent nation, eating it (more land => more pop cap + loot gold
+        // for cities) is worth far more than another SAM. Cap at 84 so it
+        // beats SAM_WALL_BUILDUP (82) but stays below the survival goals
+        // (REPEL_INVASION >=88, CONSOLIDATE_FRONT 94) and STEAMROLL (90).
+        const advRatio = me.troops / Math.max(1, target.troops);
+        let priority = 63;
+        if (advRatio >= 1.3) priority = 74;
+        if (advRatio >= 1.8) priority = 80;
+        if (advRatio >= 2.5) priority = 84;
         return {
           valid: true,
-          priority: 63,
+          priority,
           note:
             `easy=${target.name} (${target.type}) ` +
             `troopRatio=${(target.troops / Math.max(me.troops, 1)).toFixed(2)}`,
