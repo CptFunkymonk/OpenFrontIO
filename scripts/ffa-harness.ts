@@ -69,6 +69,7 @@ interface HarnessOptions {
   games: number;
   rl: boolean;
   quiet: boolean;
+  trace: number;
 }
 
 const DEFAULTS: HarnessOptions = {
@@ -81,6 +82,7 @@ const DEFAULTS: HarnessOptions = {
   games: 1,
   rl: false,
   quiet: false,
+  trace: 0,
 };
 
 function parseArgs(argv: string[]): HarnessOptions {
@@ -118,6 +120,9 @@ function parseArgs(argv: string[]): HarnessOptions {
         break;
       case "--rl":
         opts.rl = true;
+        break;
+      case "--trace":
+        opts.trace = parseInt(next(), 10);
         break;
       case "--quiet":
         opts.quiet = true;
@@ -273,6 +278,7 @@ interface GameOutcome {
   map: string;
   mode: string;
   durationMs: number;
+  collapseDiag: string | null;
 }
 
 const STRUCTURE_TYPES: [string, UnitType][] = [
@@ -460,6 +466,36 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     }
   };
 
+  // Collapse / death diagnostics: captured the first time the bot's tile count
+  // drops >=25% below its peak, and again at death.
+  let collapseDiag: string | null = null;
+  const captureDiag = (bp: any, label: string): string => {
+    let incomingTroops = 0;
+    try {
+      for (const a of bp.incomingAttacks()) {
+        incomingTroops += Number(a.troops?.() ?? a.troops ?? 0);
+      }
+    } catch {
+      /* ignore */
+    }
+    const others = game
+      .players()
+      .filter((p: any) => p.isPlayer() && p.smallID() !== bp.smallID())
+      .sort((a: any, b: any) => b.troops() - a.troops())
+      .slice(0, 3)
+      .map(
+        (p: any) =>
+          `${p.type?.() ?? "?"}:${Math.round(p.troops())}t/${p.numTilesOwned()}til`,
+      );
+    return (
+      `${label}@t=${game.ticks()} tiles=${bp.numTilesOwned()} ` +
+      `troops=${Math.round(bp.troops())} gold=${Math.round(
+        Number(bp.gold?.() ?? 0),
+      )} incomingTroops=${Math.round(incomingTroops)} ` +
+      `topEnemies=[${others.join(", ")}] goal=${runtime.planner?.activeGoalId ?? "-"}`
+    );
+  };
+
   for (let t = 0; t < opts.maxTicks; t++) {
     // Apply intents collected from the bot last tick as this turn.
     gr.addTurn({ turnNumber: t, intents: pendingIntents.splice(0) });
@@ -473,6 +509,21 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     await internals.runModulesForTick();
 
     const bp = botPlayer();
+    if (
+      opts.trace > 0 &&
+      bp &&
+      bp.isAlive() &&
+      game.ticks() % opts.trace === 0
+    ) {
+      realLog(
+        `  t=${game.ticks()} tiles=${bp.numTilesOwned()} ` +
+          `troops=${Math.round(bp.troops())} gold=${Math.round(
+            Number(bp.gold?.() ?? 0),
+          )} ` +
+          `structs=${JSON.stringify(structureCounts(bp))} ` +
+          `goal=${runtime.planner?.activeGoalId ?? "-"}`,
+      );
+    }
     if (bp) {
       const alive = bp.isAlive();
       if (alive) {
@@ -484,8 +535,18 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
         if (troops > peakTroops) peakTroops = troops;
         if (gold > peakGold) peakGold = gold;
         structuresSnapshot = structureCounts(bp);
+        if (
+          collapseDiag === null &&
+          peakTiles > 2000 &&
+          tiles < peakTiles * 0.75
+        ) {
+          collapseDiag = captureDiag(bp, "collapse");
+        }
       } else if (botWasAlive && deathTick === null) {
         deathTick = game.ticks();
+        if (collapseDiag === null) {
+          collapseDiag = captureDiag(bp, "death");
+        }
         structuresSnapshot = structureCounts(bp);
       }
     }
@@ -507,10 +568,12 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     (a: any, b: any) => b.numTilesOwned() - a.numTilesOwned(),
   );
   const bp = botPlayer();
-  const rankByTiles =
+  const idx =
     bp !== null
-      ? sortedByTiles.findIndex((p: any) => p.smallID() === bp.smallID()) + 1
+      ? sortedByTiles.findIndex((p: any) => p.smallID() === bp.smallID())
       : -1;
+  // -1 means the bot is dead / no longer ranked among living players.
+  const rankByTiles = bp !== null && bp.isAlive() && idx >= 0 ? idx + 1 : -1;
   const alivePlayersAtEnd = allPlayers.filter((p: any) => p.isAlive()).length;
 
   const winnerKind = winner ? winner[0] : null;
@@ -552,6 +615,7 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     map: opts.map,
     mode: opts.mode,
     durationMs: Date.now() - startedAt,
+    collapseDiag,
   };
 }
 
@@ -597,6 +661,9 @@ async function main() {
           `goals=${outcome.goalsAdopted.join(",")} ` +
           `(${(outcome.durationMs / 1000).toFixed(1)}s)`,
       );
+      if (outcome.collapseDiag) {
+        realLog(`    ${outcome.collapseDiag}`);
+      }
     }
   }
 
