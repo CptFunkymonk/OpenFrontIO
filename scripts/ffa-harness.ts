@@ -307,8 +307,29 @@ function structureCounts(player: any): Record<string, number> {
   return out;
 }
 
+// Deterministic PRNG (mulberry32) seeded from a string. We override the global
+// Math.random during a game so the bot's internal randomness (spawn scoring,
+// shuffles) is reproducible per seed — essential for meaningful A/B testing.
+function makeSeededRandom(seedStr: string): () => number {
+  let h = 1779033703 ^ seedStr.length;
+  for (let i = 0; i < seedStr.length; i++) {
+    h = Math.imul(h ^ seedStr.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  let a = h >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
   const startedAt = Date.now();
+  const realRandom = Math.random;
+  Math.random = makeSeededRandom(`bot-${opts.seed}`);
   const { manifest, gameMap, miniGameMap } = await loadMap(opts.map);
   const manifestNations = manifest.nations ?? [];
 
@@ -599,6 +620,8 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
   const goalsAdopted = Array.from(
     runtime.rl?.tracking?.goalsEverAdopted ?? [],
   ) as string[];
+
+  Math.random = realRandom;
 
   return {
     result,
