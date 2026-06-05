@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.10.1
+// @version      2.14.0
 // @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.10.1";
+  const BOT_VERSION = "2.14.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -301,6 +301,15 @@
   //   window.__superhumanBotDebug.debugFlags.intel = true;
   const runtime = {
     enabled: true,
+    // NOTE: "aggressive" mode A/B-wins more on Easy FFA (4/6 vs balanced 3/6 on
+    // the harness) by out-snowballing, BUT its blunt +12/-8 priority modifiers
+    // override survival-critical goals — in the scripted suite it skips
+    // PREEMPT_INVASION (brewing invader), MIRV_LAST_RESORT (coalition owns 45%),
+    // and SAM_OVERWHELM. That neglect is harmless vs weak Easy nations but
+    // unsound on Medium/Hard/multiplayer, so we keep "balanced" as the safe
+    // default. Aggressive stays user-selectable from the overlay. A future
+    // surgical pass (boost only conquest goals, never override threat-response
+    // goals) could make a refined aggressive the default.
     mode: "balanced",
     processing: false,
     lastProcessedTick: -1,
@@ -4789,6 +4798,33 @@
     return candidates[0].center;
   }
 
+  /**
+   * Strongest adjacent non-friendly enemy expressed as a multiple of our
+   * current troops. >1 means a bordering enemy out-troops us. Bots are
+   * ignored (they are weak filler); Nations and Humans count. Returns 0 when
+   * we have no troops or no qualifying neighbour. Drives the defensive
+   * troop-hoard logic so we stop bleeding our army into offense when a much
+   * stronger neighbour is staring at our border.
+   */
+  function worstAdjacentEnemyTroopRatio(player) {
+    const myTroops = safeCall(() => Number(player.troops()), 0) || 0;
+    if (myTroops < 1) return 0;
+    const adj =
+      (runtime.world &&
+        runtime.world.threats &&
+        runtime.world.threats.adjacentEnemies) ||
+      [];
+    let worst = 0;
+    for (const entry of adj) {
+      if (!entry || entry.isFriendly || entry.isDisconnected) continue;
+      if (entry.type === PlayerType.Bot) continue;
+      const theirTroops = Number(entry.troops) || 0;
+      const ratio = theirTroops / myTroops;
+      if (ratio > worst) worst = ratio;
+    }
+    return worst;
+  }
+
   function computeReserveRatio(player, maxTroops) {
     const ratio = maxTroops > 0 ? player.troops() / maxTroops : 0;
     let reserve = 0.35;
@@ -4798,7 +4834,19 @@
 
     if (runtime.mode === "aggressive") reserve -= 0.08;
     if (runtime.mode === "turtle") reserve += 0.12;
-    return clamp(reserve, 0.12, 0.72);
+
+    // Threat-aware defensive hoard. When a much stronger non-bot neighbour
+    // borders us, stop pouring our army into expansion — sit on troops so the
+    // standing army regrows toward the cap and the defender bonus saturates.
+    // This is the #1 reason the bot used to peak then collapse on crowded
+    // maps: it over-committed to offense and got counter-invaded while
+    // troop-starved. Weak/no neighbour (e.g. small maps) => no change.
+    const enemyRatio = worstAdjacentEnemyTroopRatio(player);
+    if (enemyRatio >= 2.5) reserve = Math.max(reserve, 0.85);
+    else if (enemyRatio >= 1.7) reserve = Math.max(reserve, 0.7);
+    else if (enemyRatio >= 1.25) reserve = Math.max(reserve, 0.55);
+
+    return clamp(reserve, 0.12, 0.9);
   }
 
   /**
@@ -4816,8 +4864,19 @@
   function cappedReserveRatio(player, maxTroops, desiredReserve, floor) {
     const fallbackFloor = typeof floor === "number" ? floor : 0.08;
     const currentRatio = maxTroops > 0 ? player.troops() / maxTroops : 0;
-    const cap = Math.max(fallbackFloor, currentRatio * 0.5);
     const desired = Math.max(fallbackFloor, desiredReserve);
+
+    // Defensive override: when a much stronger non-bot neighbour borders us we
+    // WANT to starve offense and hoard. The usual `currentRatio * 0.5` cap
+    // exists to keep us aggressive even below the desired reserve, but applying
+    // it while out-gunned re-commits our shrinking army into attacks and feeds
+    // the collapse spiral. Honour the full desired reserve in that case so
+    // `available` goes (near) zero and the army regrows.
+    if (worstAdjacentEnemyTroopRatio(player) >= 1.25) {
+      return desired;
+    }
+
+    const cap = Math.max(fallbackFloor, currentRatio * 0.5);
     return Math.min(cap, desired);
   }
 
@@ -5910,12 +5969,28 @@
         // of equivalent cost. Force-unlock up to 3 ports when coastal.
         if (hasCoast && count < 3) return true;
         return hasCoast && count < Math.max(1, Math.floor(cities * portCoef));
-      case UnitType.DefensePost:
+      case UnitType.DefensePost: {
+        if (!dpUnlock) return false;
+        // v2.14: break the early-game survival deadlock. DefensePosts give a
+        // 5x defence bonus for only 50k gold — the cheapest way to hold a
+        // border against a stronger neighbour. The old gate required
+        // `cities >= dpCityGate` (>=2 cities), but on crowded maps the bot
+        // often can't afford its first 125k city before a stronger nation
+        // invades, so it died with ZERO structures. When we're actually under
+        // threat (active/brewing invasion, or an overwhelming neighbour),
+        // allow a small DefensePost wall regardless of city count.
+        const underThreat =
+          (runtime.world.threats.activeInvaders || []).length > 0 ||
+          (runtime.world.threats.brewingInvaders || []).length > 0 ||
+          Boolean(runtime.world.threats.overwhelmingNeighbor);
+        if (underThreat) {
+          return count < Math.max(3, Math.floor(cities * dpCoef) + 2);
+        }
         return (
-          dpUnlock &&
           cities >= dpCityGate &&
           count < Math.max(1, Math.floor(cities * dpCoef))
         );
+      }
       case UnitType.MissileSilo: {
         if (!nukesEnabled) return false;
         if (cities < 2) return false;
@@ -10837,6 +10912,43 @@
       onAct: async () => false,
     },
     {
+      // STEAMROLL_CROWN — the dominant crown closing out the game. When we
+      // hold a commanding map share with a clear lead and are NOT under an
+      // actual invasion, we must convert our overwhelming army into the
+      // conquest needed to reach the 80% win line instead of sitting in a
+      // defensive turtle / SAM-wall loop. This is the single biggest reason
+      // the bot used to peak at ~30% share and stall there for thousands of
+      // ticks: every defensive goal (DEFENSIVE_TURTLE 86, SAM_WALL_BUILDUP
+      // 82) out-prioritised conquest once we were ahead. Priority 90 clears
+      // those but stays below the genuine emergency responses (REPEL ≥88
+      // escalating to 98, CONSOLIDATE_FRONT 94 at extreme pressure, MIRV
+      // last resort), so a real threat still pre-empts the steamroll.
+      id: "STEAMROLL_CROWN",
+      horizonTicks: 120,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const myShare = world.totals.myShare;
+        const secondShare = world.totals.secondShare;
+        // Dominant: large share AND a clear lead over the next player.
+        if (myShare < 0.3) return { valid: false };
+        if (myShare < secondShare * 1.5) return { valid: false };
+        // Don't steamroll while actively being invaded — survival first.
+        if ((world.threats.activeInvaders || []).length > 0) {
+          return { valid: false };
+        }
+        // Already won? Nothing left to do.
+        if (myShare >= 0.8) return { valid: false };
+        return {
+          valid: true,
+          priority: 90,
+          note: `steamroll — share=${(myShare * 100).toFixed(0)}% (closing to 80%)`,
+        };
+      },
+      onAct: async () => false,
+    },
+    {
       id: "DEFENSIVE_TURTLE",
       horizonTicks: 200,
       evaluate: () => {
@@ -10875,7 +10987,14 @@
         if (samCount >= targetSams) return { valid: false };
         return {
           valid: true,
-          priority: 82,
+          // v2.14: lowered 82 -> 76 so active conquest (EASY_NATION_GRAB up to
+          // 80, TERRA_NULLIUS_RUSH ~81) out-prioritises speculative SAM-wall
+          // building in the 20-35% share window. Building SAMs while a rival
+          // nation keeps grabbing land was a losing trade — we'd turtle to
+          // rank 2. Still above pure idle/economy so we DO build SAMs when
+          // there's nothing better to do (and still below all threat-prep
+          // goals PREEMPT 82 / REPEL >=88 so defence always wins).
+          priority: 76,
           note: `pre-crown SAM wall ${samCount}/${targetSams}`,
         };
       },
@@ -10965,9 +11084,27 @@
           (best, c) => (best === null || c.troops < best.troops ? c : best),
           null,
         );
+        // v2.13.0: scale priority with how badly we out-troop the weakest
+        // adjacent nation. The old flat 63 lost to SAM_WALL_BUILDUP (82) and
+        // DEFENSE_NETWORK, so once terra nullius dried up the bot stopped
+        // conquering and turtled on SAMs at 20-35% share — letting a rival
+        // nation out-snowball it and win the FFA. When we clearly dominate an
+        // adjacent nation, eating it (more land => more pop cap + loot gold
+        // for cities) is worth far more than another SAM. Cap at 80 so it
+        // beats SAM_WALL_BUILDUP (lowered to 76 in v2.14) but stays BELOW the
+        // threat-prep / survival goals (PREEMPT_INVASION 82, REPEL >=88,
+        // CONSOLIDATE_FRONT 94) and STEAMROLL (90). Crucially it must lose to
+        // PREEMPT_INVASION: if a strong neighbour is winding up against us we
+        // need DefensePosts on that border, not a speculative conquest that
+        // leaves home open (this was an over-aggression regression in v2.13).
+        const advRatio = me.troops / Math.max(1, target.troops);
+        let priority = 63;
+        if (advRatio >= 1.3) priority = 72;
+        if (advRatio >= 1.8) priority = 78;
+        if (advRatio >= 2.5) priority = 80;
         return {
           valid: true,
-          priority: 63,
+          priority,
           note:
             `easy=${target.name} (${target.type}) ` +
             `troopRatio=${(target.troops / Math.max(me.troops, 1)).toFixed(2)}`,
@@ -11973,6 +12110,19 @@
         // Force handled=true unconditionally so the legacy fallback
         // can never fire offensive combat during the traitor lock.
         handled = true;
+        break;
+      case "STEAMROLL_CROWN":
+        // v2.12.0: dominant crown closing out the game. Relentlessly
+        // convert our overwhelming army into conquest — land combat first,
+        // then empty-land grabs, river crossings, and overseas naval
+        // invasions to reach the remaining nations. Only if nothing can be
+        // attacked this tick do we fall back to economy/upkeep.
+        handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeExpand(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
+        if (!handled) handled = await maybeNaval(me);
+        if (!handled) handled = await maybeEconomy(me, getEnemies());
+        if (!handled) handled = await maybeDiplomacy(me);
         break;
       case "SAM_WALL_BUILDUP":
         handled = await runGoal_SamWallBuildup(me);
@@ -14165,7 +14315,10 @@
     scenario1.threats.crownSmallID = 2;
     step("crown50-atom -> NUKE_CROWN", scenario1, "NUKE_CROWN", true);
 
-    // Scenario 2: we're the crown ourselves -> DEFENSIVE_TURTLE.
+    // Scenario 2: we're the dominant crown and NOT under invasion ->
+    // STEAMROLL_CROWN (close out the game) rather than turtle. v2.12.0:
+    // a safe crown must keep conquering to reach the 80% win line; the old
+    // behaviour stalled at ~30% share in a defensive turtle loop.
     const scenario2 = buildTestWorld({
       totals: {
         alivePlayers: 3,
@@ -14179,7 +14332,40 @@
         secondShare: 0.15,
       },
     });
-    step("we-are-crown -> DEFENSIVE_TURTLE", scenario2, "DEFENSIVE_TURTLE");
+    step("we-are-crown-safe -> STEAMROLL_CROWN", scenario2, "STEAMROLL_CROWN");
+
+    // Scenario 2b: dominant crown but actively being invaded -> survival
+    // (REPEL_INVASION) outranks the steamroll; STEAMROLL_CROWN is invalid
+    // while activeInvaders is non-empty.
+    const scenario2b = buildTestWorld({
+      totals: {
+        alivePlayers: 3,
+        humanCount: 1,
+        nationCount: 1,
+        botCount: 1,
+        totalLand: 10_000,
+        usableLand: 10_000,
+        crownShare: 0.35,
+        myShare: 0.35,
+        secondShare: 0.15,
+      },
+    });
+    scenario2b.me.incomingTroops = 60_000;
+    scenario2b.threats.invasionTroopsInbound = 60_000;
+    scenario2b.threats.activeInvaders = [
+      {
+        smallID: 88,
+        name: "Invader",
+        type: PlayerType.Human,
+        isFriendly: false,
+        isAdjacent: true,
+        troops: 90_000,
+        invasionIncoming: 60_000,
+        invasionPressure: 1.5,
+        strength: 110_000,
+      },
+    ];
+    step("we-are-crown-invaded -> REPEL_INVASION", scenario2b, "REPEL_INVASION");
 
     // Scenario 3: we own 27% -> SAM_WALL_BUILDUP.
     const scenario3 = buildTestWorld({
@@ -14979,6 +15165,10 @@
         sendRawMessage,
         installLocalTransportBridge,
         handleServerMessage,
+        // Per-tick brain entry point. Exposed so the headless FFA harness can
+        // drive the bot deterministically (one call per engine tick) instead
+        // of relying on the setInterval loop.
+        runModulesForTick,
         buildOrderForArchetype,
         reasonLog,
         UnitType,
