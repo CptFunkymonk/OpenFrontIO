@@ -147,7 +147,8 @@ function buildMockGame(opts: any) {
       return out;
     },
     manhattanDist: (a: number, b: number) =>
-      Math.abs((a % W) - (b % W)) + Math.abs(Math.floor(a / W) - Math.floor(b / W)),
+      Math.abs((a % W) - (b % W)) +
+      Math.abs(Math.floor(a / W) - Math.floor(b / W)),
     nearbyUnits: () => [],
     config: () => ({
       gameConfig: () => ({
@@ -327,6 +328,82 @@ describe("Overlord end-to-end loop", () => {
       (i) => i.type === "allianceRequest" && i.recipient === "peer",
     );
     expect(req, "should court the strong non-adjacent peer").toBeTruthy();
+  });
+
+  it("logs server error/desync messages instead of dropping them", () => {
+    expect(() =>
+      runtime.test.handleServerMessage({
+        type: "error",
+        error: "intent_validation",
+        message: "bad intent",
+      }),
+    ).not.toThrow();
+    expect(
+      runtime.state.log.some((l: string) =>
+        l.includes("SERVER ERROR: intent_validation — bad intent"),
+      ),
+    ).toBe(true);
+
+    expect(() =>
+      runtime.test.handleServerMessage({ type: "desync", turn: 42 }),
+    ).not.toThrow();
+    expect(
+      runtime.state.log.some((l: string) =>
+        l.includes("SERVER DESYNC at turn 42"),
+      ),
+    ).toBe(true);
+  });
+
+  it("naval: aborts (no boat intent) when no viable launch point exists", async () => {
+    const ownership = new Array(W * H).fill(0);
+    fillBlock(ownership, 1, 0, 0, 6, 6); // me
+    fillBlock(ownership, 2, 14, 14, 8, 8); // target (big block, easy to sample)
+    const gv = buildMockGame({
+      tick: 700,
+      meSmallID: 1,
+      players: [
+        { smallID: 1, id: "me", name: "Me", troops: 150000, gold: 0 },
+        { smallID: 2, id: "prey", name: "Prey", troops: 30000, gold: 0 },
+      ],
+      ownership,
+    });
+    setGame(gv);
+    // Mock default: bestTransportShipSpawn resolves false (unreachable).
+    const world = runtime.test.buildWorld(gv);
+    const target = world.bySmallID.get(2);
+    const sent = await runtime.test.runNaval(world, { target });
+    expect(sent).toBe(false);
+    expect(captured.filter((i) => i.type === "boat").length).toBe(0);
+    // Failed probe keeps only a short retry guard, not the full 30-tick burn.
+    expect(runtime.state.cooldowns.boat).toBe(world.tick - 20);
+  });
+
+  it("naval: dispatches a boat when a launch point is viable", async () => {
+    const ownership = new Array(W * H).fill(0);
+    fillBlock(ownership, 1, 0, 0, 6, 6);
+    fillBlock(ownership, 2, 14, 14, 8, 8);
+    const gv = buildMockGame({
+      tick: 700,
+      meSmallID: 1,
+      players: [
+        { smallID: 1, id: "me", name: "Me", troops: 150000, gold: 0 },
+        { smallID: 2, id: "prey", name: "Prey", troops: 30000, gold: 0 },
+      ],
+      ownership,
+    });
+    setGame(gv);
+    gv.myPlayer().bestTransportShipSpawn = async () => 99; // viable launch
+    const world = runtime.test.buildWorld(gv);
+    const target = world.bySmallID.get(2);
+    const sent = await runtime.test.runNaval(world, { target });
+    expect(sent).toBe(true);
+    const boat = captured.find((i) => i.type === "boat");
+    expect(boat).toBeTruthy();
+    expect(boat.troops).toBeGreaterThan(0);
+    // dst must be a tile owned by the target.
+    expect(ownership[boat.dst]).toBe(2);
+    // Successful dispatch burns the full cooldown.
+    expect(runtime.state.cooldowns.boat).toBe(world.tick);
   });
 
   it("survives many ticks without throwing", async () => {

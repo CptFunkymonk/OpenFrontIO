@@ -1345,6 +1345,7 @@
   runtime.test.buildWorld = buildWorld;
   runtime.test.findGameView = findGameView;
   runtime.test.attachLocalBridge = attachLocalBridge;
+  runtime.test.handleServerMessage = handleServerMessage;
   runtime._attachLocalBridge = attachLocalBridge;
   runtime._buildWorld = buildWorld;
 
@@ -4098,6 +4099,7 @@
   runtime.test.selectPrimaryGoal = selectPrimaryGoal;
   runtime.test.GOAL_SPECS = GOAL_SPECS;
   runtime.test.runModulesForTick = runModulesForTick;
+  runtime.test.runNaval = runNaval;
 
   runtime.test.runSuite = function () {
     const results = [];
