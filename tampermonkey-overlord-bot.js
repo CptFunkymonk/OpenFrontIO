@@ -737,6 +737,16 @@
     typeof window !== "undefined" ? window.WebSocket : null;
 
   function installWebSocketHook() {
+    try {
+      installWebSocketHookUnsafe();
+    } catch (err) {
+      // Never let a locked-down environment (frozen WebSocket, CSP quirks)
+      // abort the whole bootstrap — the overlay/local-bridge paths still work.
+      botLog("WebSocket hook failed: " + (err && err.message));
+    }
+  }
+
+  function installWebSocketHookUnsafe() {
     if (typeof window === "undefined" || !window.WebSocket) {
       return;
     }
@@ -845,6 +855,17 @@
       if (typeof runtime._onTurn === "function") {
         safeCall(() => runtime._onTurn(), null);
       }
+    } else if (data.type === "error") {
+      // Surface server rejections (e.g. malformed intents) instead of
+      // dropping them — this is the first place to look when "nothing works".
+      botLog(
+        "SERVER ERROR: " +
+          data.error +
+          (data.message ? " — " + data.message : ""),
+      );
+      decisionLog("server error: " + data.error);
+    } else if (data.type === "desync") {
+      botLog("SERVER DESYNC at turn " + data.turn);
     }
   }
 
@@ -3258,7 +3279,8 @@
   function runRepel(world, ctx) {
     let acted = false;
     const me = world.me;
-    // Recall doomed outgoing attacks to bring troops home for defense.
+    // Recall ALL outgoing attacks: under an active invasion every committed
+    // troop is worth more at home (defense gets the terrain/DP multipliers).
     for (const a of me.outgoingAttacks || []) {
       if (a.id) {
         acted = IO.sendCancelAttack(a.id) || acted;
@@ -3364,22 +3386,32 @@
     if (world.tick - lastBoat < 30) {
       return false;
     }
-    runtime.state.cooldowns.boat = world.tick;
     // Find a destination tile owned by the target and a viable spawn.
     const dstSeed = findOwnedTileOf(gameView, target.smallID, 300);
     if (dstSeed == null) {
       return false;
     }
+    // bestTransportShipSpawn resolves `false` when no launch point can reach
+    // the destination — sending a boat intent there is doomed, so abort. Use a
+    // short cooldown for failed probes (cheap retry soon) and only burn the
+    // full cooldown when a boat is actually dispatched.
     const spawn = await safeCallAsync(
       () => myPlayer.bestTransportShipSpawn(dstSeed),
       false,
     );
+    if (spawn === false) {
+      runtime.state.cooldowns.boat = world.tick - 20; // retry in ~10 ticks
+      return false;
+    }
     const troops = Math.floor((world.me.troops || 0) / 5);
     if (troops <= 0) {
       return false;
     }
-    const dst = spawn && spawn !== false ? dstSeed : dstSeed;
-    return IO.sendBoat(dst, troops);
+    const sent = IO.sendBoat(dstSeed, troops);
+    if (sent) {
+      runtime.state.cooldowns.boat = world.tick;
+    }
+    return sent;
   }
 
   function findCrownTargetTile(gameView, crown) {
@@ -4513,8 +4545,15 @@
       return;
     }
     document.addEventListener("keydown", (e) => {
+      // Never hijack browser/app shortcuts (Ctrl+O etc.) or typing fields.
+      if (e.ctrlKey || e.metaKey || e.altKey) {
+        return;
+      }
       const tag = (e.target && e.target.tagName) || "";
       if (tag === "INPUT" || tag === "TEXTAREA") {
+        return;
+      }
+      if (e.target && e.target.isContentEditable) {
         return;
       }
       if (e.key === "o" || e.key === "O") {
