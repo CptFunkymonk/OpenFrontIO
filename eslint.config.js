@@ -17,6 +17,11 @@ export default [
     ignores: [
       "src/server/gatekeeper/**",
       "tests/pathfinding/playground/**",
+      // Standalone userscripts: plain JS outside the tsconfig project, so the
+      // type-aware config cannot parse them. They are linted separately with
+      // a Tampermonkey-equivalent config (eslint:recommended + curly).
+      "tampermonkey-bot.js",
+      "tampermonkey-overlord-bot.js",
       "tampermonkey-superhuman-bot.js",
     ],
   },
