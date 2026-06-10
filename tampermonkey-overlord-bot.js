@@ -325,8 +325,8 @@
       const base =
         2 * (Math.pow(tiles, 0.6) * 1000 + 50000) +
         cityLevelsSum * CITY_TROOP_INCREASE;
-      if (type === PlayerType.Bot) return base / 3;
-      if (type === PlayerType.Human) return base;
+      if (type === PlayerType.Bot) {return base / 3;}
+      if (type === PlayerType.Human) {return base;}
       // Nation
       return base * NATION_MAXTROOP_MULT[difficulty];
     }
@@ -337,8 +337,8 @@
       let toAdd = 10 + Math.pow(troops, 0.73) / 4;
       const ratio = 1 - troops / max;
       toAdd *= ratio;
-      if (type === PlayerType.Bot) toAdd *= 0.6;
-      else if (type === PlayerType.Nation) toAdd *= NATION_TROOPINC_MULT[difficulty];
+      if (type === PlayerType.Bot) {toAdd *= 0.6;}
+      else if (type === PlayerType.Nation) {toAdd *= NATION_TROOPINC_MULT[difficulty];}
       return Math.min(troops + toAdd, max) - troops;
     }
 
@@ -471,12 +471,12 @@
     function optimalAttackTroops(available, defenderTroops, opts) {
       opts = opts || {};
       const minAbsolute = opts.minAbsolute == null ? 5000 : opts.minAbsolute;
-      if (available <= 0) return 0;
+      if (available <= 0) {return 0;}
       if (defenderTroops <= 0) {
         // TerraNullius: flat loss, commit everything above reserve.
         return Math.floor(available);
       }
-      if (available < minAbsolute) return 0;
+      if (available < minAbsolute) {return 0;}
 
       const ideal = Math.ceil(defenderTroops * ATK_RATIO_MIN_LOSS);
       const strong = Math.ceil(defenderTroops * ATK_RATIO_MAX_SPEED);
@@ -486,8 +486,8 @@
         // Keep a small follow-up buffer but never drop below the ideal point.
         return Math.max(ideal, Math.floor(available * 0.85));
       }
-      if (available >= strong) return Math.floor(available);
-      if (available >= minViable) return opts.retaliating ? Math.floor(available) : 0;
+      if (available >= strong) {return Math.floor(available);}
+      if (available >= minViable) {return opts.retaliating ? Math.floor(available) : 0;}
       return opts.retaliating && available >= minAbsolute ? Math.floor(available) : 0;
     }
 
@@ -496,7 +496,7 @@
      * `troops` to `target` (integrating troopIncrease). Capped iterations.
      */
     function ticksToReachTroops(troops, target, params) {
-      if (target <= troops) return 0;
+      if (target <= troops) {return 0;}
       let t = troops;
       let ticks = 0;
       const cap = params.max;
@@ -508,7 +508,7 @@
           type: params.type,
           difficulty: params.difficulty,
         });
-        if (inc <= 1e-6) break; // asymptote
+        if (inc <= 1e-6) {break;} // asymptote
         t += inc;
         ticks++;
       }
@@ -517,8 +517,8 @@
 
     /** Ticks to afford a cost given current gold and per-tick income. */
     function ticksToAfford(gold, income, cost) {
-      if (gold >= cost) return 0;
-      if (income <= 0) return Infinity;
+      if (gold >= cost) {return 0;}
+      if (income <= 0) {return Infinity;}
       return Math.ceil((cost - gold) / income);
     }
 
@@ -643,13 +643,13 @@
   }
 
   function fmt(n) {
-    if (n == null) return "0";
+    if (n == null) {return "0";}
     n = Number(n);
     const sign = n < 0 ? "-" : "";
     n = Math.abs(n);
-    if (n >= 1e9) return sign + (n / 1e9).toFixed(1) + "B";
-    if (n >= 1e6) return sign + (n / 1e6).toFixed(1) + "M";
-    if (n >= 1e3) return sign + (n / 1e3).toFixed(1) + "K";
+    if (n >= 1e9) {return sign + (n / 1e9).toFixed(1) + "B";}
+    if (n >= 1e6) {return sign + (n / 1e6).toFixed(1) + "M";}
+    if (n >= 1e3) {return sign + (n / 1e3).toFixed(1) + "K";}
     return sign + String(Math.round(n));
   }
 
@@ -660,15 +660,15 @@
   function botLog(msg) {
     const entry = "[Overlord] " + msg;
     runtime.state.log.push(entry);
-    if (runtime.state.log.length > 300) runtime.state.log.shift();
-    if (!TEST_MODE && typeof console !== "undefined") console.log(entry);
+    if (runtime.state.log.length > 300) {runtime.state.log.shift();}
+    if (!TEST_MODE && typeof console !== "undefined") {console.log(entry);}
   }
 
   function decisionLog(msg) {
     const entry = "T" + runtime.hooks.tick + " " + msg;
     runtime.state.decisionLog.push(entry);
     if (runtime.state.decisionLog.length > 200)
-      runtime.state.decisionLog.shift();
+      {runtime.state.decisionLog.shift();}
   }
 
   function isStructureType(t) {
@@ -687,7 +687,7 @@
     typeof window !== "undefined" ? window.WebSocket : null;
 
   function installWebSocketHook() {
-    if (typeof window === "undefined" || !window.WebSocket) return;
+    if (typeof window === "undefined" || !window.WebSocket) {return;}
     const Native = window.WebSocket;
     function Wrapped(url, protocols) {
       const ws = protocols ? new Native(url, protocols) : new Native(url);
@@ -726,8 +726,8 @@
   }
 
   function attachLocalBridge() {
-    if (typeof window === "undefined") return false;
-    if (runtime.hooks.localBridge) return true;
+    if (typeof window === "undefined") {return false;}
+    if (runtime.hooks.localBridge) {return true;}
     const bridge = window.__openFrontLocalTransport;
     if (!bridge || bridge.isLocal !== true || typeof bridge.addMessageListener !== "function") {
       return false;
@@ -746,7 +746,7 @@
   }
 
   function handleServerMessage(data) {
-    if (!data || typeof data !== "object") return;
+    if (!data || typeof data !== "object") {return;}
     if (data.type === "lobby_info") {
       runtime.hooks.myClientID = data.myClientID || runtime.hooks.myClientID;
     } else if (data.type === "start") {
@@ -764,7 +764,7 @@
     } else if (data.type === "turn") {
       const turn = data.turn || {};
       if (typeof turn.turnNumber === "number")
-        runtime.hooks.tick = turn.turnNumber;
+        {runtime.hooks.tick = turn.turnNumber;}
       if (Array.isArray(turn.intents)) {
         for (const intent of turn.intents) {
           if (intent && intent.clientID === runtime.hooks.myClientID) {
@@ -806,7 +806,7 @@
       } catch (_) {
         continue;
       }
-      if (isGameViewLike(v)) return v;
+      if (isGameViewLike(v)) {return v;}
       if (v && typeof v === "object") {
         let childNames;
         try {
@@ -821,7 +821,7 @@
           } catch (_) {
             continue;
           }
-          if (isGameViewLike(cv)) return cv;
+          if (isGameViewLike(cv)) {return cv;}
         }
       }
     }
@@ -831,10 +831,10 @@
   function findGameView() {
     const cached = runtime.hooks.gameView;
     if (cached) {
-      if (safeCall(() => (cached.ticks(), true), false)) return cached;
+      if (safeCall(() => (cached.ticks(), true), false)) {return cached;}
       runtime.hooks.gameView = null;
     }
-    if (typeof document === "undefined") return null;
+    if (typeof document === "undefined") {return null;}
 
     // 1) window globals
     try {
@@ -863,7 +863,7 @@
     try {
       for (const el of document.querySelectorAll("*")) {
         const sources = [el];
-        if (el.shadowRoot) sources.push(el.shadowRoot);
+        if (el.shadowRoot) {sources.push(el.shadowRoot);}
         for (const src of sources) {
           const v = deepFindGameView(src);
           if (v) {
@@ -893,29 +893,29 @@
       return true;
     }
     const sock = runtime.hooks.socket;
-    if (!sock) return false;
+    if (!sock) {return false;}
     if (NativeWebSocket && sock.readyState !== NativeWebSocket.OPEN) {
       // In harness, FakeWebSocket.OPEN === 1 and readyState === 1.
-      if (sock.readyState !== 1) return false;
+      if (sock.readyState !== 1) {return false;}
     }
     safeCall(() => sock.send(JSON.stringify(obj)), null);
     return true;
   }
 
   function sendIntent(intent) {
-    if (!runtime.enabled) return false;
+    if (!runtime.enabled) {return false;}
     const signature = intent.type + ":" + JSON.stringify(intent);
-    if (runtime.state.lastIntentSignature === signature) return false;
+    if (runtime.state.lastIntentSignature === signature) {return false;}
     // Phase 7: stealth gate hook.
     if (typeof runtime._stealthBlocks === "function") {
-      if (runtime._stealthBlocks(intent)) return false;
+      if (runtime._stealthBlocks(intent)) {return false;}
     }
     const ok = rawSend({ type: "intent", intent });
     if (ok) {
       runtime.state.intentsSent++;
       runtime.state.lastIntentSignature = signature;
       if (typeof runtime._recordIntent === "function")
-        safeCall(() => runtime._recordIntent(intent), null);
+        {safeCall(() => runtime._recordIntent(intent), null);}
       decisionLog("SENT " + intent.type);
     }
     return ok;
@@ -938,7 +938,7 @@
     sendBuild: (unit, tile, rocketDirectionUp) => {
       const intent = { type: "build_unit", unit, tile };
       if (rocketDirectionUp !== undefined)
-        intent.rocketDirectionUp = rocketDirectionUp;
+        {intent.rocketDirectionUp = rocketDirectionUp;}
       return sendIntent(intent);
     },
     sendUpgrade: (unitId, unit) =>
@@ -995,7 +995,7 @@
     const cities = safeCall(() => player.units(UnitType.City), []) || [];
     let sum = 0;
     for (const c of cities) {
-      if (safeCall(() => c.isUnderConstruction(), false)) continue;
+      if (safeCall(() => c.isUnderConstruction(), false)) {continue;}
       sum += safeCall(() => c.level(), 1);
     }
     return sum;
@@ -1009,7 +1009,7 @@
       let n = 0;
       let lvl = 0;
       for (const u of units) {
-        if (safeCall(() => u.isUnderConstruction(), false)) continue;
+        if (safeCall(() => u.isUnderConstruction(), false)) {continue;}
         n++;
         lvl += safeCall(() => u.level(), 1);
       }
@@ -1021,8 +1021,8 @@
 
   function sumAttackTroops(attacks) {
     let s = 0;
-    if (!attacks) return 0;
-    for (const a of attacks) s += a.troops || 0;
+    if (!attacks) {return 0;}
+    for (const a of attacks) {s += a.troops || 0;}
     return s;
   }
 
@@ -1033,12 +1033,12 @@
       runtime.state.history.set(smallID, arr);
     }
     arr.push({ tick, tiles, troops, gold });
-    if (arr.length > CONFIG.historyMaxSamples) arr.shift();
+    if (arr.length > CONFIG.historyMaxSamples) {arr.shift();}
   }
 
   function velocity(smallID, tick, field) {
     const arr = runtime.state.history.get(smallID);
-    if (!arr || arr.length < 2) return 0;
+    if (!arr || arr.length < 2) {return 0;}
     // Find oldest sample within the velocity window.
     let oldest = arr[0];
     for (const s of arr) {
@@ -1049,7 +1049,7 @@
     }
     const last = arr[arr.length - 1];
     const dt = last.tick - oldest.tick;
-    if (dt <= 0) return 0;
+    if (dt <= 0) {return 0;}
     return ((last[field] - oldest[field]) / dt) * CONFIG.ticksPerMinute;
   }
 
@@ -1058,7 +1058,7 @@
    * gameView; mutates runtime.state.history for velocity tracking.
    */
   function buildWorld(gameView) {
-    if (!gameView) return null;
+    if (!gameView) {return null;}
     const tick = safeCall(() => gameView.ticks(), runtime.hooks.tick) || 0;
     const gcInfo = getGameConfigInfo(gameView);
     const myPlayer = safeCall(() => gameView.myPlayer(), null);
@@ -1081,9 +1081,9 @@
     for (const p of players) {
       const smallID = safeCall(() => p.smallID(), -1);
       const type = safeCall(() => p.type(), PlayerType.Human);
-      if (type === PlayerType.Human) humanCount++;
-      else if (type === PlayerType.Nation) nationCount++;
-      else if (type === PlayerType.Bot) botCount++;
+      if (type === PlayerType.Human) {humanCount++;}
+      else if (type === PlayerType.Nation) {nationCount++;}
+      else if (type === PlayerType.Bot) {botCount++;}
 
       const tiles = safeCall(() => p.numTilesOwned(), 0);
       const troops = safeCall(() => p.troops(), 0);
@@ -1151,7 +1151,7 @@
       });
       bySmallID.set(mySid, me);
       const meIdx = everyone.indexOf(meEntry);
-      if (meIdx >= 0) everyone[meIdx] = me;
+      if (meIdx >= 0) {everyone[meIdx] = me;}
     }
 
     // totals / shares
@@ -1234,16 +1234,16 @@
       // pop cap) lets us both expand early (avoids the under-expansion trap)
       // AND never leave ourselves defenceless (the glass-cannon failure).
       const me = world.me;
-      if (!me) return 0.25;
+      if (!me) {return 0.25;}
       const pressure = me.incomingTroops / Math.max(1, me.troops);
       const share = world.totals.myShare;
       let reserve;
-      if (share < 0.03) reserve = 0.12; // tiny: claim space before we're boxed in
-      else if (share < 0.08) reserve = 0.2;
-      else if (share < 0.2) reserve = 0.28;
-      else reserve = 0.35; // established: keep density to hold
-      if (pressure > 0.5) reserve = Math.max(reserve, 0.55);
-      else if (pressure > 0.25) reserve = Math.max(reserve, 0.42);
+      if (share < 0.03) {reserve = 0.12;} // tiny: claim space before we're boxed in
+      else if (share < 0.08) {reserve = 0.2;}
+      else if (share < 0.2) {reserve = 0.28;}
+      else {reserve = 0.35;} // established: keep density to hold
+      if (pressure > 0.5) {reserve = Math.max(reserve, 0.55);}
+      else if (pressure > 0.25) {reserve = Math.max(reserve, 0.42);}
       return clamp01(reserve, 0.1, 0.75);
     }
 
@@ -1254,12 +1254,12 @@
     function reserveForCombat(world) {
       // Fraction of CURRENT troops to keep home when committing a PvP attack.
       const me = world.me;
-      if (!me) return 0.35;
+      if (!me) {return 0.35;}
       const share = world.totals.myShare;
       const pressure = me.incomingTroops / Math.max(1, me.troops);
       let reserve = 0.35; // keep 35% of cap home when committing PvP attacks
-      if (pressure > 0.4) reserve = Math.max(reserve, 0.45);
-      if (share > 0.4) reserve = Math.min(reserve, 0.3);
+      if (pressure > 0.4) {reserve = Math.max(reserve, 0.45);}
+      if (share > 0.4) {reserve = Math.min(reserve, 0.3);}
       return clamp01(reserve, 0.2, 0.7);
     }
 
@@ -1269,7 +1269,7 @@
       // expansion can't drain us to zero (the glass-cannon death) — once troops
       // fall to the reserve we stop until they regenerate.
       const me = world.me;
-      if (!me) return 0;
+      if (!me) {return 0;}
       return Math.floor(me.troops - me.maxTroops * reserveRatio);
     }
 
@@ -1315,7 +1315,7 @@
      */
     function selectAttackTarget(world, candidates) {
       const me = world.me;
-      if (!me || !candidates || candidates.length === 0) return null;
+      if (!me || !candidates || candidates.length === 0) {return null;}
       const myTroops = me.troops;
 
       const sorted = candidates.slice().sort((a, b) => a.troops - b.troops);
@@ -1324,11 +1324,11 @@
       let biggestAttacker = null;
       let biggestTroops = 0;
       for (const a of me.incomingAttacks || []) {
-        if (a.troops <= biggestTroops) continue;
+        if (a.troops <= biggestTroops) {continue;}
         const atkEntry = world.bySmallID.get(a.attackerID);
-        if (!atkEntry) continue;
-        if (atkEntry.type === PlayerType.Bot) continue;
-        if (!candidates.some((c) => c.smallID === atkEntry.smallID)) continue;
+        if (!atkEntry) {continue;}
+        if (atkEntry.type === PlayerType.Bot) {continue;}
+        if (!candidates.some((c) => c.smallID === atkEntry.smallID)) {continue;}
         biggestTroops = a.troops;
         biggestAttacker = atkEntry;
       }
@@ -1370,7 +1370,7 @@
 
       // 6) Victim: under 50%+ of their troops in incoming attacks & < 1.2x us.
       for (const c of sorted) {
-        if (c.troops > myTroops * 1.2) continue;
+        if (c.troops > myTroops * 1.2) {continue;}
         if ((c.incomingTroops || 0) > c.troops * 0.5) {
           return { entry: c, reason: "victim", retaliating: false };
         }
@@ -1394,7 +1394,7 @@
      */
     function pickBuild(world, flags) {
       const me = world.me;
-      if (!me) return null;
+      if (!me) {return null;}
       flags = flags || {};
       const gold = me.gold;
       const s = me.structures || {};
@@ -1475,18 +1475,18 @@
         });
       }
 
-      if (candidates.length === 0) return null;
+      if (candidates.length === 0) {return null;}
       candidates.sort((a, b) => a.prio - b.prio);
 
       // Highest-priority affordable build wins.
       for (const b of candidates) {
         if (gold >= b.cost)
-          return {
+          {return {
             type: b.type,
             cost: b.cost,
             reason: b.reason,
             affordable: true,
-          };
+          };}
       }
       // Otherwise advise banking for the highest-priority build.
       const top = candidates[0];
@@ -1539,7 +1539,7 @@
      * Impossible-nation value; for ourselves the planner passes the real one.
      */
     function assumedReserveRatio(entry) {
-      if (!entry) return 0.35;
+      if (!entry) {return 0.35;}
       // Bots commit almost everything; humans/nations hold a reserve.
       return entry.type === PlayerType.Bot ? 0.1 : 0.35;
     }
@@ -1670,7 +1670,7 @@
 
       const enCommittable = () => Math.max(0, enTroops - enMax(enTiles) * enReserve);
 
-      if (enCommittable() >= meTroops * factor) return 0;
+      if (enCommittable() >= meTroops * factor) {return 0;}
 
       for (let t = 1; t <= horizon; t++) {
         meTiles = Math.min(totalLand, Math.max(0, meTiles + meTilesPerTick));
@@ -1687,7 +1687,7 @@
           type: enemy.type || PlayerType.Human,
           difficulty,
         });
-        if (enCommittable() >= meTroops * factor) return t;
+        if (enCommittable() >= meTroops * factor) {return t;}
       }
       return Infinity;
     }
@@ -1698,12 +1698,12 @@
      */
     function crownWinEta(world) {
       const crown = world.threats && world.threats.crown;
-      if (!crown) return Infinity;
+      if (!crown) {return Infinity;}
       const winPct = MATH.percentageTilesOwnedToWin(world.gameConfig.isTeam);
       const targetTiles = (winPct / 100) * world.totals.totalLand;
-      if (crown.tiles >= targetTiles) return 0;
+      if (crown.tiles >= targetTiles) {return 0;}
       const perTick = (crown.tilesPerMin || 0) / 600;
-      if (perTick <= 0) return Infinity;
+      if (perTick <= 0) {return Infinity;}
       return Math.ceil((targetTiles - crown.tiles) / perTick);
     }
 
@@ -1718,7 +1718,7 @@
     function safeCommit(world, commitTroops, ctx) {
       ctx = ctx || {};
       const me = world.me;
-      if (!me) return { trough: 0, safe: false, recommendedMax: 0 };
+      if (!me) {return { trough: 0, safe: false, recommendedMax: 0 };}
       const adjacents = (world.threats && world.threats.adjacentEnemies) || [];
       // The biggest immediate striker among adjacent enemies.
       let danger = null;
@@ -1777,7 +1777,7 @@
       info = info || {};
       const me = world.me;
       const t = world.threats; // crown already set by buildWorld
-      if (!me) return t;
+      if (!me) {return t;}
 
       const adjacent = (info.adjacentEnemies || []).slice();
       t.adjacentEnemies = adjacent;
@@ -1795,13 +1795,13 @@
       let invasionInbound = 0;
       for (const a of me.incomingAttacks || []) {
         const atk = world.bySmallID.get(a.attackerID);
-        if (!atk || atk.isMe || atk.isAlly) continue;
+        if (!atk || atk.isMe || atk.isAlly) {continue;}
         invasionInbound += a.troops || 0;
         // Bots are noise unless large; track players & big bot pushes.
         if (atk.type === PlayerType.Bot && (a.troops || 0) < me.troops * 0.15)
-          continue;
+          {continue;}
         if (!activeInvaders.some((x) => x.smallID === atk.smallID))
-          activeInvaders.push(atk);
+          {activeInvaders.push(atk);}
       }
       activeInvaders.sort((x, y) => y.troops - x.troops);
       t.activeInvaders = activeInvaders;
@@ -1811,8 +1811,8 @@
       //    can invade us within the horizon and are accumulating troops. ──
       const brewing = [];
       for (const e of adjacent) {
-        if (activeInvaders.some((x) => x.smallID === e.smallID)) continue;
-        if (e.isAlly) continue;
+        if (activeInvaders.some((x) => x.smallID === e.smallID)) {continue;}
+        if (e.isAlly) {continue;}
         const eta = SIM.ticksUntilInvadable(me, e, ctx);
         // Accumulating (or already capable) and a real contender.
         const accumulating = (e.troopsPerMin || 0) >= 0;
@@ -1843,9 +1843,9 @@
       // ── Rising stars: fast-growing non-allied players we can still beat. ──
       const rising = [];
       for (const e of world.everyone) {
-        if (e.isMe || e.isAlly) continue;
-        if ((e.tilesPerMin || 0) <= 0) continue;
-        if (e.troops > me.troops * 1.2) continue; // beatable
+        if (e.isMe || e.isAlly) {continue;}
+        if ((e.tilesPerMin || 0) <= 0) {continue;}
+        if (e.troops > me.troops * 1.2) {continue;} // beatable
         rising.push(e);
       }
       rising.sort((x, y) => (y.tilesPerMin || 0) - (x.tilesPerMin || 0));
@@ -1864,7 +1864,7 @@
           const en = world.bySmallID.get(sid);
           return s + (en ? en.share : 0);
         }, 0);
-        if (!biggest || share > biggest.share) biggest = { members: bloc, share };
+        if (!biggest || share > biggest.share) {biggest = { members: bloc, share };}
       }
       const blocReal =
         biggest &&
@@ -1892,18 +1892,18 @@
       const seen = new Set();
       const blocs = [];
       for (const [sid] of edges) {
-        if (sid === me.smallID || seen.has(sid)) continue;
+        if (sid === me.smallID || seen.has(sid)) {continue;}
         const stack = [sid];
         const comp = [];
         while (stack.length) {
           const cur = stack.pop();
-          if (seen.has(cur) || cur === me.smallID) continue;
+          if (seen.has(cur) || cur === me.smallID) {continue;}
           seen.add(cur);
           comp.push(cur);
           const nbrs = edges.get(cur);
-          if (nbrs) for (const n of nbrs) if (!seen.has(n) && n !== me.smallID) stack.push(n);
+          if (nbrs) {for (const n of nbrs) {if (!seen.has(n) && n !== me.smallID) {stack.push(n);}}}
         }
-        if (comp.length >= 2) blocs.push(comp);
+        if (comp.length >= 2) {blocs.push(comp);}
       }
       return blocs;
     }
@@ -1972,8 +1972,8 @@
      */
     function shouldAcceptAlliance(world, req) {
       const me = world.me;
-      if (!me) return { accept: false, reason: "no me" };
-      if (req.isTraitor) return { accept: false, reason: "traitor" };
+      if (!me) {return { accept: false, reason: "no me" };}
+      if (req.isTraitor) {return { accept: false, reason: "traitor" };}
 
       const nb = nonBotCount(world);
       // Don't feed the crown: reject players already allied to a big fraction
@@ -2013,14 +2013,14 @@
      */
     function pickAllianceRequestTarget(world) {
       const me = world.me;
-      if (!me) return null;
+      if (!me) {return null;}
       const nb = nonBotCount(world);
       const candidates = world.everyone.filter((e) => {
-        if (e.isMe || e.isAlly) return false;
-        if (e.type === PlayerType.Bot) return false;
-        if (e.isTraitor) return false;
-        if (nb >= 4 && e.allianceCount >= 0.25 * nb) return false; // crown-feeder
-        if (projectedToOvertake(world, e, OVERGROW_HORIZON)) return false;
+        if (e.isMe || e.isAlly) {return false;}
+        if (e.type === PlayerType.Bot) {return false;}
+        if (e.isTraitor) {return false;}
+        if (nb >= 4 && e.allianceCount >= 0.25 * nb) {return false;} // crown-feeder
+        if (projectedToOvertake(world, e, OVERGROW_HORIZON)) {return false;}
         return true;
       });
       // Prefer the strongest acceptable peer (best shield) that isn't so strong
@@ -2038,15 +2038,15 @@
       opts = opts || {};
       const me = world.me;
       const pressure = me.incomingTroops / Math.max(1, me.troops);
-      if (pressure > 0.25) return false;
+      if (pressure > 0.25) {return false;}
       // Respect a break budget to avoid diplomacy thrash.
       if (opts.breaksUsed != null && opts.maxBreaks != null) {
-        if (opts.breaksUsed >= opts.maxBreaks) return false;
+        if (opts.breaksUsed >= opts.maxBreaks) {return false;}
       }
       // Don't break our only shield against a clearly stronger neighbour.
       const adjacent = (world.threats && world.threats.adjacentEnemies) || [];
       const strongAdjacent = adjacent.filter((e) => e.troops > me.troops);
-      if (strongAdjacent.length >= 2) return false;
+      if (strongAdjacent.length >= 2) {return false;}
       return true;
     }
 
@@ -2057,7 +2057,7 @@
      */
     function shouldBetrayAlly(world, ally, opts) {
       const me = world.me;
-      if (!me) return { betray: false, reason: "no me" };
+      if (!me) {return { betray: false, reason: "no me" };}
 
       // Weak / MIRV'd ally we can absorb (mirrors engine maybeBetray).
       const aMax = estMax(world, ally);
@@ -2090,16 +2090,16 @@
       const t = world.threats;
       const embargoTargets = [];
       let allyTarget = null;
-      if (!t || !t.coalitionAgainstMe) return { embargoTargets, allyTarget };
+      if (!t || !t.coalitionAgainstMe) {return { embargoTargets, allyTarget };}
 
       const crown = t.crown;
       if (crown && !crown.isMe && !crown.isAlly) {
-        if (crown.id) embargoTargets.push(crown.id);
+        if (crown.id) {embargoTargets.push(crown.id);}
       }
       if (t.coalition && t.coalition.members) {
         for (const sid of t.coalition.members) {
           const en = world.bySmallID.get(sid);
-          if (en && en.id && !en.isMe && !en.isAlly) embargoTargets.push(en.id);
+          if (en && en.id && !en.isMe && !en.isAlly) {embargoTargets.push(en.id);}
         }
       }
       // Ally the strongest player who is NOT in the bloc and NOT the crown.
@@ -2162,18 +2162,18 @@
   // ───────────────────────────────────────────────────────────────────────
 
   function normalizeBorderTiles(result) {
-    if (!result) return null;
-    if (result instanceof Set) return result;
-    if (result.borderTiles instanceof Set) return result.borderTiles;
-    if (Array.isArray(result)) return new Set(result);
-    if (Array.isArray(result.borderTiles)) return new Set(result.borderTiles);
+    if (!result) {return null;}
+    if (result instanceof Set) {return result;}
+    if (result.borderTiles instanceof Set) {return result.borderTiles;}
+    if (Array.isArray(result)) {return new Set(result);}
+    if (Array.isArray(result.borderTiles)) {return new Set(result.borderTiles);}
     return null;
   }
 
   async function getMyBorderTiles(gameView, myPlayer) {
     const tick = runtime.hooks.tick;
     const cache = runtime.state._borderCache;
-    if (cache && tick - cache.tick < 10 && cache.tiles) return cache.tiles;
+    if (cache && tick - cache.tick < 10 && cache.tiles) {return cache.tiles;}
     let tiles = null;
     try {
       const r = await myPlayer.borderTiles();
@@ -2181,7 +2181,7 @@
     } catch (_) {
       tiles = null;
     }
-    if (!tiles) tiles = sampleOwnedBorderTiles(gameView, myPlayer);
+    if (!tiles) {tiles = sampleOwnedBorderTiles(gameView, myPlayer);}
     runtime.state._borderCache = { tick, tiles };
     return tiles;
   }
@@ -2192,14 +2192,14 @@
     const sid = safeCall(() => myPlayer.smallID(), -1);
     const w = safeCall(() => gameView.width(), 0);
     const h = safeCall(() => gameView.height(), 0);
-    if (!w || !h) return out;
+    if (!w || !h) {return out;}
     for (let i = 0; i < 1500 && out.size < 400; i++) {
       const x = (Math.random() * w) | 0;
       const y = (Math.random() * h) | 0;
-      if (!safeCall(() => gameView.isValidCoord(x, y), false)) continue;
+      if (!safeCall(() => gameView.isValidCoord(x, y), false)) {continue;}
       const ref = gameView.ref(x, y);
-      if (!safeCall(() => gameView.isLand(ref), false)) continue;
-      if (safeCall(() => gameView.ownerID(ref), -1) !== sid) continue;
+      if (!safeCall(() => gameView.isLand(ref), false)) {continue;}
+      if (safeCall(() => gameView.ownerID(ref), -1) !== sid) {continue;}
       for (const n of safeCall(() => gameView.neighbors(ref), [])) {
         if (safeCall(() => gameView.ownerID(n), sid) !== sid) {
           out.add(ref);
@@ -2226,7 +2226,7 @@
       targetedByCount: 0,
       hotByEnemy: new Map(), // smallID -> border-contact count
     };
-    if (!myPlayer || !world.me) return info;
+    if (!myPlayer || !world.me) {return info;}
     const mySid = world.me.smallID;
 
     // Alliance graph edges (smallID -> Set of ally smallIDs).
@@ -2236,13 +2236,13 @@
       const set = new Set();
       for (const a of allies) {
         const aSid = safeCall(() => a.smallID(), null);
-        if (aSid != null) set.add(aSid);
+        if (aSid != null) {set.add(aSid);}
       }
-      if (set.size) edges.set(e.smallID, set);
+      if (set.size) {edges.set(e.smallID, set);}
       // who targets us?
       const targets = safeCall(() => e.player.targets(), []) || [];
       if (targets.some((t) => safeCall(() => t.smallID(), -2) === mySid))
-        info.targetedByCount++;
+        {info.targetedByCount++;}
     }
     world.allianceGraph.edges = edges;
 
@@ -2251,14 +2251,14 @@
     const adjSids = new Map();
     for (const tile of border) {
       if (!info.hasCoast && safeCall(() => gameView.isOceanShore(tile), false))
-        info.hasCoast = true;
+        {info.hasCoast = true;}
       for (const n of safeCall(() => gameView.neighbors(tile), [])) {
-        if (!safeCall(() => gameView.isLand(n), false)) continue;
+        if (!safeCall(() => gameView.isLand(n), false)) {continue;}
         const oid = safeCall(() => gameView.ownerID(n), mySid);
-        if (oid === mySid) continue;
+        if (oid === mySid) {continue;}
         if (oid === 0) {
           if (!safeCall(() => gameView.hasFallout(n), false))
-            info.bordersTN = true;
+            {info.bordersTN = true;}
           continue;
         }
         adjSids.set(oid, (adjSids.get(oid) || 0) + 1);
@@ -2267,14 +2267,14 @@
     info.hotByEnemy = adjSids;
     for (const [sid, contacts] of adjSids) {
       const entry = world.bySmallID.get(sid);
-      if (!entry || entry.isMe || entry.isAlly) continue;
+      if (!entry || entry.isMe || entry.isAlly) {continue;}
       entry.borderContacts = contacts;
       info.adjacentEnemies.push(entry);
     }
     info.adjacentAllies = [];
     for (const [sid] of adjSids) {
       const entry = world.bySmallID.get(sid);
-      if (entry && entry.isAlly && !entry.isMe) info.adjacentAllies.push(entry);
+      if (entry && entry.isAlly && !entry.isMe) {info.adjacentAllies.push(entry);}
     }
 
     // Inbound nukes targeting our territory.
@@ -2290,9 +2290,9 @@
       ) || [];
     for (const u of nukeUnits) {
       const owner = safeCall(() => u.owner(), null);
-      if (owner && safeCall(() => owner.smallID(), -1) === mySid) continue;
+      if (owner && safeCall(() => owner.smallID(), -1) === mySid) {continue;}
       const target = safeCall(() => u.targetTile(), undefined);
-      if (target == null) continue;
+      if (target == null) {continue;}
       if (safeCall(() => gameView.ownerID(target), -1) === mySid) {
         info.inboundNukes.push({ unit: u, targetTile: target });
       }
@@ -2303,8 +2303,8 @@
       safeCall(() => gameView.units(UnitType.TransportShip), []) || [];
     for (const u of boats) {
       const owner = safeCall(() => u.owner(), null);
-      if (!owner || safeCall(() => owner.smallID(), -1) === mySid) continue;
-      if (safeCall(() => myPlayer.isFriendly(owner), false)) continue;
+      if (!owner || safeCall(() => owner.smallID(), -1) === mySid) {continue;}
+      if (safeCall(() => myPlayer.isFriendly(owner), false)) {continue;}
       const target = safeCall(() => u.targetTile(), undefined);
       if (target != null && safeCall(() => gameView.ownerID(target), -1) === mySid) {
         info.inboundBoats.push({ unit: u, targetTile: target });
@@ -2321,10 +2321,10 @@
     for (let i = 0; i < (attempts || 400); i++) {
       const x = (Math.random() * w) | 0;
       const y = (Math.random() * h) | 0;
-      if (!safeCall(() => gameView.isValidCoord(x, y), false)) continue;
+      if (!safeCall(() => gameView.isValidCoord(x, y), false)) {continue;}
       const ref = gameView.ref(x, y);
-      if (!safeCall(() => gameView.isLand(ref), false)) continue;
-      if (safeCall(() => gameView.ownerID(ref), -1) === sid) return ref;
+      if (!safeCall(() => gameView.isLand(ref), false)) {continue;}
+      if (safeCall(() => gameView.ownerID(ref), -1) === sid) {return ref;}
     }
     return null;
   }
@@ -2337,17 +2337,17 @@
     minDist = minDist || 15;
     for (let attempt = 0; attempt < 120; attempt++) {
       const tile = findOwnedTileOf(gameView, mySid, 1);
-      if (tile == null) continue;
+      if (tile == null) {continue;}
       let ok = true;
       for (const s of existing) {
         const st = safeCall(() => s.tile(), null);
-        if (st == null) continue;
+        if (st == null) {continue;}
         if (safeCall(() => gameView.manhattanDist(tile, st), 999) < minDist) {
           ok = false;
           break;
         }
       }
-      if (ok) return tile;
+      if (ok) {return tile;}
     }
     return null;
   }
@@ -2364,7 +2364,7 @@
   }
   function myHostileCrown(world) {
     const c = world.threats && world.threats.crown;
-    if (!c || c.isMe || c.isAlly) return null;
+    if (!c || c.isMe || c.isAlly) {return null;}
     return c;
   }
 
@@ -2373,13 +2373,13 @@
       id: "EMERGENCY_MIRV",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const dying =
           me.troopRatio < 0.12 &&
           me.incomingTroops >= me.troops &&
           me.incomingTroops > 0;
         if (dying && canAfford(world, GOLD.MIRV))
-          return { valid: true, priority: 98, note: "about to die — MIRV" };
+          {return { valid: true, priority: 98, note: "about to die — MIRV" };}
         return { valid: false };
       },
       run: (world) => runEmergencyMirv(world),
@@ -2388,16 +2388,16 @@
       id: "REPEL_INVASION",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const inv = (world.threats.activeInvaders || []).filter(
           (e) => !e.isAlly,
         );
-        if (inv.length === 0) return { valid: false };
+        if (inv.length === 0) {return { valid: false };}
         const inbound = world.threats.invasionTroopsInbound || 0;
         const pressure = inbound / Math.max(1, me.troops);
         let priority = 88;
-        if (pressure >= 0.5) priority += 4;
-        if (pressure >= 1.0) priority += 4;
+        if (pressure >= 0.5) {priority += 4;}
+        if (pressure >= 1.0) {priority += 4;}
         return {
           valid: true,
           priority,
@@ -2411,7 +2411,7 @@
       id: "DEFEND_NUKE",
       evaluate: (world) => {
         if ((world.threats.inboundNukes || []).length === 0)
-          return { valid: false };
+          {return { valid: false };}
         return { valid: true, priority: 90, note: "inbound nuke — SAM/relocate" };
       },
       run: (world) => runDefendNuke(world),
@@ -2420,9 +2420,9 @@
       id: "CONSOLIDATE_FRONT",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const pressure = me.incomingTroops / Math.max(1, me.troops);
-        if (pressure < 0.6) return { valid: false };
+        if (pressure < 0.6) {return { valid: false };}
         return {
           valid: true,
           priority: pressure >= 1 ? 94 : 78,
@@ -2435,11 +2435,11 @@
       id: "DEFENSIVE_TURTLE",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const myShare = world.totals.myShare;
         const second = world.totals.secondShare;
-        if (myShare < 0.3) return { valid: false };
-        if (myShare < second * 1.5) return { valid: false };
+        if (myShare < 0.3) {return { valid: false };}
+        if (myShare < second * 1.5) {return { valid: false };}
         // Low priority: when we're ahead we want to PRESS (expand/attack) to the
         // 80% win, not turtle and let the opponent recover. This only wins the
         // selection when no offensive goal is available.
@@ -2451,22 +2451,22 @@
       id: "PREEMPT_INVASION",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         if ((world.threats.activeInvaders || []).length > 0)
-          return { valid: false };
+          {return { valid: false };}
         const brewing = world.threats.brewingInvaders || [];
         const early = world.threats.earlyHumanOvermatch;
-        if (brewing.length === 0 && !early) return { valid: false };
+        if (brewing.length === 0 && !early) {return { valid: false };}
         const invader = brewing[0]
           ? brewing[0].entry
           : early
             ? early.enemy
             : null;
-        if (!invader) return { valid: false };
+        if (!invader) {return { valid: false };}
         const ratio = invader.troops / Math.max(1, me.troops);
         let priority = early ? 91 : 82;
-        if (ratio >= 1.5) priority += 2;
-        if (ratio >= 2.0) priority += 2;
+        if (ratio >= 1.5) {priority += 2;}
+        if (ratio >= 2.0) {priority += 2;}
         return {
           valid: true,
           priority,
@@ -2480,17 +2480,17 @@
       id: "SAM_OVERWHELM",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const crown = myHostileCrown(world);
-        if (!crown) return { valid: false };
-        if (me.gold < GOLD.ATOM * 3 + GOLD.HYDRO) return { valid: false };
+        if (!crown) {return { valid: false };}
+        if (me.gold < GOLD.ATOM * 3 + GOLD.HYDRO) {return { valid: false };}
         const crownSams = safeCall(
           () => crown.player.units(UnitType.SAMLauncher).length,
           0,
         );
-        if (crownSams === 0) return { valid: false };
+        if (crownSams === 0) {return { valid: false };}
         const silos = (me.structures || {})[UnitType.MissileSilo] || 0;
-        if (silos < 3) return { valid: false };
+        if (silos < 3) {return { valid: false };}
         return { valid: true, priority: 85, note: "overwhelm SAMs on " + crown.name };
       },
       run: (world) => runSamOverwhelm(world),
@@ -2499,16 +2499,16 @@
       id: "NUKE_CROWN",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const crown = myHostileCrown(world);
-        if (!crown) return { valid: false };
-        if (world.totals.crownShare < 0.2) return { valid: false };
+        if (!crown) {return { valid: false };}
+        if (world.totals.crownShare < 0.2) {return { valid: false };}
         const silos = (me.structures || {})[UnitType.MissileSilo] || 0;
-        if (silos < 1) return { valid: false };
-        if (!canAfford(world, GOLD.ATOM)) return { valid: false };
+        if (silos < 1) {return { valid: false };}
+        if (!canAfford(world, GOLD.ATOM)) {return { valid: false };}
         let priority = 84;
-        if (world.totals.crownShare >= 0.3) priority += 4;
-        if (world.totals.crownShare >= 0.4) priority += 4;
+        if (world.totals.crownShare >= 0.3) {priority += 4;}
+        if (world.totals.crownShare >= 0.4) {priority += 4;}
         return {
           valid: true,
           priority,
@@ -2522,7 +2522,7 @@
       id: "BREAK_OVERGROWN_ALLY",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const allies = world.everyone.filter((e) => e.isAlly && !e.isMe);
         for (const ally of allies) {
           const d = DIPLO.shouldBetrayAlly(world, ally, {
@@ -2530,12 +2530,12 @@
             maxBreaks: 3,
           });
           if (d.betray)
-            return {
+            {return {
               valid: true,
               priority: 80,
               note: "betray " + ally.name + ": " + d.reason,
               context: { ally, reason: d.reason },
-            };
+            };}
         }
         return { valid: false };
       },
@@ -2544,11 +2544,11 @@
     {
       id: "DIPLOMACY_ISOLATE_CROWN",
       evaluate: (world) => {
-        if (!world.me) return { valid: false };
-        if (!world.threats.coalitionAgainstMe) return { valid: false };
+        if (!world.me) {return { valid: false };}
+        if (!world.threats.coalitionAgainstMe) {return { valid: false };}
         // Only worth diplomacy-warring when there's an actual crown threat —
         // otherwise (tiny crown, crowded map) it just spams embargoes forever.
-        if (world.totals.crownShare < 0.2) return { valid: false };
+        if (world.totals.crownShare < 0.2) {return { valid: false };}
         return { valid: true, priority: 76, note: "coalition — isolate crown" };
       },
       run: (world) => runDiplomacyIsolateCrown(world),
@@ -2557,15 +2557,15 @@
       id: "SAM_WALL_BUILDUP",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         // Pre-crown SAM walls only matter in a real multi-player nuke era.
-        if (world.totals.alivePlayers < 5) return { valid: false };
+        if (world.totals.alivePlayers < 5) {return { valid: false };}
         const share = world.totals.myShare;
-        if (share < 0.2 || share > 0.35) return { valid: false };
+        if (share < 0.2 || share > 0.35) {return { valid: false };}
         const cities = (me.structures || {})[UnitType.City] || 0;
         const sams = (me.structureLevels || {})[UnitType.SAMLauncher] || 0;
         const target = Math.max(2, Math.floor(cities * 0.5));
-        if (sams >= target) return { valid: false };
+        if (sams >= target) {return { valid: false };}
         return { valid: true, priority: 82, note: "SAM wall " + sams + "/" + target };
       },
       run: (world) => runSamWall(world),
@@ -2578,7 +2578,7 @@
       id: "EASY_NATION_GRAB",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const adj = world.threats.adjacentEnemies || [];
         const cands = adj.filter(
           (e) =>
@@ -2587,7 +2587,7 @@
             (e.type === PlayerType.Nation || e.type === PlayerType.Bot) &&
             (e.troops < me.troops * 0.85 || (e.tiles || 0) > 30),
         );
-        if (cands.length === 0) return { valid: false };
+        if (cands.length === 0) {return { valid: false };}
         // Weakest first — easy wins.
         const target = cands.reduce(
           (b, c) => (b === null || c.troops < b.troops ? c : b),
@@ -2597,7 +2597,7 @@
           retaliating: true,
           reserveRatio: 0.25,
         });
-        if (troops <= 0) return { valid: false };
+        if (troops <= 0) {return { valid: false };}
         // Higher when there is no TerraNullius left (must attack to grow).
         const noFrontier = !scanOf(world).bordersTN;
         return {
@@ -2613,17 +2613,17 @@
       id: "NEUTRALIZE_RISING_STAR",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const stars = world.threats.risingStars || [];
-        if (stars.length === 0) return { valid: false };
+        if (stars.length === 0) {return { valid: false };}
         const target = stars[0];
-        if (target.isAlly) return { valid: false };
-        if (target.troops > me.troops * 1.2) return { valid: false };
+        if (target.isAlly) {return { valid: false };}
+        if (target.troops > me.troops * 1.2) {return { valid: false };}
         // Must be reachable (adjacent or coast for boat).
         const adjacent = (world.threats.adjacentEnemies || []).some(
           (e) => e.smallID === target.smallID,
         );
-        if (!adjacent && !scanOf(world).hasCoast) return { valid: false };
+        if (!adjacent && !scanOf(world).hasCoast) {return { valid: false };}
         // If the rising star isn't on our border but we DO have adjacent
         // enemies, prefer eating those by land (ATTACK_WEAKEST) rather than
         // dribbling capped boats at a distant target.
@@ -2646,13 +2646,13 @@
       id: "BREAK_TO_EXPAND",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
-        if (scanOf(world).bordersTN) return { valid: false };
+        if (!me) {return { valid: false };}
+        if (scanOf(world).bordersTN) {return { valid: false };}
         if ((world.threats.adjacentEnemies || []).length > 0)
-          return { valid: false };
+          {return { valid: false };}
         const adjAllies = world.threats.adjacentAllies || [];
-        if (adjAllies.length === 0) return { valid: false };
-        if (me.troopRatio < 0.5) return { valid: false };
+        if (adjAllies.length === 0) {return { valid: false };}
+        if (me.troopRatio < 0.5) {return { valid: false };}
         if (
           !DIPLO.safeToBreak(world, adjAllies[0], {
             breaksUsed: runtime.state._breaksUsed || 0,
@@ -2674,15 +2674,15 @@
       id: "EXPAND_RUSH",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
-        if (!scanOf(world).bordersTN) return { valid: false };
-        if (TACTICS.expansionTroops(world) <= 0) return { valid: false };
+        if (!me) {return { valid: false };}
+        if (!scanOf(world).bordersTN) {return { valid: false };}
+        if (TACTICS.expansionTroops(world) <= 0) {return { valid: false };}
         const lastExpand = runtime.state.cooldowns.expand || -999;
         const share = world.totals.myShare;
         const expandGap = share < 0.1 ? 6 : 18;
-        if (world.tick - lastExpand < expandGap) return { valid: false };
+        if (world.tick - lastExpand < expandGap) {return { valid: false };}
         let priority = 76; // win the land-grab race; yields to REPEL/CONSOLIDATE (86+)
-        if (share < 0.05) priority += 6;
+        if (share < 0.05) {priority += 6;}
         return { valid: true, priority, note: "expand TN (share " + (share * 100).toFixed(1) + "%)" };
       },
       run: (world) => runExpand(world),
@@ -2691,14 +2691,14 @@
       id: "ATTACK_WEAKEST",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
+        if (!me) {return { valid: false };}
         const candidates = world.threats.adjacentEnemies || [];
         const pick = TACTICS.selectAttackTarget(world, candidates);
-        if (!pick) return { valid: false };
+        if (!pick) {return { valid: false };}
         const troops = TACTICS.attackTroops(world, pick.entry, {
           retaliating: pick.retaliating,
         });
-        if (troops <= 0) return { valid: false };
+        if (troops <= 0) {return { valid: false };}
         const noFrontier = !scanOf(world).bordersTN;
         return {
           valid: true,
@@ -2713,13 +2713,13 @@
       id: "NAVAL_LAND_GRAB",
       evaluate: (world) => {
         const me = world.me;
-        if (!me) return { valid: false };
-        if (!scanOf(world).hasCoast) return { valid: false };
+        if (!me) {return { valid: false };}
+        if (!scanOf(world).hasCoast) {return { valid: false };}
         // Need a weaker non-ally to invade by sea.
         const target = world.everyone.find(
           (e) => !e.isMe && !e.isAlly && e.troops < me.troops * 0.8,
         );
-        if (!target) return { valid: false };
+        if (!target) {return { valid: false };}
         return {
           valid: true,
           priority: 50,
@@ -2740,7 +2740,7 @@
     let best = null;
     for (const spec of GOAL_SPECS) {
       const res = safeCall(() => spec.evaluate(world), { valid: false });
-      if (!res || !res.valid) continue;
+      if (!res || !res.valid) {continue;}
       if (!best || res.priority > best.priority) {
         best = { spec, id: spec.id, priority: res.priority, note: res.note, context: res.context };
       }
@@ -2761,14 +2761,14 @@
 
   function runExpand(world) {
     const troops = TACTICS.expansionTroops(world);
-    if (troops <= 0) return false;
+    if (troops <= 0) {return false;}
     runtime.state.cooldowns.expand = world.tick;
     return IO.sendAttack(null, troops);
   }
 
   function runAttack(world, ctx) {
     const pick = ctx && ctx.pick;
-    if (!pick) return false;
+    if (!pick) {return false;}
     let troops = ctx.troops || TACTICS.attackTroops(world, pick.entry, {
       retaliating: pick.retaliating,
     });
@@ -2777,7 +2777,7 @@
     if (!safe.safe && safe.recommendedMax > 0) {
       troops = Math.min(troops, safe.recommendedMax);
     }
-    if (troops <= 0 || !pick.entry.id) return false;
+    if (troops <= 0 || !pick.entry.id) {return false;}
     return IO.sendAttack(pick.entry.id, troops);
   }
 
@@ -2786,16 +2786,16 @@
     const me = world.me;
     // Recall doomed outgoing attacks to bring troops home for defense.
     for (const a of me.outgoingAttacks || []) {
-      if (a.id) acted = IO.sendCancelAttack(a.id) || acted;
+      if (a.id) {acted = IO.sendCancelAttack(a.id) || acted;}
     }
     // Embargo the invader.
     const invader = ctx && ctx.invader;
-    if (invader && invader.id) IO.sendEmbargo(invader.id, "start");
+    if (invader && invader.id) {IO.sendEmbargo(invader.id, "start");}
     // Fortify via the build routine (DPs) handled in secondary with underThreat.
     // If we still out-troop the invader, counter-attack it.
     if (invader && invader.troops < me.troops) {
       const troops = TACTICS.attackTroops(world, invader, { retaliating: true });
-      if (troops > 0 && invader.id) acted = IO.sendAttack(invader.id, troops) || acted;
+      if (troops > 0 && invader.id) {acted = IO.sendAttack(invader.id, troops) || acted;}
     }
     return acted;
   }
@@ -2804,20 +2804,20 @@
     // Pure fortify: recall attacks, hold troops; DP build via secondary.
     let acted = false;
     for (const a of world.me.outgoingAttacks || []) {
-      if (a.id) acted = IO.sendCancelAttack(a.id) || acted;
+      if (a.id) {acted = IO.sendCancelAttack(a.id) || acted;}
     }
     return acted;
   }
 
   function runTurtle(world) {
-    if (scanOf(world).bordersTN) return runExpand(world);
+    if (scanOf(world).bordersTN) {return runExpand(world);}
     // No empty land left — close the game out by grinding the weakest enemy.
     const me = world.me;
     const adj = (world.threats.adjacentEnemies || []).filter((e) => !e.isAlly);
     if (me && adj.length > 0) {
       const target = adj.reduce((b, c) => (b === null || c.troops < b.troops ? c : b), null);
       const troops = TACTICS.attackTroops(world, target, { retaliating: true, reserveRatio: 0.3 });
-      if (troops > 0 && target.id) return IO.sendAttack(target.id, troops);
+      if (troops > 0 && target.id) {return IO.sendAttack(target.id, troops);}
     }
     return false;
   }
@@ -2826,15 +2826,15 @@
     // Keep grabbing flat-loss TN land while fortifying (build via secondary).
     // Also try to draw in a co-bordering ally to split the invader's front.
     const target = DIPLO.pickAllianceRequestTarget(world);
-    if (target && target.id) IO.sendAllianceRequest(target.id);
+    if (target && target.id) {IO.sendAllianceRequest(target.id);}
     return runExpand(world);
   }
 
   function runNeutralize(world, ctx) {
-    if (!ctx || !ctx.target) return false;
+    if (!ctx || !ctx.target) {return false;}
     if (ctx.adjacent) {
       const troops = TACTICS.attackTroops(world, ctx.target, {});
-      if (troops > 0 && ctx.target.id) return IO.sendAttack(ctx.target.id, troops);
+      if (troops > 0 && ctx.target.id) {return IO.sendAttack(ctx.target.id, troops);}
       return false;
     }
     return runNaval(world, { target: ctx.target });
@@ -2842,10 +2842,10 @@
 
   async function runNaval(world, ctx) {
     const target = ctx && ctx.target;
-    if (!target) return false;
+    if (!target) {return false;}
     const gameView = gv();
     const myPlayer = myP();
-    if (!gameView || !myPlayer) return false;
+    if (!gameView || !myPlayer) {return false;}
     // Respect the transport-ship cap and a cooldown — don't spam boat intents
     // every tick (the engine caps active transports at boatMaxNumber anyway).
     const maxBoats = safeCall(() => gameView.config().boatMaxNumber(), 3);
@@ -2853,19 +2853,19 @@
       () => myPlayer.units(UnitType.TransportShip).length,
       0,
     );
-    if (ships >= maxBoats) return false;
+    if (ships >= maxBoats) {return false;}
     const lastBoat = runtime.state.cooldowns.boat || -99999;
-    if (world.tick - lastBoat < 30) return false;
+    if (world.tick - lastBoat < 30) {return false;}
     runtime.state.cooldowns.boat = world.tick;
     // Find a destination tile owned by the target and a viable spawn.
     const dstSeed = findOwnedTileOf(gameView, target.smallID, 300);
-    if (dstSeed == null) return false;
+    if (dstSeed == null) {return false;}
     const spawn = await safeCallAsync(
       () => myPlayer.bestTransportShipSpawn(dstSeed),
       false,
     );
     const troops = Math.floor((world.me.troops || 0) / 5);
-    if (troops <= 0) return false;
+    if (troops <= 0) {return false;}
     const dst = spawn && spawn !== false ? dstSeed : dstSeed;
     return IO.sendBoat(dst, troops);
   }
@@ -2883,7 +2883,7 @@
             .filter((u) => !safeCall(() => u.isUnderConstruction(), false)),
         [],
       ) || [];
-    if (silos.length === 0) return null;
+    if (silos.length === 0) {return null;}
     return safeCall(() => silos[0].tile(), null);
   }
 
@@ -2895,7 +2895,7 @@
    * proxy for the parabola is sufficient for SAM-proximity screening.
    */
   function enemySamInterceptsPath(gameView, srcTile, dstTile) {
-    if (srcTile == null || dstTile == null) return false;
+    if (srcTile == null || dstTile == null) {return false;}
     const sx = safeCall(() => gameView.x(srcTile), 0);
     const sy = safeCall(() => gameView.y(srcTile), 0);
     const dx = safeCall(() => gameView.x(dstTile), 0) - sx;
@@ -2905,7 +2905,7 @@
       const t = step / samples;
       const px = Math.round(sx + dx * t);
       const py = Math.round(sy + dy * t);
-      if (!safeCall(() => gameView.isValidCoord(px, py), false)) continue;
+      if (!safeCall(() => gameView.isValidCoord(px, py), false)) {continue;}
       const pt = gameView.ref(px, py);
       const sams =
         safeCall(
@@ -2915,14 +2915,14 @@
         ) || [];
       for (const s of sams) {
         const owner = safeCall(() => s.unit.owner(), null);
-        if (!owner) continue;
-        if (safeCall(() => owner.isMe(), false)) continue;
+        if (!owner) {continue;}
+        if (safeCall(() => owner.isMe(), false)) {continue;}
         const mine = myP();
-        if (mine && safeCall(() => mine.isFriendly(owner), false)) continue;
+        if (mine && safeCall(() => mine.isFriendly(owner), false)) {continue;}
         const lvl = safeCall(() => s.unit.level(), 1);
         const range = MATH.samRange(lvl);
         const dsq = s.distSquared != null ? s.distSquared : range * range + 1;
-        if (dsq <= range * range) return true;
+        if (dsq <= range * range) {return true;}
       }
     }
     return false;
@@ -2938,8 +2938,8 @@
     let fallback = null;
     for (let i = 0; i < 14; i++) {
       const tile = findOwnedTileOf(gameView, crown.smallID, 1);
-      if (tile == null) continue;
-      if (fallback == null) fallback = tile;
+      if (tile == null) {continue;}
+      if (fallback == null) {fallback = tile;}
       if (!enemySamInterceptsPath(gameView, src, tile)) {
         return { tile, clear: true };
       }
@@ -2954,7 +2954,7 @@
     const out = [];
     for (const u of units) {
       const tile = safeCall(() => u.tile(), null);
-      if (tile == null) continue;
+      if (tile == null) {continue;}
       out.push({ tile, type: safeCall(() => u.type(), null) });
     }
     return out;
@@ -2992,7 +2992,7 @@
       for (const o of structs) {
         const dx = safeCall(() => gameView.x(o.tile), 0) - sx;
         const dy = safeCall(() => gameView.y(o.tile), 0) - sy;
-        if (dx * dx + dy * dy <= r2) score += valueOf(o.type);
+        if (dx * dx + dy * dy <= r2) {score += valueOf(o.type);}
       }
       if (score > bestScore) {
         bestScore = score;
@@ -3017,7 +3017,7 @@
     const gameView = gv();
     const myPlayer = myP();
     const crown = (ctx && ctx.crown) || myHostileCrown(world);
-    if (!gameView || !crown) return runExpand(world);
+    if (!gameView || !crown) {return runExpand(world);}
     const nukeType = canAfford(world, GOLD.HYDRO)
       ? UnitType.HydrogenBomb
       : UnitType.AtomBomb;
@@ -3041,7 +3041,7 @@
       } else if (canAfford(world, GOLD.ATOM)) {
         launched = launchNukeAt(gameView, UnitType.AtomBomb, choice.tile);
       }
-      if (crown.id) IO.sendTargetPlayer(crown.id);
+      if (crown.id) {IO.sendTargetPlayer(crown.id);}
     }
     runExpand(world);
     return launched;
@@ -3050,7 +3050,7 @@
   function runSamOverwhelm(world) {
     const gameView = gv();
     const crown = myHostileCrown(world);
-    if (!gameView || !crown) return runExpand(world);
+    if (!gameView || !crown) {return runExpand(world);}
     const target = findCrownTargetTile(gameView, crown);
     let launched = false;
     if (target != null) {
@@ -3059,7 +3059,7 @@
       launchNukeAt(gameView, UnitType.AtomBomb, target);
       launchNukeAt(gameView, UnitType.AtomBomb, target);
       launched = launchNukeAt(gameView, UnitType.HydrogenBomb, target);
-      if (crown.id) IO.sendTargetPlayer(crown.id);
+      if (crown.id) {IO.sendTargetPlayer(crown.id);}
     }
     return launched;
   }
@@ -3067,7 +3067,7 @@
   function runEmergencyMirv(world) {
     const gameView = gv();
     const crown = myHostileCrown(world) || (world.threats.activeInvaders || [])[0];
-    if (!gameView || !crown) return false;
+    if (!gameView || !crown) {return false;}
     const crownPlayer = crown.player || (crown.id ? crown : null);
     let target = null;
     if (crownPlayer && crownPlayer.units) {
@@ -3079,17 +3079,17 @@
       );
       target = choice.tile;
     }
-    if (target == null) target = findCrownTargetTile(gameView, crown);
-    if (target == null) return false;
+    if (target == null) {target = findCrownTargetTile(gameView, crown);}
+    if (target == null) {return false;}
     return IO.sendBuild(UnitType.MIRV, target);
   }
 
   function runBreakToExpand(world, ctx) {
     const adjAllies = (ctx && ctx.adjAllies) || world.threats.adjacentAllies || [];
-    if (adjAllies.length === 0) return runExpand(world);
+    if (adjAllies.length === 0) {return runExpand(world);}
     // Break the weakest bordering ally so their territory becomes attackable.
     const weakest = adjAllies.slice().sort((a, b) => a.troops - b.troops)[0];
-    if (!weakest || !weakest.id) return runExpand(world);
+    if (!weakest || !weakest.id) {return runExpand(world);}
     runtime.state._breaksUsed = (runtime.state._breaksUsed || 0) + 1;
     decisionLog("break-to-expand: breaking " + weakest.name);
     return IO.sendBreakAlliance(weakest.id);
@@ -3097,7 +3097,7 @@
 
   function runBreakAlly(world, ctx) {
     const ally = ctx && ctx.ally;
-    if (!ally || !ally.id) return false;
+    if (!ally || !ally.id) {return false;}
     runtime.state._breaksUsed = (runtime.state._breaksUsed || 0) + 1;
     return IO.sendBreakAlliance(ally.id);
   }
@@ -3111,9 +3111,9 @@
     runtime.state.cooldowns.isolateCrown = world.tick;
     const resp = DIPLO.coalitionResponse(world);
     let acted = false;
-    for (const id of resp.embargoTargets) acted = IO.sendEmbargo(id, "start") || acted;
+    for (const id of resp.embargoTargets) {acted = IO.sendEmbargo(id, "start") || acted;}
     if (resp.allyTarget && resp.allyTarget.id)
-      acted = IO.sendAllianceRequest(resp.allyTarget.id) || acted;
+      {acted = IO.sendAllianceRequest(resp.allyTarget.id) || acted;}
     // Keep growing meanwhile.
     runExpand(world);
     return acted;
@@ -3144,7 +3144,7 @@
           retaliating: true,
           reserveRatio: 0.3,
         });
-        if (troops > 0 && target.id) return IO.sendAttack(target.id, troops);
+        if (troops > 0 && target.id) {return IO.sendAttack(target.id, troops);}
       }
     }
     return false;
@@ -3187,7 +3187,7 @@
   function findDefensiveBuildTile(gameView, myPlayer, threatSid, minDist) {
     const cache = runtime.state._borderCache;
     const border = cache && cache.tiles ? Array.from(cache.tiles) : null;
-    if (!border || border.length === 0) return null;
+    if (!border || border.length === 0) {return null;}
     minDist = minDist || 15;
     const existing =
       safeCall(
@@ -3197,9 +3197,9 @@
     const farEnough = (tile) => {
       for (const su of existing) {
         const st = safeCall(() => su.tile(), null);
-        if (st == null) continue;
+        if (st == null) {continue;}
         if (safeCall(() => gameView.manhattanDist(tile, st), 999) < minDist)
-          return false;
+          {return false;}
       }
       return true;
     };
@@ -3212,20 +3212,20 @@
           break;
         }
       }
-      if (!facesThreat) continue;
-      if (fallback == null) fallback = tile;
-      if (farEnough(tile)) return tile;
+      if (!facesThreat) {continue;}
+      if (fallback == null) {fallback = tile;}
+      if (farEnough(tile)) {return tile;}
     }
     return fallback;
   }
 
   function secondaryEconomyBuild(world) {
-    if (GOLD_SAVING_GOALS.has(runtime.planner.activeGoalId)) return;
+    if (GOLD_SAVING_GOALS.has(runtime.planner.activeGoalId)) {return;}
     const pick = TACTICS.pickBuild(world, buildFlags(world));
-    if (!pick || !pick.affordable) return;
+    if (!pick || !pick.affordable) {return;}
     const gameView = gv();
     const myPlayer = myP();
-    if (!gameView || !myPlayer) return;
+    if (!gameView || !myPlayer) {return;}
     let tile = null;
     // Defensive structures go on the hot border facing the strongest threat.
     if (pick.type === UnitType.DefensePost) {
@@ -3238,26 +3238,26 @@
         tile = findDefensiveBuildTile(gameView, myPlayer, threat.smallID, 15);
       }
     }
-    if (tile == null) tile = findBuildTile(gameView, myPlayer, 15);
-    if (tile == null) return;
+    if (tile == null) {tile = findBuildTile(gameView, myPlayer, 15);}
+    if (tile == null) {return;}
     IO.sendBuild(pick.type, tile);
   }
 
   function secondaryDiplomacy(world) {
     const me = world.me;
-    if (!me) return;
+    if (!me) {return;}
     const myPlayer = myP();
-    if (!myPlayer) return;
+    if (!myPlayer) {return;}
     // Accept good incoming alliance requests (re-requesting auto-accepts).
     for (const e of world.everyone) {
-      if (e.isMe || e.isAlly) continue;
+      if (e.isMe || e.isAlly) {continue;}
       const requestingUs = safeCall(
         () => e.player.isRequestingAllianceWith(myPlayer),
         false,
       );
-      if (!requestingUs) continue;
+      if (!requestingUs) {continue;}
       const d = DIPLO.shouldAcceptAlliance(world, e);
-      if (d.accept && e.id) IO.sendAllianceRequest(e.id);
+      if (d.accept && e.id) {IO.sendAllianceRequest(e.id);}
     }
     // Proactively court a powerful (but non-overgrowing) ally when we have
     // few — strong shields without empowering a future winner. Only while in a
@@ -3311,17 +3311,17 @@
     for (let i = 0; i < 800; i++) {
       const x = (Math.random() * w) | 0;
       const y = (Math.random() * h) | 0;
-      if (!safeCall(() => gameView.isValidCoord(x, y), false)) continue;
+      if (!safeCall(() => gameView.isValidCoord(x, y), false)) {continue;}
       const ref = gameView.ref(x, y);
-      if (!safeCall(() => gameView.isLand(ref), false)) continue;
-      if (safeCall(() => gameView.hasOwner(ref), true)) continue;
+      if (!safeCall(() => gameView.isLand(ref), false)) {continue;}
+      if (safeCall(() => gameView.hasOwner(ref), true)) {continue;}
       // Score: count unowned land neighbours in a small radius.
       let room = 0;
       let enemyNear = 0;
       for (const n of safeCall(() => gameView.neighbors(ref), [])) {
         if (safeCall(() => gameView.isLand(n), false)) {
-          if (!safeCall(() => gameView.hasOwner(n), true)) room++;
-          else enemyNear++;
+          if (!safeCall(() => gameView.hasOwner(n), true)) {room++;}
+          else {enemyNear++;}
         }
       }
       const w0 = safeCall(() => gameView.width(), 100);
@@ -3338,8 +3338,8 @@
   }
 
   function maybeSpawn(gameView) {
-    if (runtime.state._spawned) return false;
-    if (!inSpawnPhase(gameView)) return false;
+    if (runtime.state._spawned) {return false;}
+    if (!inSpawnPhase(gameView)) {return false;}
     const myPlayer = safeCall(() => gameView.myPlayer(), null);
     const haveTiles = myPlayer && safeCall(() => myPlayer.numTilesOwned(), 0) > 0;
     if (haveTiles) {
@@ -3349,13 +3349,13 @@
     // Don't spam a different random spawn each tick — request once and wait,
     // re-requesting only if still unspawned after a while.
     const sentTick = runtime.state._spawnSentTick;
-    if (sentTick != null && runtime.hooks.tick - sentTick < 40) return false;
+    if (sentTick != null && runtime.hooks.tick - sentTick < 40) {return false;}
     // Reuse our prior choice if it is still unclaimed; else pick fresh.
     let tile = runtime.state._lastSpawnTile;
     const stillFree =
       tile != null && !safeCall(() => gameView.hasOwner(tile), true);
-    if (!stillFree) tile = chooseSpawnTile(gameView);
-    if (tile == null) return false;
+    if (!stillFree) {tile = chooseSpawnTile(gameView);}
+    if (tile == null) {return false;}
     if (IO.sendSpawn(tile)) {
       runtime.state._lastSpawnTile = tile;
       runtime.state._spawnSentTick = runtime.hooks.tick;
@@ -3370,9 +3370,9 @@
   // ───────────────────────────────────────────────────────────────────────
 
   async function runModulesForTick() {
-    if (!runtime.enabled) return;
+    if (!runtime.enabled) {return;}
     const gameView = findGameView();
-    if (!gameView) return;
+    if (!gameView) {return;}
 
     // Spawn phase handling.
     if (inSpawnPhase(gameView)) {
@@ -3383,7 +3383,7 @@
     }
 
     const world = buildWorld(gameView);
-    if (!world || !world.me) return;
+    if (!world || !world.me) {return;}
     const info = await gatherTickInfo(gameView, world);
     world.scan = {
       bordersTN: info.bordersTN,
@@ -3408,7 +3408,7 @@
   // Drive the brain from turn messages (server cadence ~100ms), guarded so a
   // slow tick never overlaps itself.
   runtime._onTurn = function () {
-    if (runtime.state.processing) return;
+    if (runtime.state.processing) {return;}
     runtime.state.processing = true;
     Promise.resolve()
       .then(() => runModulesForTick())
@@ -3452,7 +3452,7 @@
       );
       const everyone = over.everyone || [me];
       const bySmallID = new Map();
-      for (const e of everyone) bySmallID.set(e.smallID, e);
+      for (const e of everyone) {bySmallID.set(e.smallID, e);}
       bySmallID.set(me.smallID, me);
       return {
         tick: over.tick || 1500,
@@ -3660,7 +3660,7 @@
 
   runtime._stealthBlocks = function (intent) {
     const cfg = CONFIG.stealth;
-    if (!cfg.enabled || TEST_MODE) return false;
+    if (!cfg.enabled || TEST_MODE) {return false;}
     // Reset the per-tick counter when the tick advances.
     if (stealthState.tickOfCounter !== runtime.hooks.tick) {
       stealthState.tickOfCounter = runtime.hooks.tick;
@@ -3669,7 +3669,7 @@
     const now = Date.now();
     if (cfg.minIntentGapMs > 0 && now - stealthState.lastIntentMs < cfg.minIntentGapMs) {
       // Never block spawn (single, critical) or the first major action a tick.
-      if (intent.type !== "spawn" && stealthState.majorThisTick > 0) return true;
+      if (intent.type !== "spawn" && stealthState.majorThisTick > 0) {return true;}
     }
     if (isMajorIntent(intent) && stealthState.majorThisTick >= cfg.maxMajorPerTick) {
       return true;
@@ -3679,7 +3679,7 @@
 
   runtime._recordIntent = function (intent) {
     stealthState.lastIntentMs = Date.now();
-    if (isMajorIntent(intent)) stealthState.majorThisTick++;
+    if (isMajorIntent(intent)) {stealthState.majorThisTick++;}
   };
 
   runtime.test.stealth = {
@@ -3694,9 +3694,9 @@
   // ═══════════════════════════════════════════════════════════════════════
 
   function buildOverlay() {
-    if (TEST_MODE) return;
-    if (typeof document === "undefined" || !document.body) return;
-    if (document.getElementById("overlord-panel")) return;
+    if (TEST_MODE) {return;}
+    if (typeof document === "undefined" || !document.body) {return;}
+    if (document.getElementById("overlord-panel")) {return;}
     const panel = document.createElement("div");
     panel.id = "overlord-panel";
     panel.innerHTML = `
@@ -3767,7 +3767,7 @@
       e.preventDefault();
     });
     document.addEventListener("mousemove", (e) => {
-      if (!drag) return;
+      if (!drag) {return;}
       el.style.left = e.clientX - ox + "px";
       el.style.top = e.clientY - oy + "px";
       el.style.right = "auto";
@@ -3776,10 +3776,10 @@
   }
 
   function refreshOverlay() {
-    if (TEST_MODE || typeof document === "undefined") return;
+    if (TEST_MODE || typeof document === "undefined") {return;}
     const set = (id, v) => {
       const e = document.getElementById(id);
-      if (e) e.textContent = v;
+      if (e) {e.textContent = v;}
     };
     const w = runtime.world;
     set("overlord-goal", runtime.planner.activeGoalId || "—");
@@ -3821,13 +3821,13 @@
   }
 
   function installHotkeys() {
-    if (TEST_MODE || typeof document === "undefined") return;
+    if (TEST_MODE || typeof document === "undefined") {return;}
     document.addEventListener("keydown", (e) => {
       const tag = (e.target && e.target.tagName) || "";
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (tag === "INPUT" || tag === "TEXTAREA") {return;}
       if (e.key === "o" || e.key === "O") {
         const p = document.getElementById("overlord-panel");
-        if (p) p.style.display = p.style.display === "none" ? "" : "none";
+        if (p) {p.style.display = p.style.display === "none" ? "" : "none";}
       } else if (e.key === "b" || e.key === "B") {
         runtime.enabled = !runtime.enabled;
         const tog = document.getElementById("overlord-tog");
@@ -3840,7 +3840,7 @@
   }
 
   function setupUI() {
-    if (TEST_MODE || typeof document === "undefined") return;
+    if (TEST_MODE || typeof document === "undefined") {return;}
     const boot = () => {
       buildOverlay();
       installHotkeys();
