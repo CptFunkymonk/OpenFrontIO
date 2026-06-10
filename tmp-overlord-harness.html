@@ -1,0 +1,255 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Overlord Bot Harness</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        background: #0b0e1a;
+        color: #cdd6f4;
+        margin: 0;
+        padding: 16px;
+      }
+      h1 { font-size: 16px; color: #a78bfa; }
+      #status { font-weight: 800; padding: 4px 10px; border-radius: 6px; }
+      #status.pass { background: #143d24; color: #7fe8a0; }
+      #status.fail { background: #4a1620; color: #ff8a9c; }
+      pre {
+        background: #11142a;
+        border: 1px solid #2a2f55;
+        border-radius: 8px;
+        padding: 10px;
+        white-space: pre-wrap;
+        font-size: 12px;
+      }
+      .grid { display: flex; gap: 16px; flex-wrap: wrap; }
+      .col { flex: 1; min-width: 320px; }
+    </style>
+    <script>
+      // ── Fake environment: the userscript hooks window.WebSocket and looks
+      //    for a GameView. We provide a fake socket (records intents) and a
+      //    grid-based fake GameView on window.__gameView so findGameView() can
+      //    discover it. TEST_MODE is on so the loop is driven manually and the
+      //    stealth gate stays out of the way.
+      window.__OVERLORD_TEST_MODE = true;
+      window.sentIntents = [];
+
+      const W = 28,
+        H = 28;
+      const ref = (x, y) => y * W + x;
+      const PlayerType = { Bot: "BOT", Human: "HUMAN", Nation: "NATION" };
+      const UnitType = { City: "City", MissileSilo: "Missile Silo" };
+
+      // Scenario: we own a central block surrounded by unclaimed land (a TN
+      // frontier), one weaker bordering bot, and a strong far-away peer.
+      const ownership = new Array(W * H).fill(0);
+      function fill(sid, x0, y0, w, h) {
+        for (let y = y0; y < y0 + h; y++)
+          for (let x = x0; x < x0 + w; x++) ownership[ref(x, y)] = sid;
+      }
+      fill(3, 0, 0, 4, 4); // far peer
+      fill(2, 12, 5, 3, 3); // adjacent bot
+      // We own NOTHING yet — the bot must spawn first. Our block is granted
+      // after the spawn tick (see driver below) to simulate spawning.
+
+      let spawnPhase = true;
+      let tick = 10;
+
+      function mkPlayer(p) {
+        return {
+          _p: p,
+          smallID: () => p.smallID,
+          id: () => p.id,
+          name: () => p.name,
+          type: () => p.type,
+          team: () => null,
+          isAlive: () => true,
+          isPlayer: () => true,
+          troops: () => p.troops,
+          gold: () => p.gold || 0,
+          numTilesOwned: () =>
+            ownership.reduce((n, o) => (o === p.smallID ? n + 1 : n), 0),
+          isTraitor: () => false,
+          isDisconnected: () => false,
+          isFriendly: () => false,
+          isRequestingAllianceWith: () => false,
+          allies: () => [],
+          targets: () => [],
+          alliances: () => [],
+          incomingAttacks: () => [],
+          outgoingAttacks: () => [],
+          units: () => [],
+          borderTiles: async () => {
+            const set = new Set();
+            for (let i = 0; i < ownership.length; i++) {
+              if (ownership[i] !== p.smallID) continue;
+              const x = i % W,
+                y = Math.floor(i / W);
+              for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+                const nx = x + dx,
+                  ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                if (ownership[ref(nx, ny)] !== p.smallID) {
+                  set.add(i);
+                  break;
+                }
+              }
+            }
+            return { borderTiles: set };
+          },
+          bestTransportShipSpawn: async () => false,
+        };
+      }
+
+      const players = [
+        mkPlayer({ smallID: 1, id: "me", name: "Overlord", type: PlayerType.Human, troops: 25000, gold: 250000 }),
+        mkPlayer({ smallID: 2, id: "bot", name: "Botty", type: PlayerType.Bot, troops: 9000 }),
+        mkPlayer({ smallID: 3, id: "peer", name: "Peer", type: PlayerType.Human, troops: 120000 }),
+      ];
+
+      window.__gameView = {
+        ticks: () => tick,
+        inSpawnPhase: () => spawnPhase,
+        width: () => W,
+        height: () => H,
+        numLandTiles: () => W * H,
+        ref,
+        x: (r) => r % W,
+        y: (r) => Math.floor(r / W),
+        isValidCoord: (x, y) => x >= 0 && y >= 0 && x < W && y < H,
+        isLand: () => true,
+        isOcean: () => false,
+        isOceanShore: () => false,
+        ownerID: (r) => ownership[r] ?? 0,
+        hasOwner: (r) => (ownership[r] ?? 0) !== 0,
+        hasFallout: () => false,
+        neighbors: (r) => {
+          const x = r % W,
+            y = Math.floor(r / W),
+            out = [];
+          for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const nx = x + dx,
+              ny = y + dy;
+            if (nx >= 0 && ny >= 0 && nx < W && ny < H) out.push(ref(nx, ny));
+          }
+          return out;
+        },
+        manhattanDist: (a, b) =>
+          Math.abs((a % W) - (b % W)) +
+          Math.abs(Math.floor(a / W) - Math.floor(b / W)),
+        nearbyUnits: () => [],
+        config: () => ({
+          gameConfig: () => ({ difficulty: "Impossible", gameMode: "FFA", goldMultiplier: 1 }),
+          maxTroops: () => 0,
+        }),
+        myPlayer: () => players[0],
+        playerViews: () => players,
+        playerBySmallID: (sid) =>
+          players.find((p) => p._p.smallID === sid) || { isPlayer: () => false },
+        units: () => [],
+      };
+
+      class FakeWebSocket {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+        constructor() {
+          this.readyState = 1;
+        }
+        addEventListener() {}
+        send(payload) {
+          try {
+            const m = JSON.parse(payload);
+            if (m && m.intent) window.sentIntents.push(m.intent);
+          } catch (_) {}
+        }
+        close() {}
+      }
+      window.WebSocket = FakeWebSocket;
+    </script>
+    <script src="./tampermonkey-overlord-bot.js"></script>
+  </head>
+  <body data-status="running">
+    <h1>OVERLORD Bot Harness — <span id="status">running…</span></h1>
+    <div class="grid">
+      <div class="col">
+        <h3>Captured intents</h3>
+        <pre id="intents"></pre>
+      </div>
+      <div class="col">
+        <h3>World snapshot + planner</h3>
+        <pre id="world"></pre>
+      </div>
+    </div>
+    <script>
+      (async function () {
+        const runtime = window.__overlordBotRuntime;
+        // Wire our fake socket so IO.* can send.
+        runtime.hooks.socket = new window.WebSocket();
+        runtime.hooks.gameView = window.__gameView;
+
+        const log = [];
+        function snapshot(label) {
+          const w = runtime.world;
+          log.push(
+            label +
+              " | goal=" +
+              runtime.planner.activeGoalId +
+              (w && w.me
+                ? " tiles=" +
+                  w.me.tiles +
+                  " troops=" +
+                  w.me.troops +
+                  " gold=" +
+                  w.me.gold
+                : ""),
+          );
+        }
+
+        // 1) Spawn phase: should emit a spawn intent.
+        runtime.hooks.tick = 10;
+        await runtime.test.runModulesForTick();
+        snapshot("spawn-phase");
+
+        // Simulate the spawn taking effect: grant our starting block.
+        fill(1, 11, 8, 6, 6);
+
+        // 2) Game phase: drive several ticks (growing troops a bit each tick).
+        spawnPhase = false;
+        for (let i = 0; i < 6; i++) {
+          tick = 300 + i * 10;
+          runtime.hooks.tick = tick;
+          players[0]._p.troops += 8000; // simulate growth
+          await runtime.test.runModulesForTick();
+          snapshot("tick " + tick);
+        }
+
+        const intents = window.sentIntents;
+        const hasSpawn = intents.some((i) => i.type === "spawn");
+        const hasExpand = intents.some(
+          (i) => i.type === "attack" && i.targetID === null,
+        );
+        const hasBuild = intents.some((i) => i.type === "build_unit");
+        const pass = hasSpawn && hasExpand;
+
+        document.getElementById("intents").textContent =
+          intents.map((i) => JSON.stringify(i)).join("\n") || "(none)";
+        document.getElementById("world").textContent =
+          log.join("\n") +
+          "\n\nchecks: spawn=" +
+          hasSpawn +
+          " expand=" +
+          hasExpand +
+          " build=" +
+          hasBuild;
+
+        const statusEl = document.getElementById("status");
+        statusEl.textContent = pass ? "PASS" : "FAIL";
+        statusEl.className = pass ? "pass" : "fail";
+        document.body.setAttribute("data-status", pass ? "pass" : "fail");
+      })();
+    </script>
+  </body>
+</html>
