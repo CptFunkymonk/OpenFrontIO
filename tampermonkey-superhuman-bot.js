@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.15.0
-// @description  Standalone strategic OpenFront bot: world model, threat scoring, whole-game plan (phases + persistent campaigns), opponent intel (grudges, snowball detection, appeasement), adaptive spawn scoring, goal planner, invasion defense, compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
+// @version      2.16.0
+// @description  Standalone strategic OpenFront bot: world model, threat scoring, whole-game plan (phases + persistent campaigns), opponent intel (grudges, snowball detection, appeasement), adaptive spawn scoring, goal planner, invasion defense, auto-queue (W/L tally + leave-and-requeue), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.15.0";
+  const BOT_VERSION = "2.16.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -188,6 +188,23 @@
   const EARLY_INVASION_MAX_TICKS = 3 * TICKS_PER_MINUTE;
   const EARLY_INVASION_MAX_MAP_SHARE = 0.08;
   const EARLY_INVASION_PINNED_TROOP_RATIO = 0.15;
+  // ----- Auto-queue session (v2.16) -----
+  // Persistent W/L record + automatic leave-and-requeue. The record and the
+  // auto-queue toggle live in localStorage so they survive the page
+  // navigation between matches.
+  const WL_STORAGE_KEY = "superbotWL";
+  const AUTOQUEUE_STORAGE_KEY = "superbotAutoQueue";
+  // GameUpdateType.Win in src/core/game/GameUpdates.ts (enum index).
+  const GAME_UPDATE_TYPE_WIN = 12;
+  // Human-ish pause on the win/death screen before exiting to the lobby.
+  const REQUEUE_LEAVE_DELAY_MS = 6_000;
+  const REQUEUE_LEAVE_JITTER_MS = 5_000;
+  // Homepage lobby-join pacing: retry cadence while the lobby list loads,
+  // and how long we wait in a joined lobby before assuming it started
+  // without us and picking a new one.
+  const REQUEUE_JOIN_RETRY_MS = 5_000;
+  const REQUEUE_JOIN_STUCK_MS = 120_000;
+
   const RL_STORAGE_KEY_PREFIX = "superbotRL:";
   const RL_STORAGE_MAX_MATCHES = 3;
   // Compact export budget. The default dump target — 500 KB easily fits
@@ -586,6 +603,27 @@
       // after 5 minutes; without renewal our nation appeasements silently
       // lapse mid-game and the ex-ally becomes an invader again.
       extensionRequested: new Map(),
+    },
+    /**
+     * Auto-queue session (v2.16). Tracks the match result (win/loss) once
+     * per game, keeps a persistent W/L tally (localStorage, manually
+     * resettable from the overlay or `window.__superhumanBotWL.reset()`),
+     * and — when `autoQueue` is enabled — leaves finished matches and joins
+     * the first available public lobby from the homepage.
+     */
+    session: {
+      autoQueue: false,
+      record: { wins: 0, losses: 0, sinceMs: 0 },
+      resultRecorded: false,
+      lastResult: null, // "win" | "loss" | null
+      leaveAtMs: 0,
+      leaving: false,
+      homeJoin: {
+        lastAttemptMs: 0,
+        joinedGameID: null,
+        joinedAtMs: 0,
+        attempts: 0,
+      },
     },
     stealth: {
       lastIntentAtMs: 0,
@@ -11772,6 +11810,8 @@
       "Our outer-border tile count. Proxy for how much front we're defending.",
     Outgoing: "Active attacks we're currently sending (intents still live).",
     Incoming: "Active attacks pointed at us right now.",
+    Record:
+      "Persistent win/loss tally across matches (localStorage). A win is counted when we take the game; a loss when we're eliminated or someone else wins. Reset with the 'rst W/L' button in the header.",
     // Intel
     Archetype:
       "Map archetype inferred from geography: CONTINENTAL / ISLAND / CHOKE_HEAVY / NUKE_RACE / ARENA / CONVENTIONAL. Biases which goals fire.",
@@ -13162,6 +13202,289 @@
     safeCall(() => persistRlToStorage(), null);
   }
 
+  // ---------- Auto-queue: W/L record + leave-and-requeue (v2.16) ----------
+  //
+  // Lifecycle: a match result ("win"/"loss") is detected once per game via
+  // maybeDetectMatchResult() — engine Win updates, our own elimination, or
+  // the game's win-modal as a browser-side fallback. The result increments
+  // a persistent W/L tally (localStorage `superbotWL`, resettable from the
+  // overlay or `window.__superhumanBotWL.reset()`). When auto-queue is ON
+  // (localStorage `superbotAutoQueue`, toggled from the overlay), the bot
+  // then exits to the homepage after a human-ish pause — the same
+  // `location.href = "/"` the win-modal Exit button uses — and joins the
+  // first available public lobby (ffa > team > special order) by
+  // dispatching the client's own `join-lobby` event.
+
+  function sessionReadStorage(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function sessionWriteStorage(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (_) { /* storage unavailable — session-only tally */ }
+  }
+
+  function loadSessionSettings() {
+    const session = runtime.session;
+    session.autoQueue = sessionReadStorage(AUTOQUEUE_STORAGE_KEY) === "1";
+    const raw = sessionReadStorage(WL_STORAGE_KEY);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        session.record.wins = Math.max(0, Number(parsed.wins) || 0);
+        session.record.losses = Math.max(0, Number(parsed.losses) || 0);
+        session.record.sinceMs = Number(parsed.sinceMs) || 0;
+      } catch (_) { /* corrupted record — start fresh */ }
+    }
+    if (!session.record.sinceMs) session.record.sinceMs = Date.now();
+  }
+
+  function persistWinLossRecord() {
+    sessionWriteStorage(WL_STORAGE_KEY, JSON.stringify(runtime.session.record));
+  }
+
+  function resetWinLossRecord() {
+    runtime.session.record = { wins: 0, losses: 0, sinceMs: Date.now() };
+    persistWinLossRecord();
+    botLog("W/L record reset");
+    safeCall(() => refreshOverlay({ force: true }), null);
+    return runtime.session.record;
+  }
+
+  function setAutoQueue(enabled) {
+    runtime.session.autoQueue = Boolean(enabled);
+    sessionWriteStorage(
+      AUTOQUEUE_STORAGE_KEY,
+      runtime.session.autoQueue ? "1" : "0",
+    );
+    botLog("Auto-queue " + (runtime.session.autoQueue ? "ENABLED" : "disabled"));
+    safeCall(() => refreshOverlay({ force: true }), null);
+    return runtime.session.autoQueue;
+  }
+
+  /**
+   * Record the match result exactly once per game and (if auto-queue is on)
+   * schedule the exit to the lobby.
+   */
+  function recordMatchResult(result, reason) {
+    const session = runtime.session;
+    if (session.resultRecorded) return false;
+    session.resultRecorded = true;
+    session.lastResult = result;
+    if (result === "win") session.record.wins += 1;
+    else session.record.losses += 1;
+    persistWinLossRecord();
+    botLog(
+      "Match result: " +
+        String(result).toUpperCase() +
+        " (" +
+        reason +
+        ") — record " +
+        session.record.wins +
+        "W/" +
+        session.record.losses +
+        "L",
+    );
+    decisionLog("match result " + result + " — " + reason);
+    scheduleAutoRequeue(reason);
+    return true;
+  }
+
+  function scheduleAutoRequeue(reason) {
+    const session = runtime.session;
+    if (!session.autoQueue) return;
+    if (isHarnessMode()) return;
+    if (session.leaveAtMs > 0) return;
+    session.leaveAtMs =
+      Date.now() +
+      REQUEUE_LEAVE_DELAY_MS +
+      Math.floor(Math.random() * REQUEUE_LEAVE_JITTER_MS);
+    botLog(
+      "Auto-queue: leaving match in ~" +
+        Math.max(1, Math.round((session.leaveAtMs - Date.now()) / 1000)) +
+        "s (" +
+        reason +
+        ")",
+    );
+  }
+
+  /**
+   * Detect this match's terminal result. Three independent signals, checked
+   * in priority order:
+   *   1. Engine Win update on the GameView (works headless too). The final
+   *      update bundle persists after the game stops ticking, so polling
+   *      cannot miss it.
+   *   2. Our own elimination — counted as a loss immediately (we don't wait
+   *      for someone else to reach the win condition).
+   *   3. The game's own <win-modal> becoming visible (browser fallback).
+   */
+  function maybeDetectMatchResult() {
+    const session = runtime.session;
+    if (session.resultRecorded) return;
+    if (!runtime.state.gameStarted) return;
+    const gameView = runtime.hooks.gameView;
+
+    // 1. Engine win update.
+    const updates = gameView
+      ? safeCall(() => gameView.updatesSinceLastTick(), null)
+      : null;
+    const winUpdates = updates ? updates[GAME_UPDATE_TYPE_WIN] : null;
+    if (winUpdates && winUpdates.length > 0) {
+      const winner = winUpdates[0] ? winUpdates[0].winner : null;
+      if (winner && winner[0] === "player") {
+        const weWon =
+          runtime.identity.clientID !== null &&
+          winner[1] === runtime.identity.clientID;
+        recordMatchResult(
+          weWon ? "win" : "loss",
+          weWon ? "we won the game" : "another player won",
+        );
+        return;
+      }
+      if (winner && winner[0] === "team") {
+        const me = getMyPlayer();
+        const myTeam = me ? safeCall(() => me.team(), null) : null;
+        const weWon = myTeam !== null && winner[1] === myTeam;
+        recordMatchResult(
+          weWon ? "win" : "loss",
+          weWon ? "our team won" : "another team won",
+        );
+        return;
+      }
+      if (winner) {
+        recordMatchResult("loss", winner[0] + " won the game");
+        return;
+      }
+    }
+
+    // 2. We were eliminated.
+    const me = getMyPlayer();
+    if (
+      me &&
+      gameView &&
+      safeCall(() => me.hasSpawned(), false) &&
+      !safeCall(() => me.isAlive(), false) &&
+      !safeCall(() => gameView.inSpawnPhase(), false)
+    ) {
+      recordMatchResult("loss", "we were eliminated");
+      return;
+    }
+
+    // 3. Win-modal fallback (real browser only).
+    const modal = safeCall(
+      () =>
+        typeof document !== "undefined"
+          ? document.querySelector("win-modal")
+          : null,
+      null,
+    );
+    if (modal && modal.isVisible === true && typeof modal.isWin === "boolean") {
+      recordMatchResult(
+        modal.isWin ? "win" : "loss",
+        "win modal shown (" + (modal.isWin ? "victory" : "defeat") + ")",
+      );
+    }
+  }
+
+  /**
+   * Execute the scheduled exit: navigate back to the homepage, exactly like
+   * the win-modal's Exit button. The userscript reloads there (@match
+   * covers the site root) and the auto-join pass takes over.
+   */
+  function maybeLeaveFinishedMatch() {
+    const session = runtime.session;
+    if (!session.autoQueue || isHarnessMode()) return;
+    if (session.leaving) return;
+    if (session.leaveAtMs === 0 || Date.now() < session.leaveAtMs) return;
+    session.leaving = true;
+    botLog("Auto-queue: exiting to lobby");
+    try {
+      window.location.href = "/";
+    } catch (_) {
+      // Navigation unavailable (sandbox) — allow a retry next tick.
+      session.leaving = false;
+    }
+  }
+
+  /**
+   * "First game available": ffa lobbies first (the bot's strongest format),
+   * then team, then special events.
+   */
+  function pickFirstPublicLobby(selectorElement) {
+    const lobbies = safeCall(() => selectorElement.lobbies, null);
+    if (!lobbies || !lobbies.games) return null;
+    for (const type of ["ffa", "team", "special"]) {
+      const list = lobbies.games[type];
+      if (Array.isArray(list) && list.length > 0 && list[0] && list[0].gameID) {
+        return list[0];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Homepage pass: when auto-queue is on and we're not in a match, join the
+   * first available public lobby by dispatching the client's own
+   * `join-lobby` CustomEvent (the exact event a lobby-card click fires).
+   * Retries on a slow cadence while the lobby list streams in, and re-picks
+   * if a joined lobby never starts within REQUEUE_JOIN_STUCK_MS.
+   */
+  function maybeAutoJoinNextGame() {
+    const session = runtime.session;
+    if (!session.autoQueue || isHarnessMode()) return false;
+    if (runtime.state.gameStarted) return false;
+    if (runtime.hooks.gameView) return false; // in a match or replay
+    if (typeof document === "undefined") return false;
+    const selector = safeCall(
+      () => document.querySelector("game-mode-selector"),
+      null,
+    );
+    if (!selector) return false; // not on the homepage
+    const nowMs = Date.now();
+    const join = session.homeJoin;
+    if (
+      join.joinedGameID &&
+      nowMs - join.joinedAtMs < REQUEUE_JOIN_STUCK_MS
+    ) {
+      return false; // sitting in a lobby, waiting for the game to start
+    }
+    if (nowMs - join.lastAttemptMs < REQUEUE_JOIN_RETRY_MS) return false;
+    join.lastAttemptMs = nowMs;
+    const lobby = pickFirstPublicLobby(selector);
+    if (!lobby) return false;
+    join.joinedGameID = lobby.gameID;
+    join.joinedAtMs = nowMs;
+    join.attempts += 1;
+    botLog(
+      "Auto-queue: joining public lobby " +
+        lobby.gameID +
+        " (attempt " +
+        join.attempts +
+        ")",
+    );
+    try {
+      document.dispatchEvent(
+        new CustomEvent("join-lobby", {
+          detail: {
+            gameID: lobby.gameID,
+            source: "public",
+            publicLobbyInfo: lobby,
+          },
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   async function runModulesForTick() {
     // Plan §1: spin up a fresh per-tick view cache so every helper inside
     // this tick reuses the same engine references. The cache is keyed on
@@ -13182,6 +13505,16 @@
       spawnGlobals: null,
     };
     discoverRuntimeReferences();
+
+    // v2.16 session upkeep. Runs BEFORE the tick guard on purpose: the
+    // final Win update lands on the game's last tick, after which ticks
+    // stop advancing — result detection, the scheduled lobby exit, and the
+    // homepage auto-join all must keep running when the tick counter is
+    // frozen (game over) or absent (homepage).
+    safeCall(() => maybeDetectMatchResult(), null);
+    safeCall(() => maybeLeaveFinishedMatch(), null);
+    safeCall(() => maybeAutoJoinNextGame(), null);
+
     const gameView = getGameView();
     if (!gameView) {
       runtime.state.strategy = "waiting for game view";
@@ -13563,6 +13896,14 @@
       runtime.intel.seenAttackIDs.clear();
       runtime.intel.appeaseAttempts.clear();
       runtime.intel.extensionRequested.clear();
+      // v2.16: fresh match — arm result detection and clear any pending
+      // auto-requeue exit from the previous game.
+      runtime.session.resultRecorded = false;
+      runtime.session.lastResult = null;
+      runtime.session.leaveAtMs = 0;
+      runtime.session.leaving = false;
+      runtime.session.homeJoin.joinedGameID = null;
+      runtime.session.homeJoin.joinedAtMs = 0;
       runtime.reasons = [];
       runtime.stealth.perPlayerActions.clear();
       runtime.stealth.combos.clear();
@@ -14060,6 +14401,8 @@
         <div class="superbot-controls">
           <button id="superbot-toggle" title="Master enable switch. When OFF the bot stops sending any intents.">ON</button>
           <button id="superbot-mode" title="Strategy mode — cycle Balanced / Aggressive / Turtle. Hover for a full description.">BAL</button>
+          <button id="superbot-queue" title="Auto-queue: when ON the bot records the result at every win/loss, exits to the lobby, and joins the first available public game. Toggle persists across matches.">AQ off</button>
+          <button id="superbot-wl-reset" title="Reset the persistent W/L record to 0-0.">rst W/L</button>
           <button id="superbot-export" title="Copy a JSON dump of the current world model (intel, players, threats) to clipboard.">export</button>
           <button id="superbot-rl" title="Copy + download the RL decision log for the current match (compact format).">RL dump</button>
           <button id="superbot-collapse" title="Collapse / expand the overlay body.">_</button>
@@ -14785,6 +15128,8 @@
 
     const toggleButton = panel.querySelector("#superbot-toggle");
     const modeButton = panel.querySelector("#superbot-mode");
+    const queueButton = panel.querySelector("#superbot-queue");
+    const wlResetButton = panel.querySelector("#superbot-wl-reset");
     const exportButton = panel.querySelector("#superbot-export");
     const rlButton = panel.querySelector("#superbot-rl");
     const collapseButton = panel.querySelector("#superbot-collapse");
@@ -14797,6 +15142,18 @@
       botLog(runtime.enabled ? "bot enabled" : "bot disabled");
       refreshOverlay({ force: true });
     });
+
+    if (queueButton) {
+      queueButton.addEventListener("click", () => {
+        setAutoQueue(!runtime.session.autoQueue);
+      });
+    }
+
+    if (wlResetButton) {
+      wlResetButton.addEventListener("click", () => {
+        resetWinLossRecord();
+      });
+    }
 
     modeButton.addEventListener("click", () => {
       if (runtime.mode === "balanced") runtime.mode = "aggressive";
@@ -15011,6 +15368,12 @@
         "\n\nClick to cycle Balanced → Aggressive → Turtle.";
       modeButton.title = modeTooltip;
     }
+    const queueButton = root.querySelector("#superbot-queue");
+    if (queueButton) {
+      const on = runtime.session.autoQueue;
+      queueButton.textContent = on ? "AQ ON" : "AQ off";
+      queueButton.style.color = on ? "#6ef79a" : "";
+    }
 
     if (hooksRoot) {
       setRowsIfChanged(hooksRoot, [
@@ -15092,8 +15455,29 @@
               { label: "Outgoing", value: String(stats.outgoingAttacks) },
               { label: "Incoming", value: String(stats.incomingAttacks) },
               { label: "Emojis", value: String(stats.emojisSent || 0) },
+              {
+                label: "Record",
+                value:
+                  runtime.session.record.wins +
+                  "W / " +
+                  runtime.session.record.losses +
+                  "L" +
+                  (runtime.session.lastResult
+                    ? " (last: " + runtime.session.lastResult + ")"
+                    : ""),
+              },
             ]
-          : [{ label: "Status", value: "no live player data" }],
+          : [
+              { label: "Status", value: "no live player data" },
+              {
+                label: "Record",
+                value:
+                  runtime.session.record.wins +
+                  "W / " +
+                  runtime.session.record.losses +
+                  "L",
+              },
+            ],
       );
     }
 
@@ -16209,6 +16593,18 @@
 
   function init() {
     window.__superhumanBotRuntime = runtime;
+    // v2.16: restore the persistent W/L record + auto-queue toggle before
+    // anything else can read them (overlay, first tick).
+    loadSessionSettings();
+    // Devtools namespace for the session record: read, reset, toggle.
+    window.__superhumanBotWL = {
+      get: () => Object.assign({}, runtime.session.record),
+      reset: () => resetWinLossRecord(),
+      setAutoQueue: (enabled) => setAutoQueue(enabled),
+      get autoQueue() {
+        return runtime.session.autoQueue;
+      },
+    };
     // Tests + manual devtools usage want a guaranteed-immediate refresh.
     // The throttled path is for the tick loop; the public API forces.
     window.__superhumanBotRefreshOverlay = () => refreshOverlay({ force: true });
@@ -16416,6 +16812,19 @@
         pickAppeasementTarget,
         maybeAppeaseThreats,
         maybeExtendAlliances,
+        // v2.16 auto-queue session helpers.
+        loadSessionSettings,
+        persistWinLossRecord,
+        resetWinLossRecord,
+        setAutoQueue,
+        recordMatchResult,
+        maybeDetectMatchResult,
+        maybeLeaveFinishedMatch,
+        pickFirstPublicLobby,
+        maybeAutoJoinNextGame,
+        WL_STORAGE_KEY,
+        AUTOQUEUE_STORAGE_KEY,
+        GAME_UPDATE_TYPE_WIN,
         nextSpawnProbeCoord,
         refineSpawnCandidate,
         // Plan §2.4 acceptance helpers.
