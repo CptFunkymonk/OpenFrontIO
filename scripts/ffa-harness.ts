@@ -284,6 +284,9 @@ interface GameOutcome {
   structuresAtDeathOrEnd: Record<string, number>;
   lastGoal: string | null;
   goalsAdopted: string[];
+  intentCounts: Record<string, number>;
+  alliesAtEnd: number;
+  planPhaseHistory: Array<{ tick: number; prev: string; next: string }>;
   winnerKind: string | null;
   winnerIsBot: boolean;
   seed: string;
@@ -312,6 +315,14 @@ function structureCounts(player: any): Record<string, number> {
     }
   }
   return out;
+}
+
+function safeIsAlliedWith(a: any, b: any): boolean {
+  try {
+    return Boolean(a.isAlliedWith(b));
+  } catch {
+    return false;
+  }
 }
 
 // Deterministic PRNG (mulberry32) seeded from a string. We override the global
@@ -453,12 +464,15 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
   const win: any = globalThis.window;
 
   const pendingIntents: any[] = [];
+  const intentCounts: Record<string, number> = {};
   const listeners: Array<(msg: any) => void> = [];
   win.__openFrontLocalTransport = {
     isLocal: true,
     send: (msg: any) => {
       if (msg && msg.type === "intent" && msg.intent) {
         pendingIntents.push({ ...msg.intent, clientID });
+        const kind = String(msg.intent.type || "unknown");
+        intentCounts[kind] = (intentCounts[kind] || 0) + 1;
       }
     },
     addMessageListener: (listener: (msg: any) => void) => {
@@ -628,6 +642,18 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
   const goalsAdopted = Array.from(
     runtime.rl?.tracking?.goalsEverAdopted ?? [],
   ) as string[];
+  const alliesAtEnd =
+    bp !== null
+      ? allPlayers.filter(
+          (p: any) =>
+            p.smallID() !== bp.smallID() &&
+            p.isAlive() &&
+            safeIsAlliedWith(bp, p),
+        ).length
+      : 0;
+  const planPhaseHistory = (runtime.plan?.phaseHistory ?? []).map(
+    (h: any) => ({ tick: h.tick, prev: h.prev, next: h.next }),
+  );
 
   Math.random = realRandom;
 
@@ -645,6 +671,9 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     structuresAtDeathOrEnd: structuresSnapshot,
     lastGoal,
     goalsAdopted,
+    intentCounts,
+    alliesAtEnd,
+    planPhaseHistory,
     winnerKind,
     winnerIsBot,
     seed: opts.seed,
@@ -696,6 +725,13 @@ async function main() {
           `lastGoal=${outcome.lastGoal} ` +
           `goals=${outcome.goalsAdopted.join(",")} ` +
           `(${(outcome.durationMs / 1000).toFixed(1)}s)`,
+      );
+      realLog(
+        `    intents=${JSON.stringify(outcome.intentCounts)} ` +
+          `allies=${outcome.alliesAtEnd} ` +
+          `phases=${outcome.planPhaseHistory
+            .map((h) => `${h.next}@${h.tick}`)
+            .join(",")}`,
       );
       if (outcome.collapseDiag) {
         realLog(`    ${outcome.collapseDiag}`);

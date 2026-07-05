@@ -4213,7 +4213,11 @@
       localOpen: localOpen * 0.8,
       frontier: frontier * 1.2 + farTerrain.weighted * 1.7,
       elev: elev * 0.25,
-      coast: coast * 45,
+      // v2.15: ocean access is a whole-game economic decision, not a
+      // tie-breaker. Ports earn ~75k per trade arrival vs the flat
+      // 100/tick worker rate — a coastal spawn funds the city curve that
+      // keeps our troop cap competitive with snowballing nations.
+      coast: coast * 220,
       choke: choke * 18,
       peninsula: peninsulaScore * 45,
       corridor: corridorScore * 35,
@@ -4986,6 +4990,29 @@
    * troop-hoard logic so we stop bleeding our army into offense when a much
    * stronger neighbour is staring at our border.
    */
+  // v2.15: behaviour-driven threat weighting for the defensive hoard.
+  // A neighbour that has never attacked us and shows no invasion pattern
+  // only counts at 55% of its raw troop ratio — hoarding 85% of the army
+  // against a PEACEFUL giant is exactly the spiral that loses nation-dense
+  // maps (no expansion → capped population → the gap only widens). A
+  // neighbour that acts hostile (attacked us, winding up, snowballing at
+  // us) counts at full strength, so real threats still trigger the hoard.
+  const PEACEFUL_NEIGHBOR_THREAT_WEIGHT = 0.55;
+
+  function adjacentEnemyThreatWeight(entry) {
+    if (!entry) return 1;
+    const tags = entry.tags;
+    const actsHostile =
+      (tags &&
+        (tags.has("INVADING_US") ||
+          tags.has("BREWING_INVASION") ||
+          tags.has("SNOWBALL_RISK") ||
+          tags.has("EARLY_HUMAN_OVERMATCH") ||
+          tags.has("ARCHENEMY"))) ||
+      grudgeScoreFor(entry.smallID) > 0;
+    return actsHostile ? 1 : PEACEFUL_NEIGHBOR_THREAT_WEIGHT;
+  }
+
   function worstAdjacentEnemyTroopRatio(player) {
     const myTroops = safeCall(() => Number(player.troops()), 0) || 0;
     if (myTroops < 1) return 0;
@@ -4999,7 +5026,7 @@
       if (!entry || entry.isFriendly || entry.isDisconnected) continue;
       if (entry.type === PlayerType.Bot) continue;
       const theirTroops = Number(entry.troops) || 0;
-      const ratio = theirTroops / myTroops;
+      const ratio = (theirTroops / myTroops) * adjacentEnemyThreatWeight(entry);
       if (ratio > worst) worst = ratio;
     }
     return worst;
@@ -6137,6 +6164,13 @@
       case UnitType.City:
         return count < cityTarget;
       case UnitType.Factory:
+        // v2.15: landlocked economies live on trains — a first factory
+        // beside our first city prints ~10k gold per train visit, several
+        // times the flat 100/tick worker rate, and factories are the ONLY
+        // scalable income without ocean access. Unlock factory #1 as soon
+        // as one city stands; further factories still follow the city
+        // cadence so we don't over-invest in rails.
+        if (!hasCoast && cities >= 1 && count < 1) return true;
         // Gate factories behind hitting the city target in non-ISLAND
         // archetypes. On ISLAND we need the gold stream early.
         if (archetype !== "ISLAND" && cities < cityTarget) return false;
@@ -11019,9 +11053,12 @@
   const TIMER_CRUNCH_TICKS = 3 * TICKS_PER_MINUTE;
 
   /**
-   * Pure phase decision. Returns { phase, reason }.
+   * Pure phase decision. Returns { phase, reason }. `prevPhase` drives the
+   * SURVIVAL exit hysteresis: we enter at ≥35% invasion pressure but only
+   * leave once pressure has genuinely subsided (<15%), so the plan doesn't
+   * flap between SURVIVAL and ASCENSION every wave.
    */
-  function computeGamePlanPhase(world, meEntry, activeTicks) {
+  function computeGamePlanPhase(world, meEntry, activeTicks, prevPhase) {
     const threats = world.threats || {};
     const totals = world.totals || {};
 
@@ -11030,7 +11067,9 @@
     const inbound = threats.invasionTroopsInbound || 0;
     const myTroops = Math.max(1, Number(meEntry.troops) || 0);
     const pressure = inbound / myTroops;
-    if (invaders.length > 0 && pressure >= 0.35) {
+    const survivalThreshold =
+      prevPhase === GAME_PHASES.SURVIVAL ? 0.15 : 0.35;
+    if (invaders.length > 0 && pressure >= survivalThreshold) {
       return {
         phase: GAME_PHASES.SURVIVAL,
         reason: `invasion pressure ${(pressure * 100).toFixed(0)}%`,
@@ -11282,7 +11321,7 @@
 
     // Phase transition with hysteresis; SURVIVAL/ENDGAME are urgent and
     // bypass the residency requirement.
-    const next = computeGamePlanPhase(world, meEntry, activeTicks);
+    const next = computeGamePlanPhase(world, meEntry, activeTicks, plan.phase);
     if (plan.phaseSince < 0) {
       plan.phase = next.phase;
       plan.phaseSince = tick;
