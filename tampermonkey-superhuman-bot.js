@@ -5032,6 +5032,28 @@
     return worst;
   }
 
+  /**
+   * v2.15: strongest adjacent hostile army, weighted by observed behaviour
+   * (peaceful giants count at 0.55×; see adjacentEnemyThreatWeight). Used
+   * to peg the standing-army floor to the actual threat next door.
+   */
+  function strongestAdjacentEnemyTroopsWeighted() {
+    const adj =
+      (runtime.world &&
+        runtime.world.threats &&
+        runtime.world.threats.adjacentEnemies) ||
+      [];
+    let strongest = 0;
+    for (const entry of adj) {
+      if (!entry || entry.isFriendly || entry.isDisconnected) continue;
+      if (entry.type === PlayerType.Bot) continue;
+      const weighted =
+        (Number(entry.troops) || 0) * adjacentEnemyThreatWeight(entry);
+      if (weighted > strongest) strongest = weighted;
+    }
+    return strongest;
+  }
+
   function computeReserveRatio(player, maxTroops) {
     const ratio = maxTroops > 0 ? player.troops() / maxTroops : 0;
     let reserve = 0.35;
@@ -5052,6 +5074,19 @@
     if (enemyRatio >= 2.5) reserve = Math.max(reserve, 0.85);
     else if (enemyRatio >= 1.7) reserve = Math.max(reserve, 0.7);
     else if (enemyRatio >= 1.25) reserve = Math.max(reserve, 0.55);
+
+    // v2.15 adaptive army floor. The engine's defender-bonus math
+    // saturates when the defender holds ≥ 0.4× the attacker's committed
+    // troops (see computeOverwhelmingNeighbor.idealMinTroops). Peg the
+    // reserve so our STANDING army never drops below 0.4× the strongest
+    // adjacent (behaviour-weighted) hostile army — late-game collapses
+    // consistently show us at ~27% of cap when a 3M-troop neighbour
+    // finally swings. Capped at 0.75 so expansion never fully stalls.
+    const strongest = strongestAdjacentEnemyTroopsWeighted();
+    if (strongest > 0 && maxTroops > 0) {
+      const floorRatio = (strongest * 0.4) / maxTroops;
+      reserve = Math.max(reserve, Math.min(0.75, floorRatio));
+    }
 
     return clamp(reserve, 0.12, 0.9);
   }
