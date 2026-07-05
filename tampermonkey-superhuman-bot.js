@@ -1575,15 +1575,11 @@
   }
 
   function sendRawMessage(object) {
-    const socket = runtime.hooks.socket;
-    if (socket && socket.readyState === NativeWebSocket.OPEN) {
-      socket.send(JSON.stringify(object));
-      return true;
-    }
-    // Singleplayer fallback: the game uses an in-process LocalServer instead
-    // of a WebSocket when playing against AI locally, so there is no socket
-    // to send through. Transport.ts exposes a bridge on `window` that lets us
-    // submit the ClientMessage directly.
+    // Singleplayer first: Transport.ts only installs the local bridge for
+    // in-process games (singleplayer / replay), so its presence is the
+    // authoritative signal that intents must go to the LocalServer — never
+    // to whatever WebSocket happens to be open (v2.16: on dev hosts Vite's
+    // HMR socket used to win this race and silently swallow intents).
     const bridge = runtime.hooks.localBridge;
     if (bridge && typeof bridge.send === "function") {
       try {
@@ -1593,6 +1589,11 @@
         decisionLog("send failed: local bridge error " + (error && error.message));
         return false;
       }
+    }
+    const socket = runtime.hooks.socket;
+    if (socket && socket.readyState === NativeWebSocket.OPEN) {
+      socket.send(JSON.stringify(object));
+      return true;
     }
     decisionLog("send failed: socket unavailable");
     return false;
@@ -14080,14 +14081,25 @@
         : new NativeWebSocket(url);
 
       const urlText = String(url);
-      socket.addEventListener("message", (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          handleServerMessage(data);
-        } catch (_) {}
-      });
-
-      if (!urlText.includes("/lobbies")) {
+      // Only treat game-server sockets as THE game socket. The page opens
+      // several other WebSockets we must never capture (or we'd send our
+      // intents into them):
+      //   - the public lobby feed ("/lobbies"),
+      //   - Vite's dev-server HMR socket ("?token=..." on localhost dev),
+      //   - anything explicitly vite/hmr flavoured.
+      // Game sockets connect to a worker path like wss://host/w3.
+      const isNonGameSocket =
+        urlText.includes("/lobbies") ||
+        urlText.includes("vite") ||
+        urlText.includes("hmr") ||
+        /[?&]token=/.test(urlText);
+      if (!isNonGameSocket) {
+        socket.addEventListener("message", (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            handleServerMessage(data);
+          } catch (_) {}
+        });
         runtime.hooks.socket = socket;
       }
 
