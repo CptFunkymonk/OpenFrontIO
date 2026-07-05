@@ -644,6 +644,117 @@ describe("CAMPAIGN_CONQUEST goal — never idle with a campaign on the books", (
 });
 
 // ---------------------------------------------------------------------------
+// Defense floor (v3.1 Overlord merge)
+// ---------------------------------------------------------------------------
+
+describe("defense floor — never weak next to a neighbour", () => {
+  it("floors at the strongest adjacent hostile's committable troops", () => {
+    const runtime = loadUserscript();
+    const { computeDefenseFloor, enemyCommittableTroops } =
+      runtime.test.internals;
+    // Hostile-acting neighbour: full weight. troops 100k, cap 120k →
+    // committable = 100k − 0.35×120k = 58k.
+    const invader = makeEntry({
+      smallID: 2,
+      name: "Invader",
+      troops: 100_000,
+      maxTroops: 120_000,
+      isAdjacent: true,
+    });
+    invader.tags.add("INVADING_US");
+    const midget = makeEntry({
+      smallID: 3,
+      troops: 20_000,
+      maxTroops: 40_000,
+      isAdjacent: true,
+    });
+    installWorld(runtime, {
+      myTroops: 80_000,
+      adjacentEnemies: [invader, midget],
+    });
+    expect(enemyCommittableTroops(invader)).toBe(58_000);
+    const info = computeDefenseFloor();
+    expect(info.floor).toBe(58_000);
+    expect(info.danger.smallID).toBe(2);
+    // Excluding the attack target removes them from the floor.
+    const excluded = computeDefenseFloor(2);
+    expect(excluded.floor).toBeLessThan(10_000);
+  });
+
+  it("discounts peaceful giants but not hostile-acting ones", () => {
+    const runtime = loadUserscript();
+    const { computeDefenseFloor } = runtime.test.internals;
+    const peacefulGiant = makeEntry({
+      smallID: 2,
+      troops: 200_000,
+      maxTroops: 250_000,
+      isAdjacent: true,
+    });
+    installWorld(runtime, {
+      myTroops: 80_000,
+      adjacentEnemies: [peacefulGiant],
+    });
+    const peaceful = computeDefenseFloor().floor;
+    peacefulGiant.tags.add("SNOWBALL_RISK");
+    const hostile = computeDefenseFloor().floor;
+    expect(hostile).toBeGreaterThan(peaceful);
+    expect(peaceful).toBeCloseTo(hostile * 0.55, 0);
+  });
+
+  it("capCommitByDefenseFloor keeps the post-commit garrison at the floor", () => {
+    const runtime = loadUserscript();
+    const { capCommitByDefenseFloor } = runtime.test.internals;
+    const threat = makeEntry({
+      smallID: 2,
+      troops: 100_000,
+      maxTroops: 120_000,
+      isAdjacent: true,
+    });
+    threat.tags.add("INVADING_US"); // full weight → floor 58k
+    installWorld(runtime, { myTroops: 80_000, adjacentEnemies: [threat] });
+    const me = { troops: () => 80_000 };
+
+    // Wants 60k but only 80k − 58k = 22k may leave home.
+    expect(capCommitByDefenseFloor(me, 60_000, {})).toBe(22_000);
+    // Small commits pass through untouched.
+    expect(capCommitByDefenseFloor(me, 10_000, {})).toBe(10_000);
+    // Retaliation fights at half floor: 80k − 29k = 51k.
+    expect(capCommitByDefenseFloor(me, 60_000, { retaliating: true })).toBe(
+      51_000,
+    );
+    // A capped PvP commit below the viability point is dropped entirely.
+    expect(
+      capCommitByDefenseFloor(me, 60_000, { minViableCommit: 30_000 }),
+    ).toBe(0);
+    // Attacking the threat itself excludes them from the floor.
+    expect(capCommitByDefenseFloor(me, 60_000, { targetSmallID: 2 })).toBe(
+      60_000,
+    );
+  });
+
+  it("calculateAttackTroops expansion commits are capped by the floor", () => {
+    const runtime = loadUserscript();
+    const { calculateAttackTroops } = runtime.test.internals;
+    const threat = makeEntry({
+      smallID: 2,
+      troops: 100_000,
+      maxTroops: 120_000,
+      isAdjacent: true,
+    });
+    threat.tags.add("INVADING_US"); // floor 58k
+    installWorld(runtime, { myTroops: 80_000, adjacentEnemies: [threat] });
+    const me = { troops: () => 80_000, incomingAttacks: () => [] };
+
+    // TN expansion: reserve 0.1×100k leaves 70k available, but the floor
+    // caps the commit at 80k − 58k = 22k so the garrison holds.
+    const tn = calculateAttackTroops(me, null, 0.1, 100_000, {
+      retaliating: false,
+    });
+    expect(tn).toBe(22_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Spawn upgrades
 // ---------------------------------------------------------------------------
 

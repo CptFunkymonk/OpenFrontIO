@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         OpenFront.io Superhuman Bot
+// @name         OpenFront.io Overlord Superbot
 // @namespace    http://tampermonkey.net/
-// @version      2.16.0
-// @description  Standalone strategic OpenFront bot: world model, threat scoring, whole-game plan (phases + persistent campaigns), opponent intel (grudges, snowball detection, appeasement), adaptive spawn scoring, goal planner, invasion defense, auto-queue (W/L tally + leave-and-requeue), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
+// @version      3.1.0
+// @description  Best-of-both merge of the Superhuman and Overlord bots. Superhuman strategy stack (world model, threat scoring, whole-game plan with phases + persistent campaigns, opponent intel: grudges/snowball detection/appeasement, adaptive spawn scoring, auto-queue with W/L tally, RL decision logger, emoji comms) + Overlord military math (committable-troops defense floor on every attack commit) + Overlord UI (compact draggable panel, O/B hotkeys)
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.16.0";
+  const BOT_VERSION = "3.1.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -5038,6 +5038,112 @@
   // us) counts at full strength, so real threats still trigger the hoard.
   const PEACEFUL_NEIGHBOR_THREAT_WEIGHT = 0.55;
 
+  // v3.1 (Overlord merge): assumed home-reserve fractions for OTHER players,
+  // ported from the Overlord bot's SIM.assumedReserveRatio. A neighbour can
+  // only throw (troops − reserve×cap) at us in one strike; that committable
+  // amount — not their raw troop count — is what our standing army must
+  // match to keep the engine's defender math from saturating against us.
+  const ENEMY_ASSUMED_RESERVE_BOT = 0.1;
+  const ENEMY_ASSUMED_RESERVE_DEFAULT = 0.35;
+
+  /**
+   * Overlord SIM.committableTroops port: how many troops `entry` could
+   * realistically commit against us right now. Uses the entry's REAL pop
+   * cap from the world model (cfg.maxTroops), minus the reserve a player
+   * of that type typically holds home.
+   */
+  function enemyCommittableTroops(entry) {
+    if (!entry) return 0;
+    const max = Math.max(1, Number(entry.maxTroops) || 1);
+    const reserve =
+      entry.type === PlayerType.Bot
+        ? ENEMY_ASSUMED_RESERVE_BOT
+        : ENEMY_ASSUMED_RESERVE_DEFAULT;
+    return Math.max(0, (Number(entry.troops) || 0) - max * reserve);
+  }
+
+  /**
+   * Overlord SIM.safeCommit port, behaviour-weighted. The defense floor is
+   * the largest committable strike among adjacent hostiles — our standing
+   * army must never drop below it, or that neighbour conquers us at the
+   * engine's max-speed saturation point the moment they swing. Peaceful
+   * neighbours are discounted (PEACEFUL_NEIGHBOR_THREAT_WEIGHT) so the
+   * floor doesn't freeze expansion next to a friendly giant.
+   *
+   * @param excludeSmallID optional target we're ABOUT to attack — attacking
+   *   them consumes their committable pool, so they don't count toward the
+   *   floor for that specific commit.
+   * @returns { floor, danger } — troops we must keep home + who forces it.
+   */
+  function computeDefenseFloor(excludeSmallID) {
+    const threats = runtime.world && runtime.world.threats;
+    const adjacents = (threats && threats.adjacentEnemies) || [];
+    let floor = 0;
+    let danger = null;
+    for (const entry of adjacents) {
+      if (!entry || entry.isFriendly || entry.isDisconnected) continue;
+      if (
+        excludeSmallID !== undefined &&
+        excludeSmallID !== null &&
+        entry.smallID === excludeSmallID
+      ) {
+        continue;
+      }
+      const committable =
+        enemyCommittableTroops(entry) * adjacentEnemyThreatWeight(entry);
+      if (committable > floor) {
+        floor = committable;
+        danger = entry;
+      }
+    }
+    return { floor, danger };
+  }
+
+  /**
+   * Clamp an offensive commit so our POST-COMMIT standing army never drops
+   * below the defense floor. This is the "never be weak next to a
+   * neighbour" guarantee: expansion and conquest may only spend the troops
+   * above what the scariest adjacent hostile could throw at us.
+   *
+   *   - retaliating commits fight AT half floor: our counter-attack troops
+   *     directly cancel the inbound wave, so they still defend.
+   *   - opts.minViableCommit (PvP): if the cap pushes the commit below the
+   *     engine's viability point, return 0 — a sub-viable attack melts at
+   *     the 2× loss multiplier AND drains the garrison. Worst of both.
+   */
+  function capCommitByDefenseFloor(me, desired, opts) {
+    opts = opts || {};
+    if (!Number.isFinite(desired) || desired <= 0) return desired > 0 ? desired : 0;
+    const floorInfo = computeDefenseFloor(opts.targetSmallID);
+    if (floorInfo.floor <= 0) return Math.floor(desired);
+    const effectiveFloor = opts.retaliating
+      ? floorInfo.floor * 0.5
+      : floorInfo.floor;
+    const myTroops = safeCall(() => me.troops(), 0);
+    const maxCommit = Math.floor(myTroops - effectiveFloor);
+    if (maxCommit >= desired) return Math.floor(desired);
+    if (maxCommit <= 0) {
+      decisionLog(
+        "defense floor: holding all troops — " +
+          ((floorInfo.danger && floorInfo.danger.name) || "neighbour") +
+          " can commit " +
+          fmtTroops(floorInfo.floor),
+      );
+      return 0;
+    }
+    if (opts.minViableCommit && maxCommit < opts.minViableCommit) {
+      decisionLog(
+        "defense floor: capped commit " +
+          fmtTroops(maxCommit) +
+          " below viable " +
+          fmtTroops(opts.minViableCommit) +
+          " — skipping attack (garrison first)",
+      );
+      return 0;
+    }
+    return maxCommit;
+  }
+
   function adjacentEnemyThreatWeight(entry) {
     if (!entry) return 1;
     const tags = entry.tags;
@@ -5431,6 +5537,11 @@
     const available = Math.floor(me.troops() - maxTroops * reserveRatio);
 
     const enemyTroops = enemy ? enemy.troops() : 0;
+    // v3.1 (Overlord merge): every commit is additionally clamped by the
+    // adjacent-neighbour defense floor. The attack target itself is
+    // excluded from the floor — mutual engagement consumes their
+    // committable pool too.
+    const targetSmallID = enemy ? safeCall(() => enemy.smallID(), null) : null;
 
     // --- TerraNullius: flat loss per tile, speed scales linearly with
     // troops. Commit everything above the reserve. Plan §2.3 wording
@@ -5438,7 +5549,9 @@
     // only a non-negative floor so we never ship a negative/zero
     // payload into sendAttack.
     if (enemyTroops <= 0) {
-      return available > 0 ? available : 0;
+      return capCommitByDefenseFloor(me, available > 0 ? available : 0, {
+        retaliating,
+      });
     }
 
     // PvP gate: below 5k against a player, the attack merges into
@@ -5454,24 +5567,32 @@
     const strong = Math.ceil(enemyTroops * strongRatio);
     const minViable = Math.ceil(enemyTroops * minViableRatio);
 
+    let commit = 0;
     if (available >= ideal) {
       // Send 85% of available (keeps a small buffer for follow-ups),
       // but at least `ideal` so we stay past the saturation point.
-      return Math.max(ideal, Math.floor(available * 0.85));
-    }
-    if (available >= strong) {
+      commit = Math.max(ideal, Math.floor(available * 0.85));
+    } else if (available >= strong) {
       // Past the speed-saturation point but below the loss-saturation
       // point — still a good fight, commit everything above reserve.
-      return available;
-    }
-    if (available >= minViable) {
+      commit = available;
+    } else if (available >= minViable) {
       // Only attack if we're already being invaded; otherwise we pay
       // up-to-2x loss multiplier for slow progress. Retaliation wins
       // more ground than a fortify here because the defender's troops
       // are already outside their territory, reducing defTroops/defTiles.
-      return retaliating ? available : 0;
+      commit = retaliating ? available : 0;
     }
-    return 0;
+    if (commit <= 0) return 0;
+    // Defense floor: a non-retaliating PvP commit that gets capped below
+    // the speed-saturation point is dropped entirely — half-hearted
+    // attacks bleed at the 2× loss multiplier while also thinning the
+    // garrison the floor exists to protect.
+    return capCommitByDefenseFloor(me, commit, {
+      targetSmallID,
+      retaliating,
+      minViableCommit: retaliating ? 0 : strong,
+    });
   }
 
   function lineIntersectsEnemySam(
@@ -7521,7 +7642,11 @@
       // tiny and 4× guarantees a clean sweep), otherwise fall back to the
       // standard attack math so we still commit aggressively without
       // overspending against a collapsing player.
-      const budget = Math.floor(me.troops() - maxTroops * reserveRatio);
+      const budget = capCommitByDefenseFloor(
+        me,
+        Math.floor(me.troops() - maxTroops * reserveRatio),
+        { targetSmallID: target.smallID },
+      );
       let troops;
       if (target.type === PlayerType.Bot) {
         troops = calcTribeAttackTroops(target.troops, budget);
@@ -7640,7 +7765,11 @@
     if (target.isAdjacent) {
       let troops;
       if (target.type === PlayerType.Bot) {
-        const budget = Math.floor(me.troops() - maxTroops * reserveRatio);
+        const budget = capCommitByDefenseFloor(
+          me,
+          Math.floor(me.troops() - maxTroops * reserveRatio),
+          { targetSmallID: target.smallID },
+        );
         troops = calcTribeAttackTroops(target.troops, budget);
       } else {
         troops = calculateAttackTroops(me, target.player, reserveRatio, maxTroops);
@@ -7746,7 +7875,11 @@
       computeReserveRatio(me, maxTroops) - 0.1,
       0.15,
     );
-    const budget = Math.floor(me.troops() - maxTroops * reserveRatio);
+    const budget = capCommitByDefenseFloor(
+      me,
+      Math.floor(me.troops() - maxTroops * reserveRatio),
+      { targetSmallID: tribe.smallID },
+    );
     const troops = calcTribeAttackTroops(tribe.troops, budget);
     if (troops <= 0) return false;
 
@@ -14205,27 +14338,34 @@
     "CONVENTIONAL",
   ];
 
+  // v3.1: Overlord-style overlay — compact 320px draggable panel with the
+  // Overlord bot's visual language (purple gradient header, gradient title,
+  // single-column Me/World stat rows, monospace decision log) carrying the
+  // Superhuman bot's full feature set (mode, auto-queue, W/L record, RL
+  // dump, force-goal overrides, archetype lock, clan trust).
+  // Hotkeys: O toggles the panel, B toggles the bot (Overlord bindings).
   function overlayHtml() {
     return `
       <style>
         #superbot-panel {
           position: fixed;
-          top: 12px;
-          right: 12px;
-          width: 480px;
+          top: 10px;
+          right: 10px;
+          width: 320px;
           max-height: 88vh;
           display: flex;
           flex-direction: column;
-          background: rgba(8, 12, 24, 0.94);
-          color: #d7e4ff;
-          border: 1px solid rgba(120, 160, 255, 0.24);
-          border-radius: 12px;
-          box-shadow: 0 14px 40px rgba(0, 0, 0, 0.48);
-          font-family: Inter, "Segoe UI", Arial, sans-serif;
+          background: rgba(10, 12, 24, 0.94);
+          color: #dfe4f5;
+          border: 1px solid rgba(120, 90, 255, 0.4);
+          border-radius: 10px;
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+          font-family: system-ui, "Segoe UI", Arial, sans-serif;
           font-size: 12px;
-          z-index: 999999;
+          z-index: 2147483646;
           overflow: hidden;
-          backdrop-filter: blur(16px);
+          backdrop-filter: blur(12px);
+          user-select: none;
         }
         #superbot-panel.collapsed .superbot-body {
           display: none;
@@ -14235,60 +14375,59 @@
           align-items: center;
           justify-content: space-between;
           gap: 8px;
-          padding: 8px 10px;
-          background: linear-gradient(135deg, rgba(28, 43, 88, 0.95), rgba(18, 26, 51, 0.95));
-          border-bottom: 1px solid rgba(120, 160, 255, 0.16);
+          padding: 7px 11px;
+          background: linear-gradient(135deg, #2a1a52, #16182f);
+          cursor: move;
         }
         .superbot-title {
           font-weight: 800;
-          letter-spacing: 0.04em;
-          color: #8fc4ff;
-          text-transform: uppercase;
-          font-size: 12px;
+          letter-spacing: 0.02em;
+          background: linear-gradient(90deg, #a78bfa, #6ea8ff);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          font-size: 13px;
         }
         .superbot-controls {
           display: flex;
           align-items: center;
-          gap: 6px;
-          flex-wrap: wrap;
+          gap: 4px;
         }
-        .superbot-controls button {
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
-          color: #e6efff;
-          border-radius: 6px;
-          padding: 2px 8px;
+        #superbot-panel button {
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          background: rgba(255, 255, 255, 0.07);
+          color: #aab;
+          border-radius: 4px;
+          padding: 1px 8px;
           cursor: pointer;
           font-size: 11px;
         }
-        .superbot-controls button.active-goal {
-          background: rgba(124, 230, 160, 0.22);
-          border-color: rgba(124, 230, 160, 0.6);
-          color: #b7ffd1;
+        #superbot-panel button.on {
+          background: rgba(60, 210, 120, 0.2);
+          color: #7fe8a0;
         }
         .superbot-body {
           overflow: auto;
-          padding: 10px;
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          grid-gap: 10px;
+          padding: 8px 11px;
+          max-height: 70vh;
         }
-        .superbot-body .wide {
-          grid-column: span 2;
-        }
-        .superbot-section {
-          background: rgba(255, 255, 255, 0.02);
-          border: 1px solid rgba(255, 255, 255, 0.04);
-          border-radius: 8px;
-          padding: 8px 10px;
-        }
-        .superbot-section-title {
-          text-transform: uppercase;
-          font-size: 10px;
-          letter-spacing: 0.08em;
-          color: rgba(164, 190, 255, 0.74);
-          margin-bottom: 6px;
+        .superbot-goal-line {
+          font-size: 14px;
           font-weight: 700;
+          color: #9fd0ff;
+          margin-bottom: 2px;
+        }
+        .superbot-goal-note {
+          font-size: 10px;
+          color: #8a93b8;
+          margin-bottom: 6px;
+          word-break: break-word;
+        }
+        .superbot-sec {
+          font-size: 9px;
+          text-transform: uppercase;
+          letter-spacing: 1px;
+          color: #6b74a0;
+          margin: 7px 0 2px;
           display: flex;
           justify-content: space-between;
         }
@@ -14296,77 +14435,48 @@
           display: flex;
           justify-content: space-between;
           gap: 8px;
-          padding: 2px 0;
-          border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+          padding: 1px 0;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.03);
         }
         .superbot-row:last-child {
           border-bottom: 0;
         }
         .superbot-label {
-          color: rgba(211, 223, 247, 0.74);
+          color: #8893bb;
         }
         .superbot-value {
-          color: #ffffff;
           font-weight: 600;
+          color: #cdd6f4;
           text-align: right;
         }
         .superbot-hook-ok {
-          color: #6ef79a;
+          color: #7fe8a0;
         }
         .superbot-hook-miss {
-          color: #ff7d7d;
+          color: #ff8080;
+        }
+        .superbot-ctl {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
+          margin: 2px 0;
         }
         .superbot-log {
-          background: rgba(0, 0, 0, 0.22);
-          border-radius: 8px;
-          padding: 6px;
-          max-height: 160px;
-          overflow: auto;
+          margin-top: 2px;
           font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           font-size: 10px;
           line-height: 1.45;
+          color: #8893bb;
+          max-height: 130px;
+          overflow: auto;
+          background: rgba(0, 0, 0, 0.25);
+          border-radius: 4px;
+          padding: 4px 6px;
         }
         .superbot-log-line {
           color: rgba(216, 228, 255, 0.85);
-          margin-bottom: 2px;
+          margin-bottom: 1px;
           word-break: break-word;
-        }
-        .superbot-goal-row {
-          display: grid;
-          grid-template-columns: 96px 28px 1fr;
-          gap: 6px;
-          font-size: 11px;
-          padding: 1px 0;
-        }
-        .superbot-goal-row .gid {
-          color: #cfe0ff;
-          font-weight: 600;
-        }
-        .superbot-goal-row .gp {
-          color: #9ffcb8;
-          text-align: right;
-        }
-        .superbot-goal-row.inactive .gid {
-          color: rgba(200, 213, 244, 0.45);
-        }
-        .superbot-goal-row.inactive .gp {
-          color: rgba(150, 180, 220, 0.5);
-        }
-        .superbot-reason {
-          font-size: 11px;
-          line-height: 1.35;
-          padding: 4px 6px;
-          border-left: 2px solid rgba(140, 180, 255, 0.45);
-          margin-bottom: 4px;
-          background: rgba(140, 180, 255, 0.05);
-          border-radius: 0 6px 6px 0;
-        }
-        .superbot-reason .head {
-          color: #b7ffd1;
-          font-weight: 700;
-        }
-        .superbot-reason .tail {
-          color: rgba(216, 228, 255, 0.85);
         }
         .superbot-override-row {
           display: flex;
@@ -14374,100 +14484,66 @@
           gap: 4px;
           margin-top: 4px;
         }
-        .superbot-override-row button {
-          border: 1px solid rgba(140, 180, 255, 0.2);
-          background: rgba(140, 180, 255, 0.08);
-          color: #cfe0ff;
-          border-radius: 5px;
-          padding: 2px 6px;
-          font-size: 10px;
-          cursor: pointer;
-        }
         .superbot-override-row button.active {
-          background: rgba(124, 230, 160, 0.22);
-          border-color: rgba(124, 230, 160, 0.6);
-          color: #b7ffd1;
+          background: rgba(60, 210, 120, 0.2);
+          border-color: rgba(60, 210, 120, 0.6);
+          color: #7fe8a0;
         }
         select.superbot-select {
           background: rgba(255, 255, 255, 0.05);
-          color: #e6efff;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          border-radius: 5px;
+          color: #dfe4f5;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          border-radius: 4px;
           padding: 2px 4px;
           font-size: 11px;
-          margin-left: 6px;
+          width: 100%;
+          margin-top: 2px;
         }
         input.superbot-input {
           background: rgba(255, 255, 255, 0.05);
-          color: #e6efff;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          border-radius: 5px;
+          color: #dfe4f5;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          border-radius: 4px;
           padding: 2px 6px;
           font-size: 11px;
           width: 100%;
-          margin-top: 4px;
+          margin-top: 2px;
+          box-sizing: border-box;
         }
       </style>
-      <div class="superbot-header">
-        <div class="superbot-title" title="Superhuman Bot overlay — hover any label, value, goal or button for a description of what it does.">Superhuman Bot v${BOT_VERSION}</div>
-        <div class="superbot-controls">
-          <button id="superbot-toggle" title="Master enable switch. When OFF the bot stops sending any intents.">ON</button>
-          <button id="superbot-mode" title="Strategy mode — cycle Balanced / Aggressive / Turtle. Hover for a full description.">BAL</button>
-          <button id="superbot-queue" title="Auto-queue: when ON the bot records the result at every win/loss, exits to the lobby, and joins the first available public game. Toggle persists across matches.">AQ off</button>
-          <button id="superbot-wl-reset" title="Reset the persistent W/L record to 0-0.">rst W/L</button>
-          <button id="superbot-export" title="Copy a JSON dump of the current world model (intel, players, threats) to clipboard.">export</button>
-          <button id="superbot-rl" title="Copy + download the RL decision log for the current match (compact format).">RL dump</button>
-          <button id="superbot-collapse" title="Collapse / expand the overlay body.">_</button>
-        </div>
+      <div class="superbot-header" id="superbot-drag">
+        <span class="superbot-title" title="Overlord Superbot — hover any label, value or button for a description. Hotkeys: O toggles this panel, B toggles the bot.">OVERLORD v${BOT_VERSION}</span>
+        <span class="superbot-controls">
+          <button id="superbot-toggle" class="on" title="Master enable switch (hotkey: B). When OFF the bot stops sending any intents.">ON</button>
+          <button id="superbot-collapse" title="Collapse / expand the panel body (hotkey: O hides the whole panel).">_</button>
+        </span>
       </div>
       <div class="superbot-body">
-        <div class="superbot-section">
-          <div class="superbot-section-title" title="Which game internals we successfully hooked. All four must be ready before the bot can play.">Hooks</div>
-          <div id="superbot-hooks"></div>
+        <div class="superbot-goal-line" id="superbot-goal-line" title="Goal currently driving the bot's actions. Hover for details.">—</div>
+        <div class="superbot-goal-note" id="superbot-goal-note"></div>
+        <div class="superbot-sec">Me</div>
+        <div id="superbot-stats"></div>
+        <div class="superbot-sec">World</div>
+        <div id="superbot-intel"></div>
+        <div class="superbot-sec">Controls</div>
+        <div class="superbot-ctl">
+          <button id="superbot-mode" title="Strategy mode — cycle Balanced / Aggressive / Turtle.">BAL</button>
+          <button id="superbot-queue" title="Auto-queue: when ON the bot records the result at every win/loss, exits to the lobby, and joins the first available public game. Persists across matches.">AQ off</button>
+          <button id="superbot-wl-reset" title="Reset the persistent W/L record to 0-0.">rst W/L</button>
+          <button id="superbot-export" title="Copy a JSON dump of the current world model to clipboard.">export</button>
+          <button id="superbot-rl" title="Copy + download the RL decision log for this match (compact).">RL</button>
+          <button id="superbot-adv" title="Show / hide advanced controls (force-goal, archetype lock, trusted clans).">adv</button>
         </div>
-        <div class="superbot-section">
-          <div class="superbot-section-title" title="High-level runtime state: what phase we're in, which strategy executor ran last, and what the last action was.">State</div>
-          <div id="superbot-state"></div>
-        </div>
-        <div class="superbot-section">
-          <div class="superbot-section-title" title="Raw per-tick stats for our player (troops, gold, tiles, incoming/outgoing attacks).">Stats</div>
-          <div id="superbot-stats"></div>
-        </div>
-        <div class="superbot-section">
-          <div class="superbot-section-title" title="World-intel summary: map archetype, coalition share, crown, rising stars, danger, MIRV risk, population.">Intel</div>
-          <div id="superbot-intel"></div>
-        </div>
-        <div class="superbot-section wide">
-          <div class="superbot-section-title" title="Planner goal selection this tick: active goal, note, horizon, and the top candidate goals with their priorities. Hover any goal id for details.">Goal</div>
-          <div id="superbot-goal"></div>
-        </div>
-        <div class="superbot-section wide">
-          <div class="superbot-section-title" title="Recent plain-English explanations of why the bot took each action. Hover the goal tag for details on that goal.">Why</div>
-          <div id="superbot-reasons"></div>
-        </div>
-        <div class="superbot-section wide">
-          <div class="superbot-section-title">
-            <span title="Click a goal to force the planner into it for 120 seconds. Useful for debugging or overriding a tick-by-tick decision.">Overrides</span>
-            <span id="superbot-override-timer" style="color: rgba(216, 228, 255, 0.5); font-weight: 500; text-transform: none; letter-spacing: 0;"></span>
-          </div>
+        <div id="superbot-advanced" style="display:none">
+          <div class="superbot-sec"><span title="Click a goal to force the planner into it for 120 seconds.">Force goal</span><span id="superbot-override-timer" style="text-transform:none;letter-spacing:0"></span></div>
           <div class="superbot-override-row" id="superbot-override-goals"></div>
-          <div style="margin-top:6px">
-            <span title="Map archetype. Leave on (auto) to let the bot classify from geography. Lock to force a bias (ISLAND → naval, CHOKE_HEAVY → choke-lock, etc.)." style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em; cursor: help;">Archetype</span>
-            <select class="superbot-select" id="superbot-archetype" title="Override the detected map archetype."></select>
-          </div>
-          <div style="margin-top:6px">
-            <span title="Additional clan tags that should be treated as trusted (no backstabbing, donation-eligible). Our own clan is auto-trusted." style="color: rgba(164, 190, 255, 0.74); font-size:10px; text-transform:uppercase; letter-spacing:0.08em; cursor: help;">Trusted clan tags (comma-separated)</span>
-            <input class="superbot-input" id="superbot-clan" placeholder="e.g. UN, MLS" title="Comma-separated extra clan tags to trust, e.g. 'UN, MLS'." />
-          </div>
+          <div class="superbot-sec"><span title="Map archetype. Leave on (auto) to classify from geography; lock to force a bias.">Archetype</span></div>
+          <select class="superbot-select" id="superbot-archetype" title="Override the detected map archetype."></select>
+          <div class="superbot-sec"><span title="Extra clan tags treated as trusted (no backstabbing, donation-eligible).">Trusted clan tags</span></div>
+          <input class="superbot-input" id="superbot-clan" placeholder="e.g. UN, MLS" title="Comma-separated extra clan tags to trust." />
         </div>
-        <div class="superbot-section wide">
-          <div class="superbot-section-title" title="Rolling log of planner / executor decisions. One line per interesting decision event.">Decisions</div>
-          <div id="superbot-decisions" class="superbot-log"></div>
-        </div>
-        <div class="superbot-section wide">
-          <div class="superbot-section-title" title="Rolling activity log — any user-visible message the bot logged this match.">Activity</div>
-          <div id="superbot-activity" class="superbot-log"></div>
-        </div>
+        <div class="superbot-sec">Decisions</div>
+        <div id="superbot-decisions" class="superbot-log"></div>
       </div>
     `;
   }
@@ -15203,6 +15279,59 @@
       panel.classList.toggle("collapsed");
     });
 
+    // v3.1 (Overlord UI): draggable panel via the header bar.
+    const dragHandle = panel.querySelector("#superbot-drag");
+    if (dragHandle) {
+      let offsetX = 0;
+      let offsetY = 0;
+      let dragging = false;
+      dragHandle.addEventListener("mousedown", (event) => {
+        if (event.target && event.target.tagName === "BUTTON") return;
+        dragging = true;
+        const rect = panel.getBoundingClientRect();
+        offsetX = event.clientX - rect.left;
+        offsetY = event.clientY - rect.top;
+        event.preventDefault();
+      });
+      document.addEventListener("mousemove", (event) => {
+        if (!dragging) return;
+        panel.style.left = event.clientX - offsetX + "px";
+        panel.style.top = event.clientY - offsetY + "px";
+        panel.style.right = "auto";
+      });
+      document.addEventListener("mouseup", () => {
+        dragging = false;
+      });
+    }
+
+    // v3.1 (Overlord UI): advanced-controls toggle.
+    const advButton = panel.querySelector("#superbot-adv");
+    const advSection = panel.querySelector("#superbot-advanced");
+    if (advButton && advSection) {
+      advButton.addEventListener("click", () => {
+        const shown = advSection.style.display !== "none";
+        advSection.style.display = shown ? "none" : "";
+        advButton.classList.toggle("on", !shown);
+      });
+    }
+
+    // v3.1 (Overlord UI): hotkeys — O toggles the panel, B toggles the bot.
+    if (!runtime.overlay._hotkeysInstalled) {
+      runtime.overlay._hotkeysInstalled = true;
+      document.addEventListener("keydown", (event) => {
+        const tag = (event.target && event.target.tagName) || "";
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        if (event.key === "o" || event.key === "O") {
+          const p = document.getElementById("superbot-panel");
+          if (p) p.style.display = p.style.display === "none" ? "" : "none";
+        } else if (event.key === "b" || event.key === "B") {
+          runtime.enabled = !runtime.enabled;
+          botLog(runtime.enabled ? "bot enabled (hotkey)" : "bot disabled (hotkey)");
+          refreshOverlay({ force: true });
+        }
+      });
+    }
+
     // Force-goal buttons.
     if (overrideRow) {
       for (const entry of OVERRIDE_GOAL_BUTTONS) {
@@ -15350,14 +15479,11 @@
     if (!runtime.overlay.root) return;
 
     const root = runtime.overlay.root;
-    const hooksRoot = root.querySelector("#superbot-hooks");
-    const stateRoot = root.querySelector("#superbot-state");
+    const goalLine = root.querySelector("#superbot-goal-line");
+    const goalNote = root.querySelector("#superbot-goal-note");
     const statsRoot = root.querySelector("#superbot-stats");
     const intelRoot = root.querySelector("#superbot-intel");
-    const goalRoot = root.querySelector("#superbot-goal");
-    const reasonsRoot = root.querySelector("#superbot-reasons");
     const decisionsRoot = root.querySelector("#superbot-decisions");
-    const activityRoot = root.querySelector("#superbot-activity");
     const toggleButton = root.querySelector("#superbot-toggle");
     const modeButton = root.querySelector("#superbot-mode");
     const overrideTimer = root.querySelector("#superbot-override-timer");
@@ -15366,7 +15492,7 @@
 
     if (toggleButton) {
       toggleButton.textContent = runtime.enabled ? "ON" : "OFF";
-      toggleButton.style.color = runtime.enabled ? "#6ef79a" : "#ff7d7d";
+      toggleButton.classList.toggle("on", runtime.enabled);
     }
     if (modeButton) {
       modeButton.textContent =
@@ -15384,110 +15510,112 @@
     if (queueButton) {
       const on = runtime.session.autoQueue;
       queueButton.textContent = on ? "AQ ON" : "AQ off";
-      queueButton.style.color = on ? "#6ef79a" : "";
+      queueButton.classList.toggle("on", on);
     }
 
-    if (hooksRoot) {
-      setRowsIfChanged(hooksRoot, [
-        {
-          label: "WebSocket",
-          value: runtime.hooks.socket
-            ? "captured"
-            : runtime.hooks.localBridge
-              ? "local"
-              : "missing",
-          className:
-            runtime.hooks.socket || runtime.hooks.localBridge
-              ? "superbot-hook-ok"
-              : "superbot-hook-miss",
-        },
-        {
-          label: "Worker",
-          value: runtime.hooks.worker ? "captured" : "fallback",
-          className: runtime.hooks.worker
-            ? "superbot-hook-ok"
-            : "superbot-hook-miss",
-        },
-        {
-          label: "GameView",
-          value: runtime.hooks.gameView ? "ready" : "waiting",
-          className: runtime.hooks.gameView
-            ? "superbot-hook-ok"
-            : "superbot-hook-miss",
-        },
-        {
-          label: "UI State",
-          value: runtime.hooks.uiState ? "ready" : "waiting",
-          className: runtime.hooks.uiState
-            ? "superbot-hook-ok"
-            : "superbot-hook-miss",
-        },
-      ]);
+    // Overlord-style hero line: the active goal + its evaluator note.
+    const planner = runtime.planner;
+    if (goalLine) {
+      const activeId = planner.activeGoalId || "—";
+      const text =
+        activeId +
+        (planner.forcedGoalId ? " (forced)" : "") +
+        (runtime.plan && runtime.plan.phase ? "  ·  " + runtime.plan.phase : "");
+      if (goalLine._lastText !== text) {
+        goalLine._lastText = text;
+        goalLine.textContent = text;
+      }
+      goalLine.title =
+        (GOAL_DESCRIPTIONS[planner.activeGoalId] ||
+          "Goal currently driving the bot's actions.") +
+        "\n\nPlan phase: " +
+        ((runtime.plan && runtime.plan.phase) || "-");
     }
-
-    if (stateRoot) {
-      setRowsIfChanged(stateRoot, [
-        { label: "Phase", value: runtime.state.matchPhase },
-        {
-          label: "Strategy",
-          value: runtime.state.strategy,
-          valueTooltip:
-            STRATEGY_DESCRIPTIONS[runtime.state.strategy] ||
-            "Internal strategy label — no extra description registered for this value.",
-        },
-        { label: "Action", value: runtime.state.lastAction },
-        {
-          label: "Attack Ratio",
-          value: (getAttackRatio() * 100).toFixed(0) + "%",
-        },
-        { label: "Rocket Arc", value: getRocketDirectionUp() ? "up" : "down" },
-        {
-          label: "Clan Tag",
-          value: runtime.identity.clanTag
-            ? "[" + runtime.identity.clanTag + "]"
-            : "auto",
-        },
-      ]);
+    if (goalNote) {
+      const activeId = planner.activeGoalId || "-";
+      const activeNote =
+        (planner.lastEvaluation.find((e) => e.id === activeId) || {}).note || "";
+      const campaign =
+        runtime.plan && runtime.plan.campaign
+          ? "campaign → " + runtime.plan.campaign.name
+          : "";
+      const strategyLine =
+        (runtime.state.strategy || "") +
+        (runtime.state.lastAction ? " · " + runtime.state.lastAction : "");
+      const note = [activeNote, campaign, strategyLine]
+        .filter(Boolean)
+        .join("  |  ");
+      if (goalNote._lastText !== note) {
+        goalNote._lastText = note;
+        goalNote.textContent = note;
+      }
     }
 
     if (statsRoot) {
       const stats = runtime.statsSnapshot;
+      const floorInfo = safeCall(() => computeDefenseFloor(), null);
+      const recordValue =
+        runtime.session.record.wins +
+        "W / " +
+        runtime.session.record.losses +
+        "L" +
+        (runtime.session.lastResult
+          ? " (last: " + runtime.session.lastResult + ")"
+          : "");
+      const myShare =
+        runtime.world && runtime.world.totals
+          ? runtime.world.totals.myShare || 0
+          : 0;
       setRowsIfChanged(
         statsRoot,
         stats
           ? [
-              { label: "Tick", value: String(stats.tick) },
-              { label: "Troops", value: fmtTroops(stats.troops) },
-              { label: "Max Troops", value: fmtTroops(stats.maxTroops) },
+              {
+                label: "Tiles / Share",
+                value: fmt(stats.tiles) + " / " + (myShare * 100).toFixed(1) + "%",
+              },
+              {
+                label: "Troops / Max",
+                value:
+                  fmtTroops(stats.troops) + " / " + fmtTroops(stats.maxTroops),
+              },
               { label: "Gold", value: fmt(stats.gold) },
-              { label: "Tiles", value: fmt(stats.tiles) },
-              { label: "Enemies", value: String(stats.enemies) },
-              { label: "Allies", value: String(stats.allies) },
-              { label: "Border Tiles", value: String(stats.borderTiles) },
-              { label: "Outgoing", value: String(stats.outgoingAttacks) },
-              { label: "Incoming", value: String(stats.incomingAttacks) },
-              { label: "Emojis", value: String(stats.emojisSent || 0) },
+              {
+                label: "In / Out atk",
+                value:
+                  String(stats.incomingAttacks) +
+                  " / " +
+                  String(stats.outgoingAttacks),
+              },
+              {
+                label: "Def floor",
+                tooltip:
+                  LABEL_DESCRIPTIONS["Def floor"] ||
+                  "Troops we must keep home so the scariest adjacent hostile can't conquer us at max speed.",
+                value:
+                  floorInfo && floorInfo.floor > 0
+                    ? fmtTroops(floorInfo.floor) +
+                      (floorInfo.danger ? " (" + floorInfo.danger.name + ")" : "")
+                    : "—",
+                className:
+                  floorInfo &&
+                  floorInfo.floor > 0 &&
+                  stats.troops < floorInfo.floor
+                    ? "superbot-hook-miss"
+                    : undefined,
+              },
               {
                 label: "Record",
-                value:
-                  runtime.session.record.wins +
-                  "W / " +
-                  runtime.session.record.losses +
-                  "L" +
-                  (runtime.session.lastResult
-                    ? " (last: " + runtime.session.lastResult + ")"
-                    : ""),
+                tooltip: LABEL_DESCRIPTIONS["Record"],
+                value: recordValue,
               },
             ]
           : [
               { label: "Status", value: "no live player data" },
               {
                 label: "Record",
-                value:
-                  runtime.session.record.wins +
-                  "W / " +
-                  runtime.session.record.losses +
-                  "L",
+                tooltip: LABEL_DESCRIPTIONS["Record"],
+                value: recordValue,
               },
             ],
       );
@@ -15496,74 +15624,25 @@
     if (intelRoot) {
       const world = runtime.world;
       const crown = world.threats.crown;
-      const rising = (world.threats.risingStars || [])
-        .slice(0, 2)
-        .map((s) => s.name + " (+" + s.tilesPerMin.toFixed(0) + "/m)")
-        .join(", ") || "-";
-      const danger = world.threats.nearestDanger;
+      const threats = world.threats || {};
+      const threatSummary =
+        "inv " +
+        (threats.activeInvaders || []).length +
+        " brew " +
+        (threats.brewingInvaders || []).length +
+        " snow " +
+        (threats.snowballRisks || []).length +
+        (world.allianceGraph && world.allianceGraph.coalitionThreat
+          ? " COAL"
+          : "") +
+        (threats.mirvRisk ? " ☢" : "");
+      const hooksOk = Boolean(
+        (runtime.hooks.socket || runtime.hooks.localBridge) &&
+          runtime.hooks.gameView,
+      );
       setRowsIfChanged(intelRoot, [
-        { label: "Archetype", value: world.archetype || "unknown" },
         {
-          label: "Plan",
-          value:
-            (runtime.plan.phase || "-") +
-            (runtime.plan.campaign
-              ? " → " + runtime.plan.campaign.name
-              : ""),
-        },
-        {
-          label: "Coalition",
-          value:
-            (world.allianceGraph.largestBlocShare * 100).toFixed(0) +
-            "%" +
-            (world.allianceGraph.coalitionThreat ? " ⚠" : ""),
-        },
-        {
-          label: "My Share",
-          value: (world.totals.myShare * 100).toFixed(1) + "%",
-        },
-        {
-          label: "Crown",
-          value: crown
-            ? crown.name + " " + (world.totals.crownShare * 100).toFixed(0) + "%"
-            : "-",
-        },
-        {
-          label: "#2 Share",
-          value: (world.totals.secondShare * 100).toFixed(1) + "%",
-        },
-        { label: "Rising", value: rising },
-        {
-          label: "Collapsing",
-          value:
-            (world.threats.collapsingTargets || [])
-              .slice(0, 2)
-              .map(
-                (s) =>
-                  s.name +
-                  " (" +
-                  (s.distinctAttackerCount || 0) +
-                  "×, " +
-                  s.tilesPerMin.toFixed(0) +
-                  "/m)",
-              )
-              .join(", ") || "-",
-        },
-        {
-          label: "Danger",
-          value: danger
-            ? danger.name + " thr=" + danger.threatScore.toFixed(0)
-            : "-",
-        },
-        {
-          label: "MIRV Risk",
-          value: world.threats.mirvRisk ? "YES" : "no",
-          className: world.threats.mirvRisk
-            ? "superbot-hook-miss"
-            : "superbot-hook-ok",
-        },
-        {
-          label: "Players",
+          label: "Alive",
           value:
             world.totals.alivePlayers +
             " (" +
@@ -15574,99 +15653,45 @@
             world.totals.botCount +
             "T)",
         },
+        {
+          label: "Crown",
+          tooltip: LABEL_DESCRIPTIONS["Crown"],
+          value: crown
+            ? crown.name + " " + (world.totals.crownShare * 100).toFixed(0) + "%"
+            : "-",
+        },
+        {
+          label: "Threats",
+          tooltip:
+            "Active invaders / brewing invaders / snowball risks. COAL = coalition threat, ☢ = a hostile can plausibly MIRV.",
+          value: threatSummary,
+        },
+        {
+          label: "Plan",
+          tooltip: LABEL_DESCRIPTIONS["Plan"],
+          value:
+            (runtime.plan.phase || "-") +
+            (runtime.plan.campaign ? " → " + runtime.plan.campaign.name : ""),
+        },
+        {
+          label: "Archetype",
+          tooltip: LABEL_DESCRIPTIONS["Archetype"],
+          value: world.archetype || "unknown",
+        },
+        {
+          label: "Hooks",
+          tooltip:
+            "Game hooks status: transport (WebSocket or singleplayer bridge) + GameView.",
+          value: hooksOk ? "ok" : "missing",
+          className: hooksOk ? "superbot-hook-ok" : "superbot-hook-miss",
+        },
+        {
+          label: "Intents s/c",
+          tooltip: "Intents sent / confirmed by the server this match.",
+          value:
+            runtime.state.intentsSent + " / " + runtime.state.intentsConfirmed,
+        },
       ]);
-    }
-
-    if (goalRoot) {
-      const planner = runtime.planner;
-      const activeId = planner.activeGoalId || "-";
-      const tick = runtime.world.tick;
-      const remaining = Math.max(0, planner.activeGoalExpiresTick - tick);
-      const activeNote =
-        planner.lastEvaluation.find((e) => e.id === activeId)?.note ||
-        "-";
-      const activeDesc = GOAL_DESCRIPTIONS[activeId] || "";
-      const activeLabelTitle = LABEL_DESCRIPTIONS["Active"]
-        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Active"]) + '"'
-        : "";
-      const activeValueTitle = activeDesc
-        ? ' title="' + escapeHtml(activeDesc) + '"'
-        : "";
-      const noteLabelTitle = LABEL_DESCRIPTIONS["Note"]
-        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Note"]) + '"'
-        : "";
-      const horizonLabelTitle = LABEL_DESCRIPTIONS["Horizon"]
-        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Horizon"]) + '"'
-        : "";
-      const modeBiasLabelTitle = LABEL_DESCRIPTIONS["Mode bias"]
-        ? ' title="' + escapeHtml(LABEL_DESCRIPTIONS["Mode bias"]) + '"'
-        : "";
-      const modeBiasValueTitle = MODE_DESCRIPTIONS[runtime.mode]
-        ? ' title="' + escapeHtml(MODE_DESCRIPTIONS[runtime.mode]) + '"'
-        : "";
-      const header =
-        `<div class="superbot-row"><span class="superbot-label"${activeLabelTitle}>Active</span>` +
-        `<span class="superbot-value"${activeValueTitle}>${escapeHtml(activeId)}` +
-        (planner.forcedGoalId ? " (forced)" : "") +
-        `</span></div>` +
-        `<div class="superbot-row"><span class="superbot-label"${noteLabelTitle}>Note</span>` +
-        `<span class="superbot-value">${escapeHtml(activeNote)}</span></div>` +
-        `<div class="superbot-row"><span class="superbot-label"${horizonLabelTitle}>Horizon</span>` +
-        `<span class="superbot-value">${remaining} ticks</span></div>` +
-        `<div class="superbot-row"><span class="superbot-label"${modeBiasLabelTitle}>Mode bias</span>` +
-        `<span class="superbot-value"${modeBiasValueTitle}>${runtime.mode}</span></div>`;
-
-      const list = planner.lastEvaluation
-        .slice(0, 6)
-        .map((ev) => {
-          const cls =
-            ev.id === planner.activeGoalId ? "" : "inactive";
-          const desc = GOAL_DESCRIPTIONS[ev.id];
-          const rowTitle = desc
-            ? ' title="' + escapeHtml(desc) + '"'
-            : "";
-          return (
-            `<div class="superbot-goal-row ${cls}"${rowTitle}>` +
-            `<span class="gid">${escapeHtml(ev.id)}</span>` +
-            `<span class="gp">${ev.priority.toFixed(0)}</span>` +
-            `<span class="gt">${escapeHtml(ev.note || (ev.valid ? "" : "invalid"))}</span>` +
-            `</div>`
-          );
-        })
-        .join("");
-      setHtmlIfChanged(
-        goalRoot,
-        header + `<div style="margin-top:6px">${list}</div>`,
-      );
-    }
-
-    if (reasonsRoot) {
-      const entries = runtime.reasons.slice(-8).reverse();
-      if (entries.length === 0) {
-        setHtmlIfChanged(
-          reasonsRoot,
-          '<div style="color: rgba(216, 228, 255, 0.5); font-size: 11px;">no reasoned actions yet</div>',
-        );
-      } else {
-        const html = entries
-          .map((entry) => {
-            const desc = GOAL_DESCRIPTIONS[entry.goalId];
-            const headTitle = desc
-              ? ' title="' + escapeHtml(desc) + '"'
-              : "";
-            return (
-              `<div class="superbot-reason">` +
-              `<div><span class="head"${headTitle}>T${entry.tick} [${escapeHtml(entry.goalId)}]</span> ` +
-              `<span class="tail">${escapeHtml(entry.summary)}</span></div>` +
-              (entry.detail
-                ? `<div class="tail">${escapeHtml(entry.detail)}</div>`
-                : "") +
-              `</div>`
-            );
-          })
-          .join("");
-        setHtmlIfChanged(reasonsRoot, html);
-      }
     }
 
     if (overrideRow) {
@@ -15704,18 +15729,6 @@
         decisionsRoot._lastHtml = html;
         decisionsRoot.innerHTML = html;
         decisionsRoot.scrollTop = decisionsRoot.scrollHeight;
-      }
-    }
-
-    if (activityRoot) {
-      const html = runtime.logs
-        .slice(-22)
-        .map((entry) => '<div class="superbot-log-line">' + escapeHtml(entry) + "</div>")
-        .join("");
-      if (activityRoot._lastHtml !== html) {
-        activityRoot._lastHtml = html;
-        activityRoot.innerHTML = html;
-        activityRoot.scrollTop = activityRoot.scrollHeight;
       }
     }
   }
@@ -16824,6 +16837,10 @@
         pickAppeasementTarget,
         maybeAppeaseThreats,
         maybeExtendAlliances,
+        // v3.1 Overlord-merge defense-floor helpers.
+        enemyCommittableTroops,
+        computeDefenseFloor,
+        capCommitByDefenseFloor,
         // v2.16 auto-queue session helpers.
         loadSessionSettings,
         persistWinLossRecord,
