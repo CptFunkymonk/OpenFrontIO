@@ -286,6 +286,7 @@ interface GameOutcome {
   goalsAdopted: string[];
   intentCounts: Record<string, number>;
   alliesAtEnd: number;
+  peakAllies: number;
   planPhaseHistory: Array<{ tick: number; prev: string; next: string }>;
   winnerKind: string | null;
   winnerIsBot: boolean;
@@ -501,6 +502,7 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
   let peakTiles = 0;
   let peakTroops = 0;
   let peakGold = 0;
+  let peakAllies = 0;
   let deathTick: number | null = null;
   let botWasAlive = false;
   let endTick = 0;
@@ -582,6 +584,14 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
         if (tiles > peakTiles) peakTiles = tiles;
         if (troops > peakTroops) peakTroops = troops;
         if (gold > peakGold) peakGold = gold;
+        if (game.ticks() % 50 === 0) {
+          try {
+            const allies = (bp as any).allies?.() ?? [];
+            if (allies.length > peakAllies) peakAllies = allies.length;
+          } catch {
+            /* ignore */
+          }
+        }
         structuresSnapshot = structureCounts(bp);
         if (
           collapseDiag === null &&
@@ -673,6 +683,7 @@ async function runOneGame(opts: HarnessOptions): Promise<GameOutcome> {
     goalsAdopted,
     intentCounts,
     alliesAtEnd,
+    peakAllies,
     planPhaseHistory,
     winnerKind,
     winnerIsBot,
@@ -728,7 +739,7 @@ async function main() {
       );
       realLog(
         `    intents=${JSON.stringify(outcome.intentCounts)} ` +
-          `allies=${outcome.alliesAtEnd} ` +
+          `allies=${outcome.alliesAtEnd} peakAllies=${outcome.peakAllies} ` +
           `phases=${outcome.planPhaseHistory
             .map((h) => `${h.next}@${h.tick}`)
             .join(",")}`,

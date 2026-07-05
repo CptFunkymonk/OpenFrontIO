@@ -8174,11 +8174,13 @@
     }
 
     // Step 3: embargo the invader to slow their build-up. Skipped while
-    // we're trying to appease them (embargo sours the relation check in
-    // NationAllianceBehavior).
+    // we're trying to appease them, and skipped for neighbours who have
+    // never actually attacked us (embargo sours the relation check in
+    // NationAllianceBehavior — don't poke a bear we may yet befriend).
     if (
       tick - runtime.state.cooldowns.diplomacy >= 40 &&
-      !runtime.intel.appeaseAttempts.has(invader.smallID)
+      !runtime.intel.appeaseAttempts.has(invader.smallID) &&
+      grudgeScoreFor(invader.smallID) > 0
     ) {
       const sampleTile =
         gatherStructureTiles(invader.player)[0] ||
@@ -9375,6 +9377,10 @@
       30,
     );
     const reach = minDist * 2;
+    // v2.15: nations within a wider radius will be neighbours within a few
+    // minutes, and their early-game alliance acceptance is high (70% on
+    // Medium). Lock in the peace before the borders even touch.
+    const nationReach = minDist * 5;
 
     const mySpawn = safeCall(() => me.spawnTile(), null);
     const allPlayers = safeCall(() => gameView.playerViews(), []);
@@ -9412,7 +9418,8 @@
           dist = gameView.manhattanDist(mySpawn, sampled[0]);
         }
       }
-      if (!Number.isFinite(dist) || dist > reach) continue;
+      const typeReach = pType === PlayerType.Nation ? nationReach : reach;
+      if (!Number.isFinite(dist) || dist > typeReach) continue;
       candidates.push({ player: p, dist });
     }
 
@@ -9538,16 +9545,29 @@
     const topEnemy = enemies.sort(
       (a, b) => b.numTilesOwned() - a.numTilesOwned(),
     )[0];
-    // v2.15: never embargo a player we're actively trying to appease —
-    // embargoes sour relations, which is exactly what alliance acceptance
-    // (NationAllianceBehavior) checks.
+    // v2.15: embargoes permanently sour a nation's relation to us
+    // (NationExecution applies a relation malus to embargoing players),
+    // which kills every future appeasement/alliance chance. Only embargo
+    // players who have actually WRONGED us (grudge > 0) or the runaway
+    // crown — never a peaceful giant we may need to befriend.
     const topEnemySmallID = topEnemy
       ? safeCall(() => topEnemy.smallID(), null)
       : null;
     const appeasingTopEnemy =
       topEnemySmallID !== null &&
       runtime.intel.appeaseAttempts.has(topEnemySmallID);
-    if (topEnemy && !appeasingTopEnemy) {
+    const topEnemyEntry =
+      topEnemySmallID !== null
+        ? runtime.world.bySmallID.get(topEnemySmallID)
+        : null;
+    const topEnemyIsCrown =
+      topEnemyEntry &&
+      runtime.world.threats.crownSmallID === topEnemySmallID &&
+      (runtime.world.totals.crownShare || 0) >= 0.25;
+    const topEnemyWrongedUs =
+      topEnemySmallID !== null && grudgeScoreFor(topEnemySmallID) > 0;
+    const embargoJustified = Boolean(topEnemyIsCrown || topEnemyWrongedUs);
+    if (topEnemy && !appeasingTopEnemy && embargoJustified) {
       const targetTile =
         gatherStructureTiles(topEnemy)[0] ||
         sampleTilesForOwner(topEnemy.smallID(), 1, {
