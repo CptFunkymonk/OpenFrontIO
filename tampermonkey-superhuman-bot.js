@@ -582,6 +582,10 @@
       grudges: new Map(),
       seenAttackIDs: new Set(),
       appeaseAttempts: new Map(),
+      // allianceID -> tick we sent an extension request. Alliances expire
+      // after 5 minutes; without renewal our nation appeasements silently
+      // lapse mid-game and the ex-ally becomes an invader again.
+      extensionRequested: new Map(),
     },
     stealth: {
       lastIntentAtMs: 0,
@@ -8768,10 +8772,19 @@
    */
   const APPEASE_RETRY_TICKS = 600;
 
+  // Nations accept alliances readily while both sides are still comparable
+  // (NationAllianceBehavior.isEarlygame / isAlliancePartnerSimilarlyStrong),
+  // so the early-game window is when peace is cheap. 3600 active ticks
+  // covers the acceptance-friendly window on Easy–Hard.
+  const APPEASE_EARLY_WINDOW_TICKS = 3600;
+
   function pickAppeasementTarget(myEntry) {
     const world = runtime.world;
     if (!myEntry) return null;
     const threats = world.threats || {};
+    const gameView = getGameView();
+    const activeTicks = gameView ? getActiveMatchTicks(gameView) : Infinity;
+    const earlyWindow = activeTicks < APPEASE_EARLY_WINDOW_TICKS;
     const candidates = [];
     for (const entry of threats.adjacentEnemies || []) {
       if (!entry || entry.isFriendly || entry.isAlly) continue;
@@ -8784,13 +8797,113 @@
         entry.tags &&
         entry.tags.has("SNOWBALL_RISK") &&
         (entry.snowballRatioLater || 0) >= 2;
-      if (ratio >= 1.4 || snowball) {
+      // Early window: any adjacent Nation that's already ahead of us is a
+      // future snowballer on nation-dense maps — lock the peace NOW while
+      // their alliance AI still rates us "similarly strong". Later (or for
+      // Humans) require a real overmatch before we go hat-in-hand.
+      const earlyNationCase =
+        earlyWindow && entry.type === PlayerType.Nation && ratio >= 1.05;
+      if (ratio >= 1.4 || snowball || earlyNationCase) {
         candidates.push({ entry, ratio });
       }
     }
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => b.ratio - a.ratio);
     return candidates[0].entry;
+  }
+
+  /**
+   * v2.15: per-tick appeasement pass. Unlike the goal-gated diplomacy
+   * pipeline this runs every active tick (cheap no-op when no candidate),
+   * because the appeasement window is time-critical: nation alliance AIs
+   * accept while both sides are still "similarly strong" — wait for the
+   * planner to schedule a diplomacy tick and the window is gone.
+   * Per-target retry cadence bounds the intent volume.
+   */
+  function maybeAppeaseThreats(me) {
+    const myEntry = runtime.world.me;
+    if (!myEntry) return false;
+    const gameView = getGameView();
+    if (!gameView) return false;
+    const target = pickAppeasementTarget(myEntry);
+    if (!target) return false;
+    const tick = runtime.world.tick || 0;
+    const lastAttempt =
+      runtime.intel.appeaseAttempts.get(target.smallID) ?? -Infinity;
+    if (tick - lastAttempt < APPEASE_RETRY_TICKS) return false;
+    if (sendAllianceRequest(target.id)) {
+      runtime.intel.appeaseAttempts.set(target.smallID, tick);
+      reasonLog(
+        "DIPLOMACY_ISOLATE_CROWN",
+        `Appeasing ${target.name} — they're outgrowing us and we can't win that war.`,
+        `their troops ${fmtTroops(target.troops)} vs ours ${fmtTroops(myEntry.troops)}`,
+      );
+      decisionLog(
+        "appease: alliance request → " +
+          target.name +
+          " (ratio " +
+          ((target.troops || 0) / Math.max(1, myEntry.troops || 1)).toFixed(2) +
+          ")",
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * v2.15: alliance renewal. Alliances expire after 5 minutes
+   * (config.allianceDuration = 3000 ticks); the AllianceView on our player
+   * exposes expiresAt. When an alliance we still value enters its final
+   * minute, we send an allianceExtension intent — nations answer via
+   * NationAllianceBehavior.handleAllianceExtensionRequests, humans see a
+   * "wants to renew" message. Without this every appeasement quietly
+   * lapses mid-game and the ex-ally becomes an invader again.
+   */
+  const EXTENSION_WINDOW_TICKS = 600;
+
+  function maybeExtendAlliances(me) {
+    const myEntry = runtime.world.me;
+    if (!myEntry) return false;
+    const tick = runtime.world.tick || 0;
+    const alliances = myEntry.alliances || [];
+    for (const alliance of alliances) {
+      let allianceID = null;
+      let otherID = null;
+      let expiresAt = null;
+      try {
+        allianceID = alliance.id;
+        otherID = alliance.other;
+        expiresAt = alliance.expiresAt;
+      } catch (_) { /* swallow */ }
+      if (allianceID === null || otherID === null || expiresAt === null) {
+        continue;
+      }
+      if (expiresAt - tick > EXTENSION_WINDOW_TICKS) continue;
+      if (expiresAt <= tick) continue;
+      const requestedAt = runtime.intel.extensionRequested.get(allianceID);
+      if (requestedAt !== undefined) continue;
+      // Keep the ally unless they're confirmed dead weight (the betrayal
+      // pipeline owns that decision — we just don't renew).
+      const otherEntry = runtime.world.everyone.find((e) => e.id === otherID);
+      if (otherEntry && isAllyConfirmedHelpless(otherEntry, myEntry)) {
+        runtime.intel.extensionRequested.set(allianceID, tick);
+        decisionLog(
+          "alliance: letting alliance with " +
+            (otherEntry.name || otherID) +
+            " lapse (helpless)",
+        );
+        continue;
+      }
+      if (sendIntent({ type: "allianceExtension", recipient: otherID })) {
+        runtime.intel.extensionRequested.set(allianceID, tick);
+        decisionLog(
+          "alliance: requested extension with " +
+            ((otherEntry && otherEntry.name) || otherID),
+        );
+        return true;
+      }
+    }
+    return false;
   }
 
   function shouldAcceptIncomingAlliance(requestor, myEntry) {
@@ -8981,48 +9094,6 @@
           `their troops ~${fmtTroops(requestor.troops)}`,
         );
         return true;
-      }
-    }
-
-    // 2.5 (v2.15): appeasement. A much stronger (or fast-snowballing)
-    // adjacent neighbour we cannot beat in a land war is far cheaper as an
-    // ally than as an eventual invader. Nations accept alliances readily
-    // while we're still comparable in strength (early game especially), so
-    // we ask BEFORE the gap becomes fatal, and retry on a slow cadence.
-    const appeaseTarget = pickAppeasementTarget(myEntry);
-    if (appeaseTarget) {
-      const lastAttempt =
-        runtime.intel.appeaseAttempts.get(appeaseTarget.smallID) ?? -Infinity;
-      if (tick - lastAttempt >= APPEASE_RETRY_TICKS) {
-        const tile =
-          gatherStructureTiles(appeaseTarget.player)[0] ||
-          sampleTilesForOwner(appeaseTarget.smallID, 1, {
-            requireLand: true,
-            maxSamples: 120,
-          })[0];
-        if (tile !== undefined) {
-          const actions = await queryPlayerActions(tile, null);
-          if (
-            actions &&
-            actions.interaction &&
-            actions.interaction.canSendAllianceRequest
-          ) {
-            if (sendAllianceRequest(appeaseTarget.id)) {
-              runtime.intel.appeaseAttempts.set(appeaseTarget.smallID, tick);
-              runtime.state.cooldowns.diplomacy = tick;
-              reasonLog(
-                "DIPLOMACY_ISOLATE_CROWN",
-                `Appeasing ${appeaseTarget.name} — they're outgrowing us and we can't win that war.`,
-                `their troops ${fmtTroops(appeaseTarget.troops)} vs ours ${fmtTroops(myEntry.troops)}`,
-              );
-              return true;
-            }
-          } else {
-            // A request is already pending (or blocked); don't re-query
-            // every tick.
-            runtime.intel.appeaseAttempts.set(appeaseTarget.smallID, tick);
-          }
-        }
       }
     }
 
@@ -13071,6 +13142,14 @@
     // after the first successful send.
     safeCall(() => openingDiplomacyBlast(me), null);
 
+    // v2.15: appeasement pass — ally the neighbours we can't beat while
+    // their alliance AI still rates us as comparable. Runs every tick
+    // (bounded by a per-target retry cadence).
+    safeCall(() => maybeAppeaseThreats(me), null);
+
+    // v2.15: renew expiring alliances we still value (5-minute duration).
+    safeCall(() => maybeExtendAlliances(me), null);
+
     // Plan §2.10: team-mode donation. No-op outside team games.
     safeCall(() => maybeDonateToStrugglingTeammate(me), null);
 
@@ -13389,6 +13468,7 @@
       runtime.intel.grudges.clear();
       runtime.intel.seenAttackIDs.clear();
       runtime.intel.appeaseAttempts.clear();
+      runtime.intel.extensionRequested.clear();
       runtime.reasons = [];
       runtime.stealth.perPlayerActions.clear();
       runtime.stealth.combos.clear();
@@ -16240,6 +16320,8 @@
         updateOpponentIntel,
         grudgeScoreFor,
         pickAppeasementTarget,
+        maybeAppeaseThreats,
+        maybeExtendAlliances,
         nextSpawnProbeCoord,
         refineSpawnCandidate,
         // Plan §2.4 acceptance helpers.
