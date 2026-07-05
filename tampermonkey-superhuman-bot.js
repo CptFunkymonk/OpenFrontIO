@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenFront.io Superhuman Bot
 // @namespace    http://tampermonkey.net/
-// @version      2.14.0
-// @description  Standalone strategic OpenFront bot: world model, threat scoring, goal planner, invasion defense (incl. overwhelm stall), compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
+// @version      2.15.0
+// @description  Standalone strategic OpenFront bot: world model, threat scoring, whole-game plan (phases + persistent campaigns), opponent intel (grudges, snowball detection, appeasement), adaptive spawn scoring, goal planner, invasion defense, compact RL decision logger, emoji communication, manual Z-key broadcast hotkey
 // @author       Cursor
 // @match        https://openfront.io/*
 // @match        http://localhost:*/*
@@ -85,7 +85,7 @@
 (function () {
   "use strict";
 
-  const BOT_VERSION = "2.14.0";
+  const BOT_VERSION = "2.15.0";
   const TROOP_DISPLAY_DIVISOR = 10;
   const MAX_LOG_ENTRIES = 250;
   const MAX_DECISION_ENTRIES = 180;
@@ -542,6 +542,46 @@
       forcedGoalExpiresMs: 0,
       /** @type {Array<{id: string, priority: number, valid: boolean, note?: string}>} */
       lastEvaluation: [],
+    },
+    /**
+     * Whole-game plan (v2.15). Maintained by updateGamePlan() every active
+     * tick. `phase` is the long-horizon posture the bot is executing:
+     *   OPENING       — first ~90s: secure the spawn area, grab terra nullius.
+     *   EXPANSION     — unclaimed land still available: race for it.
+     *   CONSOLIDATION — army depleted / just survived a fight: rebuild.
+     *   ASCENSION     — map is carved up: climb ranks via campaigns.
+     *   ENDGAME       — we are the dominant #1: close out the 80% win.
+     *   SURVIVAL      — under serious invasion: everything else waits.
+     * `campaign` is a persistent conquest target (finish-what-you-start):
+     * the planner keeps pressure on one enemy instead of flapping between
+     * whichever neighbour scored highest each tick.
+     */
+    plan: {
+      phase: "OPENING",
+      phaseSince: -1,
+      /** @type {Array<{tick: number, prev: string, next: string, reason: string}>} */
+      phaseHistory: [],
+      campaign: null, // { smallID, name, sinceTick, reason, lastProgressTick, lastTargetTiles }
+      campaignScoredAt: -999,
+      rank: 0,
+      sharePerMin: 0,
+      timerTicksLeft: null,
+      containLeader: false,
+    },
+    /**
+     * Opponent intel (v2.15). Behavioural memory that persists across the
+     * match so the bot adapts to what other players actually DO:
+     *   grudges         — smallID -> { attacks, troops, lastTick }: every
+     *                     distinct attack launched at us is remembered and
+     *                     biases targeting/diplomacy against repeat offenders.
+     *   seenAttackIDs   — attack ids already counted (dedupe).
+     *   appeaseAttempts — smallID -> tick of our last appeasement alliance
+     *                     request, so we retry on a slow cadence.
+     */
+    intel: {
+      grudges: new Map(),
+      seenAttackIDs: new Set(),
+      appeaseAttempts: new Map(),
     },
     stealth: {
       lastIntentAtMs: 0,
@@ -2259,6 +2299,8 @@
     SAVE_FOR_HYDRO: 29,         // ⏳
     FARM_TRIBE: 58,             // 🐔
     EASY_NATION_GRAB: 41,       // 🎯
+    CAMPAIGN_CONQUEST: 41,      // 🎯
+    STEAMROLL_CROWN: 31,        // 💥
     TERRAIN_RUSH: 31,           // 💥
     NEUTRALIZE_RISING_STAR: 41, // 🎯
     NAVAL_LAND_GRAB: 52,        // ⛵
@@ -3864,6 +3906,15 @@
     let nearestHuman = Infinity;
     let nearestNation = Infinity;
     let nearestTribe = Infinity;
+    // v2.15 crowding counters: nearest-distance terms miss the difference
+    // between "one neighbour at 100 tiles" and "four neighbours at 100
+    // tiles". Each additional human/nation inside the expansion radius is
+    // a future war front, so we count them and penalise the pile-up. This
+    // is re-evaluated at lock time against everyone's actual spawn picks,
+    // which is how the spawn adapts to what other players did during the
+    // spawn phase.
+    let humanCrowd = 0;
+    let nationCrowd = 0;
 
     for (const opp of globals.opponents) {
       const anchor = opp.anchor;
@@ -3873,8 +3924,10 @@
       if (type === PlayerType.Human) {
         nearestHuman = Math.min(nearestHuman, dist);
         humans.push({ tile: anchor, dist });
+        if (dist < 150) humanCrowd += 1;
       } else if (type === PlayerType.Nation) {
         nearestNation = Math.min(nearestNation, dist);
+        if (dist < 150) nationCrowd += 1;
       } else if (type === PlayerType.Bot) {
         nearestTribe = Math.min(nearestTribe, dist);
         tribes.push({ tile: anchor, dist });
@@ -3903,10 +3956,21 @@
 
     tribeOpportunity = Math.min(420, tribeOpportunity);
     tribeCompetition = Math.max(-360, tribeCompetition);
+    // First neighbour of each type is already priced by the isolation /
+    // proximity terms; each EXTRA one inside the expansion radius is an
+    // additional future front. Humans cost more than nations (diplomacy,
+    // nukes, coordinated pushes). Capped so crowding can't fully invert a
+    // strong terrain read.
+    const extraFronts =
+      Math.max(0, humanCrowd - 1) * 150 + Math.max(0, nationCrowd - 1) * 70;
+    const crowding = extraFronts > 0 ? -Math.min(520, extraFronts) : 0;
     return {
       nearestHuman,
       nearestNation,
       nearestTribe,
+      humanCrowd,
+      nationCrowd,
+      crowding,
       humanIsolation: humanIsolationScore(nearestHuman),
       humanProx: Number.isFinite(nearestHuman) && nearestHuman < 70
         ? -(70 - nearestHuman) * 7
@@ -4050,12 +4114,44 @@
     // passes, so we run it first to power the gate. Heavier passes
     // (radius-42 + 700-tile BFS) are deferred until *after* the gate so
     // rejected candidates pay only for the cheap pass.
+    //
+    // v2.15 adaptive gate: on plains-poor maps (mountainous or highland-
+    // heavy worlds) the strict gate rejects essentially every legal tile
+    // and the candidate pool stays empty — the bot then falls back to a
+    // nearly random spawn. We track the gate's rejection rate; once it
+    // has clearly rejected almost everything, we relax the thresholds so
+    // "best available terrain" still builds a ranked pool.
     const nearTerrain = weightedTerrainCountsNear(gameView, center, 18);
-    if (
+    const gate =
+      runtime.state.spawn.gate ||
+      (runtime.state.spawn.gate = { checks: 0, rejects: 0, relaxed: false });
+    gate.checks += 1;
+    const strictReject =
       patchPlainsRatio < 0.6 &&
-      (patchPlainsRatio < 0.5 || nearTerrain.plainsRatio < 0.75)
-    ) {
-      return null;
+      (patchPlainsRatio < 0.5 || nearTerrain.plainsRatio < 0.75);
+    if (strictReject) {
+      gate.rejects += 1;
+      if (
+        !gate.relaxed &&
+        gate.checks >= 300 &&
+        gate.rejects / gate.checks > 0.97
+      ) {
+        gate.relaxed = true;
+        decisionLog(
+          "spawn gate: plains-poor map (" +
+            gate.rejects +
+            "/" +
+            gate.checks +
+            " rejected) — relaxing terrain gate",
+        );
+      }
+      if (!gate.relaxed) return null;
+      // Relaxed gate: accept best-available terrain (highland expands at
+      // 0.45× plains, still workable) but keep rejecting mountain-dominated
+      // patches — mountains (0.12×) choke expansion completely.
+      if (mountain / totalTerrain > 0.5) {
+        return null;
+      }
     }
 
     // Now that the candidate has passed the gate, run the heavier
@@ -4122,6 +4218,7 @@
       tribeOpportunity: proximity.tribeOpportunity,
       tribeCompetition: proximity.tribeCompetition,
       nationProx: proximity.nationProx,
+      crowding: proximity.crowding,
       owned: -ownedPenalty,
       ocean: -oceanPenalty,
       fallout: -falloutNearby * 300,
@@ -4142,6 +4239,7 @@
       subScores.tribeOpportunity +
       subScores.tribeCompetition +
       subScores.nationProx +
+      subScores.crowding +
       subScores.owned +
       subScores.ocean +
       subScores.fallout;
@@ -4151,9 +4249,50 @@
     return strategic;
   }
 
+  /**
+   * v2.15: stratified spawn probing. Pure random sampling covers big maps
+   * (e.g. 4108×1948 world maps) very unevenly — with a 1500-candidate pool
+   * whole continents can go unprobed. We sweep a shuffled coarse grid so
+   * every region of the map gets at least one probe, and jitter within the
+   * cell so repeated sweeps don't re-test the same tile.
+   */
+  function nextSpawnProbeCoord(gameView) {
+    const spawnState = runtime.state.spawn;
+    if (!spawnState.grid) {
+      const cells = 24;
+      const order = [];
+      for (let i = 0; i < cells * cells; i++) order.push(i);
+      spawnState.grid = { cells, order: shuffleArray(order), index: 0 };
+    }
+    const grid = spawnState.grid;
+    // Alternate stratified/uniform so dense good regions still get extra
+    // samples once the sweep has covered the map at least once.
+    grid.index += 1;
+    if (grid.index % 2 === 0 && grid.index > grid.order.length) {
+      return {
+        x: randomInt(0, gameView.width() - 1),
+        y: randomInt(0, gameView.height() - 1),
+      };
+    }
+    const cellIdx = grid.order[grid.index % grid.order.length];
+    const cellW = gameView.width() / grid.cells;
+    const cellH = gameView.height() / grid.cells;
+    const cx = cellIdx % grid.cells;
+    const cy = Math.floor(cellIdx / grid.cells);
+    return {
+      x: Math.min(
+        gameView.width() - 1,
+        Math.floor(cx * cellW + Math.random() * cellW),
+      ),
+      y: Math.min(
+        gameView.height() - 1,
+        Math.floor(cy * cellH + Math.random() * cellH),
+      ),
+    };
+  }
+
   function trySampleSpawnCandidate(gameView) {
-    const x = randomInt(0, gameView.width() - 1);
-    const y = randomInt(0, gameView.height() - 1);
+    const { x, y } = nextSpawnProbeCoord(gameView);
     if (!gameView.isValidCoord(x, y)) return null;
     const center = gameView.ref(x, y);
     const score = computeSpawnCenterScore(gameView, center);
@@ -4204,16 +4343,53 @@
     return sorted;
   }
 
+  /**
+   * v2.15: local refinement around a promising center. Random/stratified
+   * probing lands NEAR local optima but rarely ON them; nudging the pick a
+   * dozen tiles often finds a strictly better patch (more plains, fewer
+   * neighbours). Bounded: 8 probes per candidate.
+   */
+  const SPAWN_REFINE_OFFSETS = [
+    [10, 0], [-10, 0], [0, 10], [0, -10],
+    [18, 18], [-18, 18], [18, -18], [-18, -18],
+  ];
+
+  function refineSpawnCandidate(gameView, cand) {
+    let best = cand;
+    const cx = gameView.x(cand.center);
+    const cy = gameView.y(cand.center);
+    for (const [dx, dy] of SPAWN_REFINE_OFFSETS) {
+      const x = cx + dx;
+      const y = cy + dy;
+      if (!gameView.isValidCoord(x, y)) continue;
+      const center = gameView.ref(x, y);
+      const score = computeSpawnCenterScore(gameView, center);
+      if (score === null || score <= best.score) continue;
+      const subScores = runtime.state.spawn.lastSubScores
+        ? Object.assign({}, runtime.state.spawn.lastSubScores)
+        : null;
+      best = { center, score, subScores };
+    }
+    return best;
+  }
+
   function chooseBestRandomSpawnCandidate(gameView) {
     const sorted = refreshSpawnCandidateList();
     let best = null;
-    for (const cand of sorted.slice(0, 72)) {
+    const top = sorted.slice(0, 72);
+    for (let i = 0; i < top.length; i++) {
+      const cand = top[i];
       const fresh = computeSpawnCenterScore(gameView, cand.center);
       if (fresh === null) continue;
       const subScores = runtime.state.spawn.lastSubScores
         ? Object.assign({}, runtime.state.spawn.lastSubScores)
         : cand.subScores || null;
-      const refreshed = { center: cand.center, score: fresh, subScores };
+      let refreshed = { center: cand.center, score: fresh, subScores };
+      // Hill-climb only the strongest handful — the tail exists to
+      // survive re-validation, not to win.
+      if (i < 10) {
+        refreshed = refineSpawnCandidate(gameView, refreshed);
+      }
       rememberSpawnCandidate(refreshed);
       if (!best || refreshed.score > best.score) {
         best = refreshed;
@@ -7309,6 +7485,128 @@
   }
 
   /**
+   * CAMPAIGN_CONQUEST tactical (v2.15): sustained pressure on the plan's
+   * persistent campaign target. Adjacent → land attack; separated by a
+   * narrow strait → short hop via the river-crossing pipeline; overseas →
+   * safety-gated naval invasion. Falls back false so the dispatch chain
+   * (maybeCombat → river → expand) still acts this tick.
+   */
+  async function runGoal_CampaignConquest(me, borderTiles, context) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    const tick = gameView.ticks();
+    if (tick - runtime.state.cooldowns.combat < 8) return false;
+    const plan = runtime.plan;
+    if (!plan || !plan.campaign) return false;
+    const target =
+      (context && context.target) ||
+      runtime.world.bySmallID.get(plan.campaign.smallID);
+    if (!target || (target.tiles || 0) <= 0 || target.isFriendly) return false;
+    // Containment campaigns (runaway crown) may proceed under an
+    // overwhelming neighbour ONLY when the crown IS that neighbour;
+    // otherwise survival math wins as usual.
+    if (shouldStallForInvasionDefense()) {
+      const overwhelming = runtime.world.threats.overwhelmingNeighbor;
+      const overwhelmingIsTarget =
+        overwhelming &&
+        overwhelming.enemy &&
+        overwhelming.enemy.smallID === target.smallID;
+      if (!overwhelmingIsTarget) {
+        decisionLog("campaign: stalling under overwhelming bordering neighbour");
+        return false;
+      }
+    }
+
+    const maxTroops = gameView.config().maxTroops(me);
+    const reserveRatio = cappedReserveRatio(
+      me,
+      maxTroops,
+      computeReserveRatio(me, maxTroops) - 0.05,
+      0.08,
+    );
+
+    if (target.isAdjacent) {
+      let troops;
+      if (target.type === PlayerType.Bot) {
+        const budget = Math.floor(me.troops() - maxTroops * reserveRatio);
+        troops = calcTribeAttackTroops(target.troops, budget);
+      } else {
+        troops = calculateAttackTroops(me, target.player, reserveRatio, maxTroops);
+      }
+      if (troops <= 0) return false;
+      if (sendAttack(target.id, troops)) {
+        runtime.state.cooldowns.combat = tick;
+        runtime.state.lastAction = "campaign push into " + target.name;
+        runtime.state.strategy = "land-combat";
+        reasonLog(
+          "CAMPAIGN_CONQUEST",
+          `Sustained campaign against ${target.name} — ${plan.campaign.reason || "finish the conquest"}.`,
+          `${fmtTroops(troops)} committed`,
+        );
+        return true;
+      }
+      return false;
+    }
+
+    // Narrow strait: reuse the light river-crossing pipeline (it already
+    // prefers the nearest narrow-water hostile, which the campaign scorer
+    // required for a non-adjacent target without ports).
+    if (
+      target.narrowWaterHops !== undefined &&
+      target.narrowWaterHops !== null
+    ) {
+      return await maybeRiverCrossing(me, borderTiles);
+    }
+
+    // Overseas: full safety-gated naval invasion.
+    if (isTooEarlyForNaval(gameView, me)) return false;
+    const landingTile =
+      gatherStructureTiles(target.player)[0] ||
+      sampleTilesForOwner(target.smallID, 1, {
+        requireLand: true,
+        maxSamples: 120,
+      })[0];
+    if (landingTile === undefined) return false;
+    const spawn = await queryTransportShipSpawn(landingTile);
+    if (spawn === false) return false;
+    if (!isBoatWithinRange(gameView, me, spawn, landingTile)) return false;
+    const safety = isNavalInvasionSafe(gameView, me, spawn, landingTile, {
+      targetSmallID: target.smallID,
+    });
+    if (!safety.safe) {
+      decisionLog("campaign boat skip " + target.name + ": " + safety.reason);
+      return false;
+    }
+    const required = calculateAttackTroops(
+      me,
+      target.player,
+      reserveRatio,
+      maxTroops,
+    );
+    if (required <= 0) return false;
+    const payload = Math.min(required, Math.floor(me.troops() * 0.35));
+    if (payload < required) {
+      decisionLog(
+        "campaign boat skip " + target.name +
+          ": payload " + payload + " < required " + required,
+      );
+      return false;
+    }
+    if (sendBoat(landingTile, payload, { targetSmallID: target.smallID })) {
+      runtime.state.cooldowns.combat = tick;
+      runtime.state.cooldowns.naval = tick;
+      runtime.state.strategy = "naval";
+      reasonLog(
+        "CAMPAIGN_CONQUEST",
+        `Naval campaign strike on ${target.name}.`,
+        `${fmtTroops(payload)} shipped`,
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * FARM_TRIBE tactical: pick the nearest adjacent tribe (PlayerType.Bot) and
    * hit it with the 4× formula. Bots delete their own structures, so we want
    * to grab the cluster before they delete the buildings.
@@ -7837,8 +8135,13 @@
       }
     }
 
-    // Step 3: embargo the invader to slow their build-up.
-    if (tick - runtime.state.cooldowns.diplomacy >= 40) {
+    // Step 3: embargo the invader to slow their build-up. Skipped while
+    // we're trying to appease them (embargo sours the relation check in
+    // NationAllianceBehavior).
+    if (
+      tick - runtime.state.cooldowns.diplomacy >= 40 &&
+      !runtime.intel.appeaseAttempts.has(invader.smallID)
+    ) {
       const sampleTile =
         gatherStructureTiles(invader.player)[0] ||
         sampleTilesForOwner(invader.smallID, 1, {
@@ -8456,6 +8759,40 @@
    * auto-accepts when both sides have outstanding requests (see
    * `AllianceRequestExecution.init`).
    */
+  /**
+   * v2.15: pick the adjacent neighbour most worth appeasing. Criteria:
+   * hostile non-Bot neighbour who is either already much stronger (≥1.4×
+   * troops) or projected to badly outgrow us (SNOWBALL_RISK ≥2× in the
+   * horizon window), NOT actively invading us, and NOT a repeat aggressor
+   * (grudge ≥ 25 — we don't reward players who keep attacking us).
+   */
+  const APPEASE_RETRY_TICKS = 600;
+
+  function pickAppeasementTarget(myEntry) {
+    const world = runtime.world;
+    if (!myEntry) return null;
+    const threats = world.threats || {};
+    const candidates = [];
+    for (const entry of threats.adjacentEnemies || []) {
+      if (!entry || entry.isFriendly || entry.isAlly) continue;
+      if (entry.type === PlayerType.Bot) continue;
+      if (entry.tags && entry.tags.has("INVADING_US")) continue;
+      if (grudgeScoreFor(entry.smallID) >= 25) continue;
+      const ratio =
+        (Number(entry.troops) || 0) / Math.max(1, Number(myEntry.troops) || 0);
+      const snowball =
+        entry.tags &&
+        entry.tags.has("SNOWBALL_RISK") &&
+        (entry.snowballRatioLater || 0) >= 2;
+      if (ratio >= 1.4 || snowball) {
+        candidates.push({ entry, ratio });
+      }
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.ratio - a.ratio);
+    return candidates[0].entry;
+  }
+
   function shouldAcceptIncomingAlliance(requestor, myEntry) {
     if (!requestor || !myEntry) return false;
     if (requestor.isAlly) return false;
@@ -8464,6 +8801,11 @@
     const world = runtime.world;
     const crown = world.threats.crown;
     if (crown && !crown.isFriendly && requestor.smallID === crown.smallID) {
+      return false;
+    }
+    // v2.15: refuse repeat aggressors — a player who kept attacking us is
+    // farming an alliance to freeze the front while they snowball.
+    if (grudgeScoreFor(requestor.smallID) >= 25) {
       return false;
     }
     // Refuse anyone currently attacking us — they are exploiting alliance
@@ -8639,6 +8981,48 @@
           `their troops ~${fmtTroops(requestor.troops)}`,
         );
         return true;
+      }
+    }
+
+    // 2.5 (v2.15): appeasement. A much stronger (or fast-snowballing)
+    // adjacent neighbour we cannot beat in a land war is far cheaper as an
+    // ally than as an eventual invader. Nations accept alliances readily
+    // while we're still comparable in strength (early game especially), so
+    // we ask BEFORE the gap becomes fatal, and retry on a slow cadence.
+    const appeaseTarget = pickAppeasementTarget(myEntry);
+    if (appeaseTarget) {
+      const lastAttempt =
+        runtime.intel.appeaseAttempts.get(appeaseTarget.smallID) ?? -Infinity;
+      if (tick - lastAttempt >= APPEASE_RETRY_TICKS) {
+        const tile =
+          gatherStructureTiles(appeaseTarget.player)[0] ||
+          sampleTilesForOwner(appeaseTarget.smallID, 1, {
+            requireLand: true,
+            maxSamples: 120,
+          })[0];
+        if (tile !== undefined) {
+          const actions = await queryPlayerActions(tile, null);
+          if (
+            actions &&
+            actions.interaction &&
+            actions.interaction.canSendAllianceRequest
+          ) {
+            if (sendAllianceRequest(appeaseTarget.id)) {
+              runtime.intel.appeaseAttempts.set(appeaseTarget.smallID, tick);
+              runtime.state.cooldowns.diplomacy = tick;
+              reasonLog(
+                "DIPLOMACY_ISOLATE_CROWN",
+                `Appeasing ${appeaseTarget.name} — they're outgrowing us and we can't win that war.`,
+                `their troops ${fmtTroops(appeaseTarget.troops)} vs ours ${fmtTroops(myEntry.troops)}`,
+              );
+              return true;
+            }
+          } else {
+            // A request is already pending (or blocked); don't re-query
+            // every tick.
+            runtime.intel.appeaseAttempts.set(appeaseTarget.smallID, tick);
+          }
+        }
       }
     }
 
@@ -8890,13 +9274,20 @@
     const mySpawn = safeCall(() => me.spawnTile(), null);
     const allPlayers = safeCall(() => gameView.playerViews(), []);
 
-    // Collect candidates: alive Humans, not us, not already allied.
+    // Collect candidates: alive Humans AND Nations, not us, not already
+    // allied. v2.15: Nations DO evaluate inbound alliance requests
+    // (NationAllianceBehavior.handleAllianceRequests) and their early-game
+    // acceptance rate is high (70% on Medium in the first 3 minutes, 50%
+    // on Hard). A nearby nation that allies us early is one fewer
+    // snowballing neighbour that can crush us mid-game — the single
+    // biggest cause of harness losses on nation-dense maps.
     const candidates = [];
     for (const p of allPlayers) {
       if (!p) continue;
       if (!safeCall(() => p.isAlive(), false)) continue;
       if (p === me || safeCall(() => p.smallID(), -1) === runtime.world.meSmallID) continue;
-      if (safeCall(() => p.type(), null) !== PlayerType.Human) continue;
+      const pType = safeCall(() => p.type(), null);
+      if (pType !== PlayerType.Human && pType !== PlayerType.Nation) continue;
       if (safeCall(() => me.isFriendly(p), false)) continue;
       if (safeCall(() => me.isAlliedWith(p), false)) continue;
 
@@ -8947,11 +9338,12 @@
     // Cap to ALLIANCE_CAP + 1 = 3 requests per blast. Rationale:
     //   - ALLIANCE_CAP (2) is the effective mid-game alliance target
     //     we plan for; accepting more just forces break/churn.
-    //   - Adding +1 covers the common case where one of the nearest
-    //     humans ignores the request, so a backup still exists.
-    //   - 3 is low enough to stay under the anti-spam heuristics of
-    //     tightly-gated servers.
-    const blastCap = ALLIANCE_CAP + 1;
+    //   - v2.15: +2 headroom now that Nations are eligible — nation
+    //     alliances are pure safety (they never call in help against us)
+    //     and don't count against the human-partner plan.
+    //   - 4 is still low enough to stay under the anti-spam heuristics
+    //     of tightly-gated servers.
+    const blastCap = ALLIANCE_CAP + 2;
     for (const c of candidates.slice(0, blastCap)) {
       const smallID = safeCall(() => c.player.smallID(), -1);
       if (smallID < 0) continue;
@@ -8966,7 +9358,7 @@
     if (dispatched > 0) {
       reasonLog(
         "OPENING_DIPLOMACY",
-        "Firing opening-round alliance requests to nearby Humans.",
+        "Firing opening-round alliance requests to nearby Humans and Nations.",
         `${dispatched} request(s) within ${reach} tiles`,
       );
       // Plan §2.2: broadcast 🤝 so we look like a chatty human making
@@ -9041,7 +9433,16 @@
     const topEnemy = enemies.sort(
       (a, b) => b.numTilesOwned() - a.numTilesOwned(),
     )[0];
-    if (topEnemy) {
+    // v2.15: never embargo a player we're actively trying to appease —
+    // embargoes sour relations, which is exactly what alliance acceptance
+    // (NationAllianceBehavior) checks.
+    const topEnemySmallID = topEnemy
+      ? safeCall(() => topEnemy.smallID(), null)
+      : null;
+    const appeasingTopEnemy =
+      topEnemySmallID !== null &&
+      runtime.intel.appeaseAttempts.has(topEnemySmallID);
+    if (topEnemy && !appeasingTopEnemy) {
       const targetTile =
         gatherStructureTiles(topEnemy)[0] ||
         sampleTilesForOwner(topEnemy.smallID(), 1, {
@@ -9957,6 +10358,16 @@
       if (tags.has("SOFT_TARGET")) threatScore -= 30;
       if (entry.isDisconnected) threatScore -= 25;
       if (tags.has("CLANMATE")) threatScore -= 200; // Never target clanmates.
+      // v2.15: repeat aggressors get a persistent threat bump — players
+      // who attacked us before are far more likely to attack us again,
+      // and deserve first pick when we counter-attack.
+      if (!entry.isFriendly) {
+        const grudge = grudgeScoreFor(entry.smallID);
+        if (grudge > 0) {
+          threatScore += grudge * 0.5;
+          if (grudge >= 25) tags.add("ARCHENEMY");
+        }
+      }
 
       entry.strength = strength;
       entry.threatScore = threatScore;
@@ -10159,6 +10570,21 @@
         brewingInvaders.push(earlyEnemy);
       }
     }
+    // v2.15: snowball trajectory detection. A neighbour whose army growth
+    // will badly overtake ours within ~2 minutes is a future invader even
+    // if they look peaceful right now. Detect them while we still have
+    // options (fortify, appease, or strike at parity) instead of waiting
+    // for the 1.15×-stronger "brewing" signal that often fires too late.
+    const snowballRisks = computeSnowballRisks(meEntry, adjacentEnemies);
+    for (const risk of snowballRisks.slice(0, 2)) {
+      if (
+        (risk.snowballRatioNow || 0) >= 1.1 &&
+        !activeInvaders.some((e) => e.smallID === risk.smallID) &&
+        !brewingInvaders.some((e) => e.smallID === risk.smallID)
+      ) {
+        brewingInvaders.push(risk);
+      }
+    }
     // Invasion lists: active first (most urgent), biggest pressure at the
     // top. Brewing list is ranked by strength so we preempt the scariest
     // build-up if we can afford to. Run this after the early-overmatch
@@ -10182,11 +10608,128 @@
       narrowWaterNeighbors,
       activeInvaders: activeInvaders.slice(0, 5),
       brewingInvaders: brewingInvaders.slice(0, 5),
+      snowballRisks: snowballRisks.slice(0, 5),
       invasionTroopsInbound,
       inboundTroopTotal,
       overwhelmingNeighbor,
       earlyHumanOvermatch,
     };
+  }
+
+  /**
+   * v2.15: detect adjacent non-Bot neighbours whose army trajectory will
+   * clearly overtake ours within a short horizon. Compares current troops
+   * plus HORIZON minutes of each side's measured troops-per-minute. A
+   * neighbour at rough parity today that projects to 1.6× us in two
+   * minutes is a snowball risk: we must fortify, appease, or strike NOW,
+   * because waiting only widens the gap.
+   */
+  const SNOWBALL_HORIZON_MINUTES = 2;
+  const SNOWBALL_PROJECTED_RATIO = 1.6;
+
+  function computeSnowballRisks(meEntry, adjacentEnemies) {
+    if (!meEntry || !Array.isArray(adjacentEnemies)) return [];
+    const out = [];
+    const myTroops = Math.max(1, Number(meEntry.troops) || 0);
+    const myGain = Number(meEntry.troopsPerMin) || 0;
+    for (const entry of adjacentEnemies) {
+      if (!entry || entry.isFriendly || entry.isDisconnected) continue;
+      if (entry.type === PlayerType.Bot) continue;
+      const theirTroops = Number(entry.troops) || 0;
+      const theirGain = Number(entry.troopsPerMin) || 0;
+      if (theirGain <= myGain) continue;
+      const ratioNow = theirTroops / myTroops;
+      const mineLater = Math.max(
+        1,
+        myTroops + myGain * SNOWBALL_HORIZON_MINUTES,
+      );
+      const theirsLater = Math.max(
+        0,
+        theirTroops + theirGain * SNOWBALL_HORIZON_MINUTES,
+      );
+      const ratioLater = theirsLater / mineLater;
+      if (ratioNow >= 0.8 && ratioLater >= SNOWBALL_PROJECTED_RATIO) {
+        if (entry.tags) entry.tags.add("SNOWBALL_RISK");
+        entry.snowballRatioNow = ratioNow;
+        entry.snowballRatioLater = ratioLater;
+        out.push(entry);
+      }
+    }
+    out.sort(
+      (a, b) => (b.snowballRatioLater || 0) - (a.snowballRatioLater || 0),
+    );
+    return out;
+  }
+
+  // ---------- Phase 2.5: opponent intel (grudges) ----------
+
+  /**
+   * v2.15: behavioural memory. Every DISTINCT attack launched at us is
+   * recorded against the attacker so downstream systems adapt to what
+   * opponents actually do:
+   *   - computeThreats gives repeat aggressors a persistent threat bump
+   *     (ARCHENEMY tag at grudge ≥ 25).
+   *   - campaign targeting prefers players who attacked us.
+   *   - shouldAcceptIncomingAlliance refuses recent aggressors.
+   * Grudges decay with time (half-life ~10 minutes) so one early border
+   * skirmish doesn't poison diplomacy forever.
+   */
+  function updateOpponentIntel(me) {
+    const meEntry = runtime.world.me;
+    if (!meEntry) return;
+    const intel = runtime.intel;
+    const tick = runtime.world.tick || 0;
+    for (const attack of meEntry.incomingAttacks || []) {
+      let attackID = null;
+      let attackerID = null;
+      let troops = 0;
+      try {
+        attackID = typeof attack.id === "function" ? attack.id() : attack.id;
+        attackerID = attack.attackerID;
+        troops =
+          typeof attack.troops === "function"
+            ? attack.troops()
+            : Number(attack.troops) || 0;
+      } catch (_) { /* swallow */ }
+      if (!attackID || attackerID === null || attackerID === undefined) {
+        continue;
+      }
+      if (intel.seenAttackIDs.has(attackID)) continue;
+      intel.seenAttackIDs.add(attackID);
+      const grudge = intel.grudges.get(attackerID) || {
+        attacks: 0,
+        troops: 0,
+        lastTick: -999,
+      };
+      grudge.attacks += 1;
+      grudge.troops += troops;
+      grudge.lastTick = tick;
+      intel.grudges.set(attackerID, grudge);
+    }
+    // Bound the dedupe set: old attack ids never repeat, so we can safely
+    // drop the oldest entries once the set grows past a few hundred.
+    if (intel.seenAttackIDs.size > 600) {
+      const keep = Array.from(intel.seenAttackIDs).slice(-300);
+      intel.seenAttackIDs = new Set(keep);
+    }
+  }
+
+  /**
+   * Aggregate grudge score for a player. 0 = never attacked us. Scales
+   * with number of distinct attacks and total troops thrown at us
+   * (relative to our pop cap), decayed by recency.
+   */
+  function grudgeScoreFor(smallID) {
+    const grudge = runtime.intel && runtime.intel.grudges.get(smallID);
+    if (!grudge) return 0;
+    const world = runtime.world;
+    const meMax = world.me ? Math.max(1, world.me.maxTroops || 1) : 1;
+    const age = Math.max(0, (world.tick || 0) - grudge.lastTick);
+    const recency = Math.exp(-age / 6000); // ~10 min half-ish life
+    const base =
+      Math.min(40, grudge.attacks * 8) +
+      Math.min(30, (grudge.troops / meMax) * 40);
+    return Math.min(60, base) * recency;
   }
 
   // ---------- Phase 5: map archetype ----------
@@ -10361,6 +10904,434 @@
     );
   }
 
+  // ---------- Phase 3.4: whole-game plan ----------
+
+  /**
+   * v2.15 whole-game planning layer.
+   *
+   * The goal planner underneath is reactive: it picks whichever goal scores
+   * highest THIS tick. That wins battles but loses games — the bot would
+   * peak at rank 2 and then sit in IDLE for thousands of ticks because no
+   * reactive trigger fired. This layer maintains a persistent, long-horizon
+   * view of the match:
+   *
+   *   1. PHASE — where we are in the game arc (opening → expansion →
+   *      ascension → endgame, with survival/consolidation interrupts).
+   *      Feeds `planBias()` which nudges goal priorities so the reactive
+   *      planner executes the long-term plan.
+   *   2. CAMPAIGN — one persistent conquest target at a time. Chosen by
+   *      value/cost analysis, kept until eliminated / unreachable /
+   *      outgrown, so pressure stays focused instead of flapping.
+   *   3. CONTAINMENT — when a hostile crown is running away with the
+   *      game and we're not #1, the campaign locks onto the crown: in an
+   *      FFA the only losing move is letting the leader finish.
+   *   4. TIMER — on timed matches the plan tracks the remaining time and
+   *      flips to "hold" (rank 1) or "all-in land grab" (rank 2+) in the
+   *      final stretch, because the timer crowns the current map leader.
+   */
+  const GAME_PHASES = Object.freeze({
+    OPENING: "OPENING",
+    EXPANSION: "EXPANSION",
+    CONSOLIDATION: "CONSOLIDATION",
+    ASCENSION: "ASCENSION",
+    ENDGAME: "ENDGAME",
+    SURVIVAL: "SURVIVAL",
+  });
+
+  // Minimum residency before a non-urgent phase change is accepted, so the
+  // plan doesn't flap on noisy single-tick readings.
+  const PLAN_PHASE_MIN_TICKS = 100;
+  // Campaign target re-scoring cadence + stall abandonment window.
+  const CAMPAIGN_RESCORE_TICKS = 40;
+  const CAMPAIGN_STALL_TICKS = 900;
+  // Timer endgame window: final 3 minutes of a timed match.
+  const TIMER_CRUNCH_TICKS = 3 * TICKS_PER_MINUTE;
+
+  /**
+   * Pure phase decision. Returns { phase, reason }.
+   */
+  function computeGamePlanPhase(world, meEntry, activeTicks) {
+    const threats = world.threats || {};
+    const totals = world.totals || {};
+
+    // SURVIVAL: someone is actively pouring meaningful troops into us.
+    const invaders = threats.activeInvaders || [];
+    const inbound = threats.invasionTroopsInbound || 0;
+    const myTroops = Math.max(1, Number(meEntry.troops) || 0);
+    const pressure = inbound / myTroops;
+    if (invaders.length > 0 && pressure >= 0.35) {
+      return {
+        phase: GAME_PHASES.SURVIVAL,
+        reason: `invasion pressure ${(pressure * 100).toFixed(0)}%`,
+      };
+    }
+
+    const myShare = totals.myShare || 0;
+    const secondShare = totals.secondShare || 0;
+    const rank =
+      (world.rankings && world.rankings.byTiles
+        ? world.rankings.byTiles.indexOf(world.meSmallID)
+        : -1) + 1;
+
+    // ENDGAME: we are the dominant #1 — convert the lead into the win.
+    if (
+      rank === 1 &&
+      myShare >= 0.28 &&
+      myShare >= Math.max(0.01, secondShare) * 1.3
+    ) {
+      return {
+        phase: GAME_PHASES.ENDGAME,
+        reason: `rank 1 at ${(myShare * 100).toFixed(0)}% share`,
+      };
+    }
+
+    // OPENING: first ~90 seconds while we're still tiny.
+    if (activeTicks < 900 && myShare < 0.1) {
+      return { phase: GAME_PHASES.OPENING, reason: "early bootstrap" };
+    }
+
+    // EXPANSION: free land is still on the table.
+    let ownedTiles = 0;
+    for (const p of world.everyone) ownedTiles += p.tiles || 0;
+    const unownedFrac =
+      Math.max(0, (totals.usableLand || 1) - ownedTiles) /
+      Math.max(1, totals.usableLand || 1);
+    if (unownedFrac >= 0.05 && myShare < 0.5) {
+      return {
+        phase: GAME_PHASES.EXPANSION,
+        reason: `${(unownedFrac * 100).toFixed(0)}% unclaimed`,
+      };
+    }
+
+    // CONSOLIDATION: army depleted and we're bleeding tiles — rebuild
+    // before committing to the next campaign.
+    const armyRatio = meEntry.troopRatio || 0;
+    if (armyRatio < 0.25 && (meEntry.tilesPerMin || 0) < 0) {
+      return {
+        phase: GAME_PHASES.CONSOLIDATION,
+        reason: `army at ${(armyRatio * 100).toFixed(0)}% of cap and shrinking`,
+      };
+    }
+
+    return { phase: GAME_PHASES.ASCENSION, reason: "climb the ranks" };
+  }
+
+  /**
+   * Value/cost score for a potential campaign target. Returns null when the
+   * candidate is ineligible (friendly, too strong, unreachable).
+   */
+  function scoreCampaignCandidate(entry, meEntry, world) {
+    if (!entry || entry.isMe || entry.isFriendly) return null;
+    if ((entry.tiles || 0) <= 0) return null;
+    const myTroops = Math.max(1, Number(meEntry.troops) || 0);
+    const ratio = (Number(entry.troops) || 0) / myTroops;
+    const collapsing = Boolean(entry.collapsing);
+    const isCrownContainment =
+      runtime.plan.containLeader &&
+      world.threats.crownSmallID === entry.smallID;
+    // Safety ceiling: never campaign into someone clearly stronger, unless
+    // they're collapsing (real defence far below troop count) or the
+    // runaway crown (containment beats safety — waiting loses the game).
+    const maxRatio = collapsing ? 1.6 : isCrownContainment ? 1.35 : 1.05;
+    if (ratio > maxRatio) return null;
+
+    const adjacent = Boolean(entry.isAdjacent);
+    const narrowWater =
+      entry.narrowWaterHops !== undefined && entry.narrowWaterHops !== null;
+    const havePorts =
+      ((meEntry.structures && meEntry.structures[UnitType.Port]) || 0) > 0;
+    if (!adjacent && !narrowWater && !havePorts) return null;
+
+    const structures = entry.structures || {};
+    let structuresTotal = 0;
+    for (const type of StructureTypes) {
+      structuresTotal += structures[type] || 0;
+    }
+
+    let value = Math.min(
+      60,
+      ((entry.tiles || 0) / Math.max(1, world.totals.usableLand || 1)) * 400,
+    );
+    value += Math.min(30, structuresTotal * 3);
+    if (collapsing) value += 25;
+    // Nations/tribes carry no diplomatic fallout and never call allies.
+    if (entry.type === PlayerType.Nation || entry.type === PlayerType.Bot) {
+      value += 10;
+    }
+    value += grudgeScoreFor(entry.smallID) * 0.4;
+    if (isCrownContainment) {
+      value += 30 + (world.totals.crownShare || 0) * 60;
+    }
+    if (entry.isTraitor) value += 8;
+    if (entry.isDisconnected) value += 15;
+
+    let cost = ratio * 45;
+    cost += ((entry.structureLevels &&
+      entry.structureLevels[UnitType.DefensePost]) || 0) * 3;
+    if (!adjacent) cost += narrowWater ? 8 : 30;
+
+    return { score: value - cost, ratio, adjacent, isCrownContainment };
+  }
+
+  function chooseCampaignTarget() {
+    const world = runtime.world;
+    const meEntry = world.me;
+    if (!meEntry) return null;
+    let best = null;
+    for (const entry of world.everyone) {
+      const scored = scoreCampaignCandidate(entry, meEntry, world);
+      if (!scored) continue;
+      if (!best || scored.score > best.scored.score) {
+        best = { entry, scored };
+      }
+    }
+    if (!best || best.scored.score <= 0) return null;
+    return best;
+  }
+
+  /**
+   * Keep-or-replace logic for the persistent campaign target.
+   */
+  function maintainCampaign(meEntry, world, tick) {
+    const plan = runtime.plan;
+    const current = plan.campaign;
+    if (current) {
+      const entry = world.bySmallID.get(current.smallID);
+      let drop = null;
+      if (!entry || (entry.tiles || 0) <= 0) {
+        drop = "target eliminated";
+      } else if (entry.isFriendly) {
+        drop = "target became friendly";
+      } else {
+        const ratio =
+          (Number(entry.troops) || 0) /
+          Math.max(1, Number(meEntry.troops) || 0);
+        const isCrownContainment =
+          plan.containLeader &&
+          world.threats.crownSmallID === entry.smallID;
+        if (ratio > (isCrownContainment ? 2.2 : 1.9)) {
+          drop = "target outgrew us";
+        } else {
+          if ((entry.tiles || 0) < (current.lastTargetTiles || Infinity)) {
+            current.lastTargetTiles = entry.tiles;
+            current.lastProgressTick = tick;
+          }
+          if (
+            tick - (current.lastProgressTick || current.sinceTick) >
+            CAMPAIGN_STALL_TICKS
+          ) {
+            drop = "no progress";
+          } else if (
+            !entry.isAdjacent &&
+            (entry.narrowWaterHops === undefined ||
+              entry.narrowWaterHops === null) &&
+            ((meEntry.structures &&
+              meEntry.structures[UnitType.Port]) || 0) === 0
+          ) {
+            drop = "unreachable";
+          }
+        }
+      }
+      if (drop) {
+        decisionLog("campaign: dropping " + current.name + " — " + drop);
+        plan.campaign = null;
+      } else {
+        return;
+      }
+    }
+    if (tick - plan.campaignScoredAt < CAMPAIGN_RESCORE_TICKS) return;
+    plan.campaignScoredAt = tick;
+    const best = chooseCampaignTarget();
+    if (!best) return;
+    const reason = best.scored.isCrownContainment
+      ? "contain the runaway crown"
+      : best.entry.collapsing
+        ? "carve up a collapsing neighbour"
+        : "best value/cost conquest";
+    plan.campaign = {
+      smallID: best.entry.smallID,
+      name: best.entry.name,
+      sinceTick: tick,
+      reason,
+      lastProgressTick: tick,
+      lastTargetTiles: best.entry.tiles,
+      score: best.scored.score,
+    };
+    decisionLog(
+      "campaign: new target " +
+        best.entry.name +
+        " score=" +
+        best.scored.score.toFixed(0) +
+        " (" +
+        reason +
+        ")",
+    );
+  }
+
+  /**
+   * Refresh the whole-game plan. Runs every active tick after the world
+   * model + threats are up to date, before goal selection.
+   */
+  function updateGamePlan(me) {
+    const world = runtime.world;
+    const plan = runtime.plan;
+    const meEntry = world.me;
+    if (!meEntry) return;
+    const gameView = getGameView();
+    const tick = world.tick || 0;
+    const activeTicks = gameView ? getActiveMatchTicks(gameView) : tick;
+
+    // Rank by tiles (1 = leader; 0 = unknown).
+    const rankIdx = world.rankings.byTiles.indexOf(world.meSmallID);
+    plan.rank = rankIdx >= 0 ? rankIdx + 1 : 0;
+    plan.sharePerMin =
+      world.totals.usableLand > 0
+        ? (meEntry.tilesPerMin || 0) / world.totals.usableLand
+        : 0;
+
+    // Timed matches: the timer crowns the current map leader, so the
+    // remaining time is a first-class planning input.
+    const maxTimerMinutes = safeCall(
+      () => gameView.config().gameConfig().maxTimerValue,
+      undefined,
+    );
+    plan.timerTicksLeft =
+      typeof maxTimerMinutes === "number" && Number.isFinite(maxTimerMinutes)
+        ? Math.max(0, maxTimerMinutes * TICKS_PER_MINUTE - activeTicks)
+        : null;
+
+    // Containment: a hostile crown is running away and we are not #1.
+    const crown = world.threats.crown;
+    plan.containLeader = Boolean(
+      crown &&
+        !crown.isFriendly &&
+        (world.totals.crownShare || 0) >= 0.32 &&
+        plan.rank !== 1,
+    );
+
+    // Phase transition with hysteresis; SURVIVAL/ENDGAME are urgent and
+    // bypass the residency requirement.
+    const next = computeGamePlanPhase(world, meEntry, activeTicks);
+    if (plan.phaseSince < 0) {
+      plan.phase = next.phase;
+      plan.phaseSince = tick;
+    } else if (next.phase !== plan.phase) {
+      const urgent =
+        next.phase === GAME_PHASES.SURVIVAL ||
+        next.phase === GAME_PHASES.ENDGAME;
+      if (urgent || tick - plan.phaseSince >= PLAN_PHASE_MIN_TICKS) {
+        plan.phaseHistory.push({
+          tick,
+          prev: plan.phase,
+          next: next.phase,
+          reason: next.reason,
+        });
+        if (plan.phaseHistory.length > 60) {
+          plan.phaseHistory.splice(0, plan.phaseHistory.length - 60);
+        }
+        rlLog("plan_switch", {
+          prev: plan.phase,
+          next: next.phase,
+          reason: next.reason,
+          rank: plan.rank,
+          myShare: world.totals.myShare || 0,
+        });
+        decisionLog(
+          "plan: " + plan.phase + " → " + next.phase + " (" + next.reason + ")",
+        );
+        plan.phase = next.phase;
+        plan.phaseSince = tick;
+      }
+    }
+
+    maintainCampaign(meEntry, world, tick);
+  }
+
+  /**
+   * Phase-driven goal priority bias. Small values on purpose (±3..8 for
+   * steady-state phases): the plan should steer target selection between
+   * near-equal alternatives, never override genuine emergencies (REPEL /
+   * CONSOLIDATE / MIRV all score 88+). SURVIVAL is the exception — it
+   * actively suppresses expansionist goals so every tick goes to defence.
+   */
+  function planBias(goalId) {
+    const plan = runtime.plan;
+    if (!plan) return 0;
+    let bias = 0;
+    // Never let expansion bias override threat responses: when an invader
+    // (active or brewing) is on the board, the OPENING/EXPANSION boosts
+    // are suppressed so PREEMPT/REPEL keep their designed priority edge.
+    const threats = runtime.world && runtime.world.threats;
+    const invasionThreat = Boolean(
+      threats &&
+        (((threats.activeInvaders || []).length > 0) ||
+          ((threats.brewingInvaders || []).length > 0)),
+    );
+    switch (plan.phase) {
+      case GAME_PHASES.OPENING:
+      case GAME_PHASES.EXPANSION: {
+        // The land-race boost is for the early scramble only: once we're
+        // past 20% share, insurance goals (SAM wall) rightly outrank
+        // marginal expansion.
+        const myShare =
+          (runtime.world &&
+            runtime.world.totals &&
+            runtime.world.totals.myShare) ||
+          0;
+        if (!invasionThreat && myShare < 0.2) {
+          if (goalId === "TERRA_NULLIUS_RUSH") bias = 6;
+          else if (goalId === "EASY_NATION_GRAB" || goalId === "FARM_TRIBE") bias = 4;
+        }
+        if (goalId === "DEFENSE_NETWORK") bias = -4;
+        break;
+      }
+      case GAME_PHASES.CONSOLIDATION:
+        if (goalId === "SAM_WALL_BUILDUP" || goalId === "DEFENSE_NETWORK") bias = 6;
+        else if (goalId === "SAVE_FOR_HYDRO") bias = 4;
+        else if (goalId === "CAMPAIGN_CONQUEST" || goalId === "NAVAL_LAND_GRAB") bias = -6;
+        break;
+      case GAME_PHASES.ASCENSION:
+        if (goalId === "CAMPAIGN_CONQUEST" || goalId === "EASY_NATION_GRAB") bias = 4;
+        else if (goalId === "TERRAIN_RUSH" || goalId === "NUKE_CROWN") bias = 3;
+        break;
+      case GAME_PHASES.ENDGAME:
+        if (goalId === "CAMPAIGN_CONQUEST") bias = 6;
+        else if (goalId === "STEAMROLL_CROWN" || goalId === "NUKE_CROWN") bias = 4;
+        else if (goalId === "SAM_OVERWHELM") bias = 3;
+        break;
+      case GAME_PHASES.SURVIVAL:
+        if (
+          goalId === "REPEL_INVASION" ||
+          goalId === "CONSOLIDATE_FRONT" ||
+          goalId === "PREEMPT_INVASION"
+        ) {
+          bias = 2;
+        } else if (goalId === "CAMPAIGN_CONQUEST") bias = -20;
+        else if (goalId === "NAVAL_LAND_GRAB") bias = -10;
+        else if (goalId === "TERRA_NULLIUS_RUSH") bias = -8;
+        else if (goalId === "EASY_NATION_GRAB") bias = -6;
+        break;
+      default:
+        break;
+    }
+    // Timer crunch: in the last stretch of a timed match the current map
+    // leader wins. Rank 1 → hold the lead (turtle up); rank 2+ → take
+    // land NOW from whoever we're already fighting.
+    if (
+      plan.timerTicksLeft !== null &&
+      plan.timerTicksLeft <= TIMER_CRUNCH_TICKS
+    ) {
+      if (plan.rank === 1) {
+        if (goalId === "DEFENSIVE_TURTLE") bias += 8;
+        if (goalId === "CONSOLIDATE_FRONT") bias += 4;
+      } else if (plan.rank >= 2) {
+        if (goalId === "CAMPAIGN_CONQUEST") bias += 8;
+        if (goalId === "TERRAIN_RUSH" || goalId === "STEAMROLL_CROWN") bias += 4;
+      }
+    }
+    return bias;
+  }
+
   // ---------- Phase 3: goal planner ----------
 
   /**
@@ -10505,6 +11476,12 @@
     TERRA_NULLIUS_RUSH:
       "Grab unclaimed land while it's still available.\n" +
       "Active early-game while ≥5% of the map is unowned and we're below 50% share. Converts directly into income + pop cap; priority tapers as the map fills up and mid-game goals take over.",
+    CAMPAIGN_CONQUEST:
+      "Execute the whole-game plan's persistent conquest target.\n" +
+      "The plan layer picks one enemy by value/cost analysis and this goal keeps grinding them down until they're eliminated — no more idling at rank 2. When a hostile crown is running away with the map, the campaign locks onto the crown (containment) and priority escalates with their share.",
+    STEAMROLL_CROWN:
+      "We are the dominant #1 — close out the game.\n" +
+      "Fires at ≥30% share with a clear lead (or when the plan is in ENDGAME). Relentlessly converts our army into conquest toward the 80% win line instead of turtling on a lead.",
     NAVAL_LAND_GRAB:
       "Water-hop to soft targets or claim an island start.\n" +
       "Needs ≥30k troops and boat capacity available. Fires for soft targets across water, or automatically on ISLAND archetype maps where we have to hop to expand at all.",
@@ -10633,6 +11610,8 @@
     // Intel
     Archetype:
       "Map archetype inferred from geography: CONTINENTAL / ISLAND / CHOKE_HEAVY / NUKE_RACE / ARENA / CONVENTIONAL. Biases which goals fire.",
+    Plan:
+      "Whole-game plan phase (OPENING / EXPANSION / CONSOLIDATION / ASCENSION / ENDGAME / SURVIVAL) and the current persistent campaign target, if any. The plan biases goal priorities so the reactive planner executes a long-horizon strategy.",
     Coalition:
       "Largest alliance bloc share of the map. '⚠' if the planner flags it as a coalition-level threat.",
     "My Share": "Fraction of usable land we own.",
@@ -10932,8 +11911,15 @@
         const myShare = world.totals.myShare;
         const secondShare = world.totals.secondShare;
         // Dominant: large share AND a clear lead over the next player.
-        if (myShare < 0.3) return { valid: false };
-        if (myShare < secondShare * 1.5) return { valid: false };
+        // v2.15: the plan's ENDGAME phase (rank 1, ≥28% share, 1.3× lead)
+        // also qualifies — waiting for the old 1.5× lead let close races
+        // time out at rank 1-2 instead of closing to the 80% win line.
+        const endgamePlan =
+          runtime.plan && runtime.plan.phase === GAME_PHASES.ENDGAME;
+        if (!endgamePlan) {
+          if (myShare < 0.3) return { valid: false };
+          if (myShare < secondShare * 1.5) return { valid: false };
+        }
         // Don't steamroll while actively being invaded — survival first.
         if ((world.threats.activeInvaders || []).length > 0) {
           return { valid: false };
@@ -11201,6 +12187,53 @@
       onAct: async () => false,
     },
     {
+      // CAMPAIGN_CONQUEST (v2.15) — execute the whole-game plan's
+      // persistent conquest target. This is the "never idle" goal: when
+      // no reactive trigger fires but the plan says we should be climbing
+      // (ASCENSION / ENDGAME), we keep grinding down the chosen target.
+      // Also carries the leader-containment case: when a hostile crown is
+      // running away with the map and we're not #1, the campaign locks
+      // onto the crown and the priority escalates with their share —
+      // in an FFA, watching the leader finish IS losing.
+      id: "CAMPAIGN_CONQUEST",
+      horizonTicks: 120,
+      evaluate: () => {
+        const world = runtime.world;
+        const me = world.me;
+        if (!me) return { valid: false };
+        const plan = runtime.plan;
+        if (!plan || !plan.campaign) return { valid: false };
+        if (plan.phase === GAME_PHASES.SURVIVAL) return { valid: false };
+        const target = world.bySmallID.get(plan.campaign.smallID);
+        if (!target || (target.tiles || 0) <= 0 || target.isFriendly) {
+          return { valid: false };
+        }
+        if (me.troops < 5000) return { valid: false };
+        const containCrown =
+          plan.containLeader &&
+          world.threats.crownSmallID === target.smallID;
+        let priority = 64;
+        if (plan.phase === GAME_PHASES.ASCENSION) priority += 4;
+        if (plan.phase === GAME_PHASES.ENDGAME) priority += 8;
+        if (target.collapsing) priority += 8;
+        const advantage = me.troops / Math.max(1, target.troops);
+        if (advantage >= 2.5) priority += 6;
+        if (containCrown) {
+          priority += (world.totals.crownShare || 0) >= 0.45 ? 18 : 8;
+        }
+        return {
+          valid: true,
+          priority: Math.min(86, priority),
+          note:
+            `campaign=${target.name} ` +
+            `troopRatio=${(target.troops / Math.max(1, me.troops)).toFixed(2)}` +
+            (containCrown ? " (contain crown)" : ""),
+          context: { target },
+        };
+      },
+      onAct: async () => false,
+    },
+    {
       id: "NAVAL_LAND_GRAB",
       horizonTicks: 180,
       evaluate: () => {
@@ -11453,7 +12486,8 @@
         });
         continue;
       }
-      let priority = (evaluation.priority || 0) + modeBias(spec.id);
+      let priority =
+        (evaluation.priority || 0) + modeBias(spec.id) + planBias(spec.id);
       if (planner.activeGoalId === spec.id) priority += 15;
       evaluations.push({
         id: spec.id,
@@ -12023,6 +13057,10 @@
     // Plan §0: per-section timing harness behind runtime.debugFlags.timing.
     timingSection("updateWorldModel", () => updateWorldModel(me, borderTiles));
     timingSection("computeThreats", () => computeThreats(me, borderTiles));
+    // v2.15: opponent behavioural memory + whole-game plan. Intel first
+    // (grudges feed campaign scoring), then the plan refresh.
+    timingSection("updateOpponentIntel", () => updateOpponentIntel(me));
+    timingSection("updateGamePlan", () => updateGamePlan(me));
     classifyMapIfNeeded(me);
     maybePeriodicIntelLog();
     updateSnapshot(me, borderTiles);
@@ -12166,6 +13204,12 @@
         handled = await maybeExpand(me, borderTiles);
         if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
         break;
+      case "CAMPAIGN_CONQUEST":
+        handled = await runGoal_CampaignConquest(me, borderTiles, selectionContext);
+        if (!handled) handled = await maybeCombat(me, borderTiles);
+        if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
+        if (!handled) handled = await maybeExpand(me, borderTiles);
+        break;
       case "NAVAL_LAND_GRAB":
         handled = await runGoal_NavalLandGrab(me);
         if (!handled) handled = await maybeRiverCrossing(me, borderTiles);
@@ -12203,6 +13247,7 @@
         "EASY_NATION_GRAB",
         "TERRA_NULLIUS_RUSH",
         "TERRAIN_RUSH",
+        "CAMPAIGN_CONQUEST",
         "DIPLOMACY_ISOLATE_CROWN",
       ]);
       if (ECONOMY_SECONDARY_GOALS.has(activeGoalId)) {
@@ -12301,6 +13346,9 @@
       runtime.state.spawn.finalIndex = 0;
       runtime.state.spawn.randomSpawnIntentSent = false;
       runtime.state.spawn.thinkUntilMs = 0;
+      // v2.15: fresh stratified-probe grid + adaptive terrain gate per map.
+      runtime.state.spawn.grid = null;
+      runtime.state.spawn.gate = null;
       // Plan §6: fresh measurement budget per match so one slow match
       // doesn't permanently degrade the sampler cap.
       runtime.state.spawn.perf = {
@@ -12328,6 +13376,19 @@
       runtime.planner.activeGoalCreatedTick = -1;
       runtime.planner.activeGoalExpiresTick = -1;
       runtime.planner.lastEvaluation = [];
+      // v2.15: fresh whole-game plan + opponent intel per match.
+      runtime.plan.phase = "OPENING";
+      runtime.plan.phaseSince = -1;
+      runtime.plan.phaseHistory = [];
+      runtime.plan.campaign = null;
+      runtime.plan.campaignScoredAt = -999;
+      runtime.plan.rank = 0;
+      runtime.plan.sharePerMin = 0;
+      runtime.plan.timerTicksLeft = null;
+      runtime.plan.containLeader = false;
+      runtime.intel.grudges.clear();
+      runtime.intel.seenAttackIDs.clear();
+      runtime.intel.appeaseAttempts.clear();
       runtime.reasons = [];
       runtime.stealth.perPlayerActions.clear();
       runtime.stealth.combos.clear();
@@ -13287,6 +14348,7 @@
     stat_delta: "SD",
     planner_decision: "PD",
     goal_switch: "GS",
+    plan_switch: "PL",
     reason: "R",
     intent_sent: "IS",
     intent_blocked: "IB",
@@ -13871,6 +14933,14 @@
       const danger = world.threats.nearestDanger;
       setRowsIfChanged(intelRoot, [
         { label: "Archetype", value: world.archetype || "unknown" },
+        {
+          label: "Plan",
+          value:
+            (runtime.plan.phase || "-") +
+            (runtime.plan.campaign
+              ? " → " + runtime.plan.campaign.name
+              : ""),
+        },
         {
           label: "Coalition",
           value:
@@ -15157,6 +16227,21 @@
         // Plan §8 acceptance-test helpers.
         selectPrimaryGoal,
         recordAllianceBreak,
+        // v2.15 whole-game plan + opponent intel helpers.
+        GAME_PHASES,
+        computeGamePlanPhase,
+        updateGamePlan,
+        planBias,
+        scoreCampaignCandidate,
+        chooseCampaignTarget,
+        maintainCampaign,
+        runGoal_CampaignConquest,
+        computeSnowballRisks,
+        updateOpponentIntel,
+        grudgeScoreFor,
+        pickAppeasementTarget,
+        nextSpawnProbeCoord,
+        refineSpawnCandidate,
         // Plan §2.4 acceptance helpers.
         maybeExpand,
         maybeCombat,
