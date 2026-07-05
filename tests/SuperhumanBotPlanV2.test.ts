@@ -708,7 +708,7 @@ describe("shouldBuildType(Port) — coastal force-unlock", () => {
   });
 });
 
-describe("openingDiplomacyBlast — one-shot, Human-only, proximity-gated", () => {
+describe("openingDiplomacyBlast — one-shot, Human+Nation, proximity-gated", () => {
   function stubRuntimeForBlast(runtime: any, options: any) {
     const { minDist = 30, mySpawn = 1000, neighbours = [] } = options;
     runtime.identity.clanTag = null;
@@ -743,7 +743,7 @@ describe("openingDiplomacyBlast — one-shot, Human-only, proximity-gated", () =
     resetSpawnState(runtime);
   });
 
-  it("fires alliance requests at every nearby Human and flips fired=true", () => {
+  it("fires alliance requests at nearby Humans and Nations and flips fired=true", () => {
     const runtime = loadUserscript();
     const { openingDiplomacyBlast, PlayerType } = runtime.test.internals;
 
@@ -786,7 +786,8 @@ describe("openingDiplomacyBlast — one-shot, Human-only, proximity-gated", () =
         spawnTile: () => 1200,
         hasSpawned: () => true,
       },
-      // Close Nation — type rejected.
+      // Close Nation — v2.15: nations ARE eligible (their alliance AI
+      // evaluates inbound requests and accepts readily early-game).
       {
         isAlive: () => true,
         type: () => PlayerType.Nation,
@@ -809,11 +810,13 @@ describe("openingDiplomacyBlast — one-shot, Human-only, proximity-gated", () =
 
     const fired = openingDiplomacyBlast(me);
     expect(fired).toBe(true);
-    expect(sentTo).toEqual(["H2"]);
+    // Closest-first ordering: the nation at distance 5 precedes the
+    // human at distance 20.
+    expect(sentTo).toEqual(["N4", "H2"]);
     expect(runtime.state.openingBlast.fired).toBe(true);
     expect(
       Array.from(runtime.state.openingBlast.sentToSmallIDs as Set<number>),
-    ).toEqual([2]);
+    ).toEqual([4, 2]);
 
     (globalThis as any).window.__SUPERBOT_TEST_MODE = false;
   });
