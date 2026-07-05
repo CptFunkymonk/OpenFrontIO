@@ -714,17 +714,18 @@ describe("defense floor — never weak next to a neighbour", () => {
     installWorld(runtime, { myTroops: 80_000, adjacentEnemies: [threat] });
     const me = { troops: () => 80_000 };
 
-    // Wants 60k but only 80k − 58k = 22k may leave home.
-    expect(capCommitByDefenseFloor(me, 60_000, {})).toBe(22_000);
+    // Wants 60k, but the PvP floor (0.7 × 58k = 40.6k) caps the commit at
+    // 80k − 40.6k = 39.4k so the garrison holds.
+    expect(capCommitByDefenseFloor(me, 60_000, {})).toBe(39_400);
     // Small commits pass through untouched.
     expect(capCommitByDefenseFloor(me, 10_000, {})).toBe(10_000);
-    // Retaliation fights at half floor: 80k − 29k = 51k.
+    // Retaliation fights at half floor: 80k − 20.3k = 59.7k.
     expect(capCommitByDefenseFloor(me, 60_000, { retaliating: true })).toBe(
-      51_000,
+      59_700,
     );
     // A capped PvP commit below the viability point is dropped entirely.
     expect(
-      capCommitByDefenseFloor(me, 60_000, { minViableCommit: 30_000 }),
+      capCommitByDefenseFloor(me, 60_000, { minViableCommit: 45_000 }),
     ).toBe(0);
     // Attacking the threat itself excludes them from the floor.
     expect(capCommitByDefenseFloor(me, 60_000, { targetSmallID: 2 })).toBe(
@@ -745,12 +746,13 @@ describe("defense floor — never weak next to a neighbour", () => {
     installWorld(runtime, { myTroops: 80_000, adjacentEnemies: [threat] });
     const me = { troops: () => 80_000, incomingAttacks: () => [] };
 
-    // TN expansion: reserve 0.1×100k leaves 70k available, but the floor
-    // caps the commit at 80k − 58k = 22k so the garrison holds.
+    // TN expansion: reserve 0.1×100k leaves 70k available, but the
+    // expansion floor (0.5 × 58k = 29k) caps the commit at 80k − 29k =
+    // 51k so the garrison holds.
     const tn = calculateAttackTroops(me, null, 0.1, 100_000, {
       retaliating: false,
     });
-    expect(tn).toBe(22_000);
+    expect(tn).toBe(51_000);
   });
 });
 

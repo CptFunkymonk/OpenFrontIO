@@ -5099,12 +5099,25 @@
     return { floor, danger };
   }
 
+  // How much of the weighted committable strike we must hold at home,
+  // derived from the engine's attackLogic saturation points:
+  //   defenders ≥ 0.6× attack troops → the attacker's loss multiplier
+  //   starts climbing off its minimum; ≥ 1.0× → the attack drops below
+  //   max conquest speed. 0.7 sits between them: attackers bleed and
+  //   slow, while we keep ~30% more troops free for growth than the
+  //   full 1.0× floor (which froze expansion and lost harness games).
+  //   TN expansion holds only 0.5× — expansion troops return when the
+  //   attack completes, and land grows the pop cap that IS our defense.
+  const DEFENSE_FLOOR_RATIO_PVP = 0.7;
+  const DEFENSE_FLOOR_RATIO_EXPAND = 0.5;
+
   /**
    * Clamp an offensive commit so our POST-COMMIT standing army never drops
    * below the defense floor. This is the "never be weak next to a
    * neighbour" guarantee: expansion and conquest may only spend the troops
    * above what the scariest adjacent hostile could throw at us.
    *
+   *   - opts.floorScale rescales the floor (expansion uses 0.5×).
    *   - retaliating commits fight AT half floor: our counter-attack troops
    *     directly cancel the inbound wave, so they still defend.
    *   - opts.minViableCommit (PvP): if the cap pushes the commit below the
@@ -5116,9 +5129,11 @@
     if (!Number.isFinite(desired) || desired <= 0) return desired > 0 ? desired : 0;
     const floorInfo = computeDefenseFloor(opts.targetSmallID);
     if (floorInfo.floor <= 0) return Math.floor(desired);
-    const effectiveFloor = opts.retaliating
-      ? floorInfo.floor * 0.5
-      : floorInfo.floor;
+    const scale =
+      opts.floorScale !== undefined
+        ? opts.floorScale
+        : DEFENSE_FLOOR_RATIO_PVP;
+    const effectiveFloor = floorInfo.floor * scale * (opts.retaliating ? 0.5 : 1);
     const myTroops = safeCall(() => me.troops(), 0);
     const maxCommit = Math.floor(myTroops - effectiveFloor);
     if (maxCommit >= desired) return Math.floor(desired);
@@ -5551,6 +5566,7 @@
     if (enemyTroops <= 0) {
       return capCommitByDefenseFloor(me, available > 0 ? available : 0, {
         retaliating,
+        floorScale: DEFENSE_FLOOR_RATIO_EXPAND,
       });
     }
 
