@@ -384,9 +384,9 @@ describe("tampermonkey-superhuman-bot population-first build priority", () => {
     );
   });
 
-  it("exposes a BOT_VERSION constant bumped to 2.15.0", () => {
+  it("exposes a BOT_VERSION constant bumped to 3.1.0", () => {
     const runtime = loadUserscript();
-    expect(runtime.test.internals.BOT_VERSION).toBe("2.15.0");
+    expect(runtime.test.internals.BOT_VERSION).toBe("3.1.0");
   });
 });
 
@@ -588,18 +588,14 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
         "We are the crown",
       );
 
-      // Strategy value in the State section should carry a per-strategy tooltip.
-      const stateRoot = panel.querySelector("#superbot-state");
-      const html = stateRoot!.innerHTML;
-      expect(html).toMatch(/title="[^"]*Economy executor/);
-
-      // Active goal value in the Goal section should carry the
-      // GOAL_DESCRIPTIONS tooltip for NUKE_CROWN.
-      const goalRoot = panel.querySelector("#superbot-goal");
-      const goalHtml = goalRoot!.innerHTML;
-      expect(goalHtml).toMatch(
-        /title="[^"]*Regular nuclear pressure on the map leader/,
+      // v3.1 Overlord UI: the active goal is the hero line at the top of
+      // the panel and carries the GOAL_DESCRIPTIONS tooltip for NUKE_CROWN.
+      const goalLine = panel.querySelector("#superbot-goal-line");
+      expect(goalLine, "goal hero line should exist").toBeTruthy();
+      expect(goalLine!.getAttribute("title") ?? "").toContain(
+        "Regular nuclear pressure on the map leader",
       );
+      expect(goalLine!.textContent ?? "").toContain("NUKE_CROWN");
     } finally {
       runtime.mode = priorMode;
       runtime.state.strategy = priorStrategy;
@@ -653,10 +649,19 @@ describe("tampermonkey-superhuman-bot overlay tooltips", () => {
         "brewing invader",
       );
 
-      const goalRoot = panel!.querySelector("#superbot-goal");
-      const goalHtml = goalRoot!.innerHTML;
-      expect(goalHtml).toMatch(/title="[^"]*Dedicated all-in defence/);
-      expect(goalHtml).toMatch(/title="[^"]*Harden the border/);
+      // v3.1 Overlord UI: the active goal's tooltip lives on the hero line.
+      const goalLine = panel!.querySelector("#superbot-goal-line");
+      expect(goalLine!.getAttribute("title") ?? "").toContain(
+        "Dedicated all-in defence",
+      );
+
+      // Switch the active goal to PREEMPT_INVASION and confirm its tooltip
+      // renders too.
+      runtime.planner.activeGoalId = "PREEMPT_INVASION";
+      win.__superhumanBotRefreshOverlay();
+      expect(goalLine!.getAttribute("title") ?? "").toContain(
+        "Harden the border",
+      );
     } finally {
       runtime.planner.activeGoalId = priorActiveGoalId;
       runtime.planner.lastEvaluation = priorLastEvaluation;
