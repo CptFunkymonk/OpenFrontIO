@@ -7569,6 +7569,131 @@
    * Chooses a patrol tile near our port cluster so the warship spawns at a
    * legal friendly port.
    */
+  // ------------------------------------------------------------------
+  // Warship fleet posture.
+  //
+  // Warships patrol our coast, intercept inbound enemy transports,
+  // protect trade ships, and are REQUIRED for parity before
+  // isNavalInvasionSafe lets a long-range invasion sail past enemy
+  // warships. The old rules only floated a hull on ISLAND maps or when
+  // an enemy already had warships while we had ZERO — on ordinary
+  // coastal maps the bot never built a single warship, which in turn
+  // kept the naval-safety gate permanently red and shut down the whole
+  // naval game. Three tiers now feed a fleet target:
+  //   - parity: match enemy warship counts (capped) so escorts unblock
+  //     invasions — highest priority;
+  //   - island floor: keep 2 hulls on ISLAND archetype (unchanged);
+  //   - coastal screen: one standing hull whenever we own a port and
+  //     the gold cushion is comfortable.
+  // ------------------------------------------------------------------
+  const WARSHIP_FLEET_CAP = 3;
+  // Cities-first discipline: no screen hull until the core economy stands.
+  const WARSHIP_SCREEN_MIN_CITIES = 2;
+  // Build the screen only with a 2x gold cushion so cities/SAMs still
+  // come first when gold is tight.
+  const WARSHIP_SCREEN_GOLD_CUSHION = 2;
+
+  /** Mirrors DefaultConfig's warship cost curve: min(1M, (n+1) x 250k). */
+  function estimateNextWarshipCost(currentCount) {
+    return Math.min(1_000_000, (currentCount + 1) * 250_000);
+  }
+
+  /**
+   * Compute how many warships we WANT right now plus the dominating
+   * reason. `me` is a world-model entry (plain fields, not a PlayerView).
+   * Returns { target, reason } where reason is one of "parity",
+   * "island", "screen" (or "" when target is 0).
+   */
+  function computeWarshipFleetTarget(me, weHave, enemyWarships) {
+    if (!me) return { target: 0, reason: "" };
+    let target = 0;
+    let reason = "";
+    if (
+      (me.structures[UnitType.Port] || 0) > 0 &&
+      (me.structures[UnitType.City] || 0) >= WARSHIP_SCREEN_MIN_CITIES &&
+      (me.gold || 0) >=
+        estimateNextWarshipCost(weHave) * WARSHIP_SCREEN_GOLD_CUSHION
+    ) {
+      target = 1;
+      reason = "screen";
+    }
+    if (runtime.world.archetype === "ISLAND" && target < 2) {
+      target = 2;
+      reason = "island";
+    }
+    const parity = Math.min(enemyWarships || 0, WARSHIP_FLEET_CAP);
+    if (parity > target) {
+      target = parity;
+      reason = "parity";
+    }
+    return { target, reason };
+  }
+
+  /** Sum of visible warships owned by non-friendly players. */
+  function countEnemyWarships() {
+    const enemies = (runtime.world.everyone || []).filter(
+      (p) => p && !p.isMe && !p.isFriendly,
+    );
+    return enemies.reduce(
+      (sum, e) =>
+        sum + safeCall(() => e.player.units(UnitType.Warship).length, 0),
+      0,
+    );
+  }
+
+  // Background fleet upkeep cadence. The WARSHIP_DEFENSE goal alone is
+  // not enough: on busy maps some land goal always outranks it in the
+  // planner, so the bot never floated a single hull. Fleet upkeep now
+  // ALSO runs as an always-on pass from runModulesForTick (like the
+  // appeasement / alliance-extension passes) — a cheap no-op whenever
+  // the fleet target is already met.
+  const WARSHIP_MAINTENANCE_INTERVAL_TICKS = 90;
+
+  async function maybeMaintainWarshipFleet(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    if (
+      safeCall(
+        () => gameView.config().isUnitDisabled(UnitType.Warship),
+        false,
+      )
+    ) {
+      return false;
+    }
+    const tick = gameView.ticks();
+    if (
+      tick - runtime.state.cooldowns.warship <
+      WARSHIP_MAINTENANCE_INTERVAL_TICKS
+    ) {
+      return false;
+    }
+    const meEntry = runtime.world.me;
+    if (!meEntry) return false;
+    if ((meEntry.structures[UnitType.Port] || 0) === 0) return false;
+    const weHave = getMyUnitsOfType(UnitType.Warship).length;
+    const fleet = computeWarshipFleetTarget(
+      meEntry,
+      weHave,
+      countEnemyWarships(),
+    );
+    if (weHave >= fleet.target) return false;
+    // Require 1.5x the hull cost before dispatching. The engine
+    // re-validates affordability when WarshipExecution inits one tick
+    // later, and same-turn economy spends (city/factory builds) race us
+    // for the same purse — with no cushion the spawn fails with
+    // "Failed to spawn warship" and the gold is simply wasted time.
+    if ((meEntry.gold || 0) < estimateNextWarshipCost(weHave) * 1.5) {
+      return false;
+    }
+    const acted = await runGoal_WarshipDefense(me);
+    if (!acted) {
+      // No buildable ocean tile right now — back off for a full
+      // maintenance interval instead of re-querying buildables every tick.
+      runtime.state.cooldowns.warship = tick;
+    }
+    return acted;
+  }
+
   async function runGoal_WarshipDefense(me) {
     const gameView = getGameView();
     if (!gameView || !me) return false;
@@ -7600,12 +7725,20 @@
       if (!buildable || buildable.canBuild === false) continue;
       if (sendBuild(UnitType.Warship, tile)) {
         runtime.state.cooldowns.warship = tick;
+        const weHave = getMyUnitsOfType(UnitType.Warship).length;
+        const fleet = computeWarshipFleetTarget(
+          runtime.world.me,
+          weHave,
+          countEnemyWarships(),
+        );
         reasonLog(
           "WARSHIP_DEFENSE",
           "Building a warship to patrol our coast and intercept enemy boats.",
-          runtime.world.archetype === "ISLAND"
-            ? "island map — pirates hit hard here"
-            : "enemy warships spotted",
+          fleet.reason === "parity"
+            ? "matching enemy warships so our boats can sail"
+            : fleet.reason === "island"
+              ? "island map — pirates hit hard here"
+              : "standing coastal screen",
         );
         return true;
       }
@@ -8523,10 +8656,41 @@
     return false;
   }
 
+  // Cross-water "prey" threshold. A target under 30% of our troops is
+  // guaranteed to clear the 1.0x speed-saturation payload guard (payload
+  // caps at 35% of our troops), so shipping a wave at them is always a
+  // profitable use of surplus army. Previously naval conquest required a
+  // SOFT_TARGET classification (weak/afk/traitor), which meant a coastal
+  // bot with a huge army would sit at "no invasions" forever while
+  // perfectly edible mid-sized players lived across the water.
+  const NAVAL_PREY_TROOP_RATIO = 0.3;
+
+  /**
+   * Hostile players reachable only by water (not land-adjacent), alive,
+   * and small enough relative to our army that one transport wave can
+   * saturate their defense. Sorted weakest-first so we snowball through
+   * the easiest meals. `meEntry` is the world-model entry.
+   */
+  function findNavalPreyTargets(meEntry) {
+    if (!meEntry) return [];
+    const prey = (runtime.world.everyone || []).filter(
+      (e) =>
+        e &&
+        !e.isMe &&
+        !e.isFriendly &&
+        !e.isAdjacent &&
+        (e.tiles || 0) > 0 &&
+        (e.troops || 0) < (meEntry.troops || 0) * NAVAL_PREY_TROOP_RATIO,
+    );
+    prey.sort((a, b) => (a.troops || 0) - (b.troops || 0));
+    return prey;
+  }
+
   /**
    * Aggressive naval land-grab. In ISLAND archetype we sniff out uncontested
    * small islands via BFS; otherwise we invade the weakest soft target across
-   * water. Never exceeds `boatMaxNumber` boats in flight.
+   * water, falling back to overmatch prey (< NAVAL_PREY_TROOP_RATIO of our
+   * troops). Never exceeds `boatMaxNumber` boats in flight.
    */
   async function runGoal_NavalLandGrab(me) {
     const gameView = getGameView();
@@ -8583,10 +8747,12 @@
       }
     }
 
-    // Continental: invade the weakest structure-rich soft target.
-    const target = runtime.world.threats.softTargets.find(
+    // Continental: invade the weakest structure-rich soft target, falling
+    // back to the weakest overmatch prey across the water.
+    const soft = runtime.world.threats.softTargets.find(
       (s) => !s.isAdjacent && s.opportunityScore > 30,
     );
+    const target = soft || findNavalPreyTargets(runtime.world.me)[0] || null;
     if (!target) return false;
     const structureTiles = gatherStructureTiles(target.player);
     const candidates = uniqueBy(
@@ -8614,13 +8780,20 @@
         );
         continue;
       }
-      const boatPayload = clamp(Math.floor(available * 0.3), 8000, 30000);
-      // Plan §2.3: boat troop payload should clear the 1.0x speed-
-      // saturation point vs the target. Soft targets by definition are
-      // weaker than us, so the 30%-of-available formula usually clears
-      // — but guard anyway so a misclassified "soft" target with
-      // comparable troops doesn't receive an under-saturated shipment.
+      // Plan §2.3: boat troop payload must clear the 1.0x speed-
+      // saturation point vs the target — below the defender's troop count
+      // the landing conquers slowly with elevated losses. The payload
+      // therefore scales UP to the target's army when our budget allows
+      // (the old hard 30k cap silently disqualified every target with
+      // >30k standing troops no matter how huge our own army was).
       const targetTroops = target.troops || 0;
+      const baselinePayload = Math.floor(available * 0.3);
+      const saturationPayload = Math.ceil(targetTroops * 1.1);
+      const boatPayload = clamp(
+        Math.max(baselinePayload, saturationPayload),
+        8000,
+        Math.floor(me.troops() * 0.35),
+      );
       if (targetTroops > 0 && boatPayload < targetTroops) {
         decisionLog(
           "land-grab boat skip " +
@@ -12073,8 +12246,8 @@
       "We are the dominant #1 — close out the game.\n" +
       "Fires at ≥30% share with a clear lead (or when the plan is in ENDGAME). Relentlessly converts our army into conquest toward the 80% win line instead of turtling on a lead.",
     NAVAL_LAND_GRAB:
-      "Water-hop to soft targets or claim an island start.\n" +
-      "Needs ≥30k troops and boat capacity available. Fires for soft targets across water, or automatically on ISLAND archetype maps where we have to hop to expand at all.",
+      "Water-hop to soft targets or overmatch prey, or claim an island start.\n" +
+      "Needs ≥30k troops (15k when sealed in by allies) and boat capacity available. Fires for soft targets across water, for any cross-water player under 30% of our troops (one wave saturates them), or automatically on ISLAND archetype maps where we have to hop to expand at all.",
     CHOKEPOINT_LOCK:
       "Seal a bottleneck on choke-heavy maps.\n" +
       "Only active on CHOKE_HEAVY archetype while we're under 35% share. Builds DefensePosts up to ~0.75 × city count so the natural terrain funnel becomes a kill-channel.",
@@ -12089,7 +12262,7 @@
       "Extremely gated: alliance-break budget must be available, the ally must be confirmed-helpless over multiple ticks, no dangerous hostile nearby, and nobody hostile owns a MIRV. Only fires when the traitor debuff is clearly worth it.",
     WARSHIP_DEFENSE:
       "Keep a warship screen up around our ports.\n" +
-      "Requires ≥1 Port. Builds up to 2 warships on ISLAND maps, and matches enemy warship counts on the rest — so enemy transports can't just drive tiles into our ports.",
+      "Requires ≥1 Port. Maintains a standing coastal patrol hull once we have 2+ cities and a 2x gold cushion, keeps 2 hulls on ISLAND maps, and matches enemy warship counts (up to 3) — parity is what lets our own invasions sail past enemy patrols.",
     RIVER_CROSSING:
       "Short-hop transport across a river or narrow strait.\n" +
       "Fires when an enemy is within a handful of water tiles of one of our border tiles. Narrow gaps are too short for enemy warships to meaningfully intercept, so we use a light transport load and the naval safety gate skips the warship check for short hops.",
@@ -12851,13 +13024,21 @@
         const sealed = Boolean(world.threats.diplomaticallySealed);
         if (me.troops < (sealed ? 15000 : 30000)) return { valid: false };
         const soft = world.threats.softTargets.filter((s) => !s.isAdjacent);
+        // Overmatch prey: cross-water players small enough that one
+        // transport wave saturates them. Keeps naval conquest alive on
+        // coastal maps even when nobody qualifies as a SOFT_TARGET.
+        const prey = findNavalPreyTargets(me);
         const riverHops =
           (world.threats.narrowWaterNeighbors || []).length > 0;
-        if (soft.length === 0 && world.archetype !== "ISLAND") {
+        if (
+          soft.length === 0 &&
+          prey.length === 0 &&
+          world.archetype !== "ISLAND"
+        ) {
           if (!(sealed && riverHops)) return { valid: false };
         }
         let priority = 45;
-        let note = `${soft.length} soft targets across water`;
+        let note = `${soft.length} soft / ${prey.length} prey across water`;
         if (world.archetype === "ISLAND") {
           priority = 65;
           note = "island archetype";
@@ -13001,28 +13182,23 @@
           return { valid: false };
         }
         const weHave = getMyUnitsOfType(UnitType.Warship).length;
-        if (world.archetype === "ISLAND" && weHave < 2) {
-          return {
-            valid: true,
-            priority: 48,
-            note: `island warship ${weHave}/2`,
-          };
-        }
-        // Enemy warships spotted?
-        const enemies = world.everyone.filter((p) => !p.isFriendly);
-        const enemyWarships = enemies.reduce(
-          (sum, e) =>
-            sum + safeCall(() => e.player.units(UnitType.Warship).length, 0),
-          0,
-        );
-        if (enemyWarships > 0 && weHave < 1) {
-          return {
-            valid: true,
-            priority: 52,
-            note: `enemy warships=${enemyWarships}`,
-          };
-        }
-        return { valid: false };
+        const enemyWarships = countEnemyWarships();
+        const fleet = computeWarshipFleetTarget(me, weHave, enemyWarships);
+        if (weHave >= fleet.target) return { valid: false };
+        // Parity deficits outrank the flat island/screen maintenance —
+        // enemy warships actively sink our transports and trade ships,
+        // and isNavalInvasionSafe stays red until we can match them.
+        let priority = 44;
+        if (fleet.reason === "island") priority = 48;
+        if (fleet.reason === "parity") priority = 52;
+        return {
+          valid: true,
+          priority,
+          note:
+            `warships ${weHave}/${fleet.target} (${fleet.reason}` +
+            (enemyWarships > 0 ? `, enemy=${enemyWarships}` : "") +
+            ")",
+        };
       },
       onAct: async () => false,
     },
@@ -13984,6 +14160,15 @@
 
     // Plan §2.10: team-mode donation. No-op outside team games.
     safeCall(() => maybeDonateToStrugglingTeammate(me), null);
+
+    // Naval fleet upkeep. Always-on (not just goal-driven) because on
+    // busy maps some land goal always outranks WARSHIP_DEFENSE in the
+    // planner and the bot never floated a single hull — leaving trade
+    // ships unescorted and isNavalInvasionSafe permanently red against
+    // enemy patrols. Cheap no-op while the fleet target is met.
+    try {
+      await maybeMaintainWarshipFleet(me);
+    } catch (_) { /* swallow */ }
 
     // Emoji communication: react to the world we just modelled. Runs
     // after world/threats/snapshot so every detector sees a consistent
@@ -17023,6 +17208,124 @@
     });
     runtime.world = previous;
 
+    // Scenarios 27–29: naval posture ("did we forget how to play naval?").
+    //
+    // A coastal player must keep a warship screen (parity vs enemy hulls
+    // unblocks isNavalInvasionSafe) and must keep invading across water
+    // even when nobody qualifies as a SOFT_TARGET — any hostile under
+    // NAVAL_PREY_TROOP_RATIO of our troops is one transport wave away
+    // from being farmed.
+
+    // Scenario 27: coastal screen — port + cities + gold cushion and zero
+    // hulls selects WARSHIP_DEFENSE even with no enemy navy in sight.
+    const scenario27 = buildTestWorld();
+    scenario27.me.gold = 600_000; // >= 2x first-warship cost (250k)
+    scenario27.me.structures[UnitType.Port] = 1;
+    scenario27.threats.landFrontierOpen = false; // mute TERRA_NULLIUS_RUSH
+    step(
+      "coastal port + gold cushion + no hulls -> WARSHIP_DEFENSE",
+      scenario27,
+      "WARSHIP_DEFENSE",
+    );
+
+    // Scenario 27b: parity tier — enemy warships on the map outrank the
+    // screen (52 vs 44) and lift the fleet target to match them.
+    const scenario27b = buildTestWorld();
+    scenario27b.me.gold = 600_000;
+    scenario27b.me.structures[UnitType.Port] = 1;
+    scenario27b.threats.landFrontierOpen = false;
+    const navyEnemy = {
+      smallID: 71,
+      name: "Corsair",
+      isMe: false,
+      isFriendly: false,
+      isAdjacent: false,
+      tiles: 900,
+      troops: 100_000, // too big to be naval prey — isolates the parity path
+      player: {
+        units: (t) => (t === UnitType.Warship ? [{}, {}] : []),
+      },
+    };
+    scenario27b.everyone = [scenario27b.me, navyEnemy];
+    step(
+      "enemy warships -> WARSHIP_DEFENSE parity",
+      scenario27b,
+      "WARSHIP_DEFENSE",
+    );
+    const parityEval = runtime.planner.lastEvaluation.find(
+      (e) => e.id === "WARSHIP_DEFENSE",
+    );
+    results.push({
+      name: "warship parity note reports fleet target 0/2",
+      expected: "warships 0/2 (parity, enemy=2)",
+      actual: parityEval ? parityEval.note : "missing",
+      pass:
+        !!parityEval && parityEval.note === "warships 0/2 (parity, enemy=2)",
+    });
+
+    // Scenario 28: cross-water prey — no SOFT_TARGET anywhere, but a
+    // hostile under 30% of our troops across the water keeps
+    // NAVAL_LAND_GRAB alive.
+    const scenario28 = buildTestWorld();
+    scenario28.me.troops = 60_000;
+    scenario28.threats.landFrontierOpen = false;
+    const navalPrey = {
+      smallID: 72,
+      name: "Prey",
+      isMe: false,
+      isFriendly: false,
+      isAdjacent: false,
+      tiles: 700,
+      troops: 15_000, // < 0.3 x 60k
+      player: { units: () => [] },
+    };
+    scenario28.everyone = [scenario28.me, navalPrey];
+    step(
+      "cross-water overmatch prey -> NAVAL_LAND_GRAB",
+      scenario28,
+      "NAVAL_LAND_GRAB",
+    );
+
+    // Scenario 29: fleet-target tiers directly.
+    const stashedWorld29 = runtime.world;
+    const world29 = buildTestWorld();
+    runtime.world = world29;
+    const fleetMe = {
+      structures: { [UnitType.Port]: 1, [UnitType.City]: 4 },
+      gold: 600_000,
+    };
+    const screenTier = computeWarshipFleetTarget(fleetMe, 0, 0);
+    const parityTier = computeWarshipFleetTarget(fleetMe, 1, 5);
+    const brokeMe = {
+      structures: { [UnitType.Port]: 1, [UnitType.City]: 4 },
+      gold: 100_000, // below the 2x cushion
+    };
+    const brokeTier = computeWarshipFleetTarget(brokeMe, 0, 0);
+    runtime.world = stashedWorld29;
+    results.push({
+      name:
+        "warship fleet tiers: screen=1, parity capped at " +
+        WARSHIP_FLEET_CAP +
+        ", no screen without gold cushion",
+      expected: "1/screen,3/parity,0",
+      actual:
+        screenTier.target +
+        "/" +
+        screenTier.reason +
+        "," +
+        parityTier.target +
+        "/" +
+        parityTier.reason +
+        "," +
+        brokeTier.target,
+      pass:
+        screenTier.target === 1 &&
+        screenTier.reason === "screen" &&
+        parityTier.target === WARSHIP_FLEET_CAP &&
+        parityTier.reason === "parity" &&
+        brokeTier.target === 0,
+    });
+
     // Scenario 6: parabolic SAM check should mark fewer trajectories as
     // intercepted than the linear approximation when the SAM sits on the
     // straight line between silo and target but NOT under the parabolic
@@ -17349,6 +17652,17 @@
         shouldAcceptIncomingAlliance,
         RELEASE_VALVE_MAX_TROOP_RATIO,
         APPEASE_TROOP_RATIO,
+        // Naval posture helpers (warship fleet + cross-water prey).
+        computeWarshipFleetTarget,
+        countEnemyWarships,
+        estimateNextWarshipCost,
+        findNavalPreyTargets,
+        maybeMaintainWarshipFleet,
+        runGoal_NavalLandGrab,
+        runGoal_WarshipDefense,
+        WARSHIP_FLEET_CAP,
+        WARSHIP_MAINTENANCE_INTERVAL_TICKS,
+        NAVAL_PREY_TROOP_RATIO,
         // v3.1 Overlord-merge defense-floor helpers.
         enemyCommittableTroops,
         computeDefenseFloor,
