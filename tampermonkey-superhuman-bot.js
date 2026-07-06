@@ -544,6 +544,13 @@
         inboundTroopTotal: 0,
         overwhelmingNeighbor: null,
         earlyHumanOvermatch: null,
+        // Is there any unowned land tile directly on our border? False
+        // means land expansion is physically impossible this tick.
+        landFrontierOpen: true,
+        // Set when EVERY land neighbour is friendly AND the terra
+        // nullius frontier is gone — the "allied ourselves into a box"
+        // trap. { neighbors, alliedNeighborCount } or null.
+        diplomaticallySealed: null,
       },
       archetype: "unknown",
       archetypeLocked: null, // manual override from overlay
@@ -603,6 +610,11 @@
       // after 5 minutes; without renewal our nation appeasements silently
       // lapse mid-game and the ex-ally becomes an invader again.
       extensionRequested: new Map(),
+      // allianceID -> { smallID, name, plannedAt }. Alliances we have
+      // deliberately decided to let EXPIRE (no traitor debuff, unlike a
+      // break) because every land neighbour is an ally and we're out of
+      // room to grow. See maintainPlannedAllianceLapses.
+      plannedLapses: new Map(),
     },
     /**
      * Auto-queue session (v2.16). Tracks the match result (win/loss) once
@@ -9008,6 +9020,186 @@
     );
   }
 
+  // ------------------------------------------------------------------
+  // Diplomatic-seal detection ("allied ourselves into a box").
+  //
+  // The classic FFA trap: we ally every land neighbour, terra nullius
+  // dries up, and suddenly the only way to grow is betrayal — which costs
+  // the traitor debuff (50% defense for 30s) and sours every nearby
+  // player. Three coordinated defenses:
+  //   1. PREVENT — never form the alliance that would close our LAST
+  //      hostile land border once the frontier is gone
+  //      (allianceWouldSealBorders, checked at every alliance-forming
+  //      callsite).
+  //   2. ESCAPE — when we're already sealed, deliberately let the least
+  //      valuable alliance EXPIRE instead of breaking it. Natural expiry
+  //      (AllianceImpl.expire) carries NO traitor penalty — we just stop
+  //      requesting the extension (maintainPlannedAllianceLapses).
+  //   3. REROUTE — while waiting for the lapse, the planner biases toward
+  //      overseas / river expansion (NAVAL_LAND_GRAB seal boost) and
+  //      stops selecting land expansion it cannot execute
+  //      (TERRA_NULLIUS_RUSH frontier gate).
+  // ------------------------------------------------------------------
+
+  // Never plan a lapse against an ally who could roll us once the pact
+  // ends. 1.1× keeps a little tolerance for parity neighbours.
+  const RELEASE_VALVE_MAX_TROOP_RATIO = 1.1;
+  // A neighbour at or above this troop ratio is someone we appease for
+  // survival — those alliances are allowed even when they seal us in,
+  // because we couldn't conquer that border anyway.
+  const APPEASE_TROOP_RATIO = 1.4;
+
+  /**
+   * Is there ANY unowned land tile directly adjacent to our border?
+   * Early-exits on the first hit so the common (open frontier) case costs
+   * almost nothing.
+   */
+  function computeLandFrontierOpen(borderTiles) {
+    const gameView = getGameView();
+    if (!gameView || !borderTiles || borderTiles.length === 0) return false;
+    for (const tile of borderTiles) {
+      for (const neighbor of gameView.neighbors(tile)) {
+        if (!safeCall(() => gameView.isLand(neighbor), false)) continue;
+        if (gameView.ownerID(neighbor) === 0) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Detect the sealed state: at least one living land neighbour, ALL of
+   * them friendly, and no terra nullius left on our border. Relies on
+   * entry.isAdjacent being freshly computed by computeThreats' main loop.
+   * Returns { neighbors, alliedNeighborCount } or null.
+   */
+  function computeDiplomaticSeal(meEntry, landFrontierOpen) {
+    if (!meEntry || landFrontierOpen) return null;
+    const world = runtime.world;
+    const adjacentAlive = (world.everyone || []).filter(
+      (e) => e && !e.isMe && e.isAdjacent && (e.tiles || 0) > 0,
+    );
+    if (adjacentAlive.length === 0) return null;
+    if (adjacentAlive.some((e) => !e.isFriendly)) return null;
+    return {
+      neighbors: adjacentAlive,
+      alliedNeighborCount: adjacentAlive.length,
+    };
+  }
+
+  /**
+   * Would allying this candidate close our LAST hostile land border while
+   * the terra nullius frontier is already gone? Checked before every
+   * alliance we initiate or accept, so the seal never forms out of mere
+   * convenience. Survival-driven appeasement (>= APPEASE_TROOP_RATIO×
+   * our troops) bypasses this at the callsites — we couldn't take that
+   * border by force anyway, so allying it costs us nothing.
+   */
+  function allianceWouldSealBorders(candidateEntry) {
+    const world = runtime.world;
+    if (!world || !world.me || !candidateEntry) return false;
+    if (!candidateEntry.isAdjacent) return false;
+    // Frontier open (or not yet computed): land expansion still possible,
+    // an extra alliance can't lock us in.
+    if (world.threats.landFrontierOpen !== false) return false;
+    const otherOutlets = (world.threats.adjacentEnemies || []).filter(
+      (e) =>
+        e &&
+        e.smallID !== candidateEntry.smallID &&
+        (e.tiles || 0) > 0,
+    );
+    return otherOutlets.length === 0;
+  }
+
+  /**
+   * Pick the release-valve ally when we are sealed: the weakest adjacent
+   * non-clanmate ally we could realistically fight once the alliance
+   * expires. Returns the world entry or null.
+   */
+  function chooseAllianceLapseCandidate(myEntry) {
+    if (!myEntry) return null;
+    const seal = runtime.world.threats.diplomaticallySealed;
+    if (!seal) return null;
+    // Don't open a new front while we're already absorbing a real attack.
+    if ((myEntry.incomingTroops || 0) > (myEntry.troops || 0) * 0.25) {
+      return null;
+    }
+    const candidates = (runtime.world.everyone || []).filter(
+      (e) =>
+        e &&
+        !e.isMe &&
+        e.isAlly &&
+        !e.isClanmate &&
+        e.isAdjacent &&
+        (e.tiles || 0) > 0 &&
+        (e.troops || 0) <
+          (myEntry.troops || 0) * RELEASE_VALVE_MAX_TROOP_RATIO,
+    );
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => (a.troops || 0) - (b.troops || 0));
+    return candidates[0];
+  }
+
+  /**
+   * Maintain the planned-lapse book. Called every pass from
+   * maybeExtendAlliances (i.e. every active tick):
+   *   - prune entries whose alliance no longer exists (it expired — the
+   *     ex-ally is now a normal conquest target for the planner);
+   *   - cancel ALL planned lapses the moment the seal lifts (a hostile
+   *     border appeared or the frontier reopened) so we renew normally;
+   *   - when sealed with no lapse pending, schedule exactly one.
+   */
+  function maintainPlannedAllianceLapses(myEntry) {
+    const intel = runtime.intel;
+    if (!intel || !myEntry) return;
+    const alliances = myEntry.alliances || [];
+    const liveIDs = new Set();
+    for (const alliance of alliances) {
+      const id = safeCall(() => alliance.id, null);
+      if (id !== null) liveIDs.add(id);
+    }
+    for (const allianceID of Array.from(intel.plannedLapses.keys())) {
+      if (!liveIDs.has(allianceID)) intel.plannedLapses.delete(allianceID);
+    }
+
+    const seal = runtime.world.threats.diplomaticallySealed;
+    if (!seal) {
+      if (intel.plannedLapses.size > 0) {
+        decisionLog(
+          "alliance: border reopened — cancelling planned lapse(s)",
+        );
+        intel.plannedLapses.clear();
+      }
+      return;
+    }
+    if (intel.plannedLapses.size > 0) return; // one release valve at a time
+
+    const target = chooseAllianceLapseCandidate(myEntry);
+    if (!target) return;
+    const alliance = alliances.find(
+      (a) => safeCall(() => a.other, null) === target.id,
+    );
+    if (!alliance) return;
+    const allianceID = safeCall(() => alliance.id, null);
+    if (allianceID === null) return;
+    intel.plannedLapses.set(allianceID, {
+      smallID: target.smallID,
+      name: target.name,
+      plannedAt: runtime.world.tick || 0,
+    });
+    reasonLog(
+      "DIPLOMACY_RELEASE_VALVE",
+      `Letting the alliance with ${target.name} expire — every land neighbour is an ally and we're out of room.`,
+      `natural expiry carries no traitor debuff; ${seal.alliedNeighborCount} allied border(s)`,
+    );
+    decisionLog(
+      "alliance: planned lapse with " +
+        target.name +
+        " (sealed in by " +
+        seal.alliedNeighborCount +
+        " allied neighbours)",
+    );
+  }
+
   /**
    * Should we accept this incoming alliance request? We accept when the
    * requestor is a plausible partner:
@@ -9060,9 +9252,16 @@
       // future snowballer on nation-dense maps — lock the peace NOW while
       // their alliance AI still rates us "similarly strong". Later (or for
       // Humans) require a real overmatch before we go hat-in-hand.
+      // Seal guard: the marginal early-nation case is a convenience
+      // alliance, so it must never close our last hostile land border.
+      // Genuine overmatch (>= APPEASE_TROOP_RATIO or snowball) still
+      // qualifies — we couldn't conquer that border anyway.
       const earlyNationCase =
-        earlyWindow && entry.type === PlayerType.Nation && ratio >= 1.05;
-      if (ratio >= 1.4 || snowball || earlyNationCase) {
+        earlyWindow &&
+        entry.type === PlayerType.Nation &&
+        ratio >= 1.05 &&
+        !allianceWouldSealBorders(entry);
+      if (ratio >= APPEASE_TROOP_RATIO || snowball || earlyNationCase) {
         candidates.push({ entry, ratio });
       }
     }
@@ -9124,6 +9323,10 @@
     const myEntry = runtime.world.me;
     if (!myEntry) return false;
     const tick = runtime.world.tick || 0;
+    // Release valve for the diplomatic seal: when every land neighbour is
+    // an ally and the frontier is gone, schedule ONE alliance to lapse
+    // naturally (no traitor debuff) instead of renewing everything.
+    safeCall(() => maintainPlannedAllianceLapses(myEntry), null);
     const alliances = myEntry.alliances || [];
     for (const alliance of alliances) {
       let allianceID = null;
@@ -9137,6 +9340,9 @@
       if (allianceID === null || otherID === null || expiresAt === null) {
         continue;
       }
+      // Planned lapse: deliberately withhold the extension request so the
+      // alliance expires on schedule and reopens the border penalty-free.
+      if (runtime.intel.plannedLapses.has(allianceID)) continue;
       if (expiresAt - tick > EXTENSION_WINDOW_TICKS) continue;
       if (expiresAt <= tick) continue;
       const requestedAt = runtime.intel.extensionRequested.get(allianceID);
@@ -9187,6 +9393,17 @@
       requestor.outgoingAttacks.some(
         (a) => safeCall(() => a.targetID, null) === world.meSmallID,
       )
+    ) {
+      return false;
+    }
+    // Seal guard: never let a convenience alliance close our LAST hostile
+    // land border once the frontier is gone — that is the "allied with
+    // every neighbour, locked in unless we betray" trap. Exception: a
+    // requestor strong enough to be an appeasement target (we couldn't
+    // take that border by force, so the alliance costs us nothing).
+    if (
+      allianceWouldSealBorders(requestor) &&
+      (requestor.troops || 0) < (myEntry.troops || 0) * APPEASE_TROOP_RATIO
     ) {
       return false;
     }
@@ -9372,6 +9589,9 @@
         .filter((e) => !e.isMe && !e.isAlly && !e.isClanmate && !e.isFriendly)
         .filter((e) => e.smallID !== crown.smallID)
         .filter((e) => e.type !== PlayerType.Bot)
+        // Seal guard: an anti-crown partner is worthless if allying them
+        // closes our last hostile land border.
+        .filter((e) => !allianceWouldSealBorders(e))
         // Partners must be adjacent to the crown — they can actually pressure.
         .filter((e) =>
           isAdjacentTo(crown.player, e, Array.from(
@@ -9624,6 +9844,12 @@
       if (pType !== PlayerType.Human && pType !== PlayerType.Nation) continue;
       if (safeCall(() => me.isFriendly(p), false)) continue;
       if (safeCall(() => me.isAlliedWith(p), false)) continue;
+      // Seal guard: at spawn the frontier is normally wide open (no-op),
+      // but on cramped maps don't open-blast our only hostile border shut.
+      const worldEntry = runtime.world.bySmallID.get(
+        safeCall(() => p.smallID(), -1),
+      );
+      if (worldEntry && allianceWouldSealBorders(worldEntry)) continue;
 
       // Distance gate: spawnTile if known, else a sampled owned tile.
       let dist = Infinity;
@@ -10942,6 +11168,15 @@
     );
     brewingInvaders.sort((a, b) => (b.strength || 0) - (a.strength || 0));
 
+    // Diplomatic-seal detection. landFrontierOpen tells the planner
+    // whether land expansion is physically possible; diplomaticallySealed
+    // fires when every land border belongs to an ally on top of that.
+    const landFrontierOpen = computeLandFrontierOpen(borderTiles);
+    const diplomaticallySealed = computeDiplomaticSeal(
+      meEntry,
+      landFrontierOpen,
+    );
+
     runtime.world.threats = {
       crownSmallID: crownEntry ? crownEntry.smallID : null,
       crown: crownEntry,
@@ -10961,6 +11196,8 @@
       inboundTroopTotal,
       overwhelmingNeighbor,
       earlyHumanOvermatch,
+      landFrontierOpen,
+      diplomaticallySealed,
     };
   }
 
@@ -12514,6 +12751,14 @@
       evaluate: () => {
         const world = runtime.world;
         if (world.totals.myShare >= 0.5) return { valid: false };
+        // Frontier gate: unclaimed land elsewhere on the map is
+        // unreachable by land attack when no unowned tile touches our
+        // border (e.g. sealed in by allied neighbours). Only an explicit
+        // false blocks — undefined means "not yet computed", keep legacy
+        // behaviour.
+        if (world.threats.landFrontierOpen === false) {
+          return { valid: false };
+        }
         const unowned = Math.max(
           0,
           world.totals.usableLand -
@@ -12599,19 +12844,29 @@
           getGameView().config().boatMaxNumber()) {
           return { valid: false };
         }
-        if (me.troops < 30000) return { valid: false };
+        // Diplomatic seal: every land border belongs to an ally, so water
+        // is the ONLY way to keep growing without betraying. Lower the
+        // troop gate and out-prioritize the (now impossible) land goals
+        // while the release-valve alliance lapse runs down.
+        const sealed = Boolean(world.threats.diplomaticallySealed);
+        if (me.troops < (sealed ? 15000 : 30000)) return { valid: false };
         const soft = world.threats.softTargets.filter((s) => !s.isAdjacent);
+        const riverHops =
+          (world.threats.narrowWaterNeighbors || []).length > 0;
         if (soft.length === 0 && world.archetype !== "ISLAND") {
-          return { valid: false };
+          if (!(sealed && riverHops)) return { valid: false };
         }
-        return {
-          valid: true,
-          priority: world.archetype === "ISLAND" ? 65 : 45,
-          note:
-            world.archetype === "ISLAND"
-              ? "island archetype"
-              : `${soft.length} soft targets across water`,
-        };
+        let priority = 45;
+        let note = `${soft.length} soft targets across water`;
+        if (world.archetype === "ISLAND") {
+          priority = 65;
+          note = "island archetype";
+        }
+        if (sealed) {
+          priority = Math.max(priority, 66);
+          note = "sealed in by allies — expanding overseas";
+        }
+        return { valid: true, priority, note };
       },
       onAct: async () => false,
     },
@@ -14046,6 +14301,7 @@
       runtime.intel.seenAttackIDs.clear();
       runtime.intel.appeaseAttempts.clear();
       runtime.intel.extensionRequested.clear();
+      runtime.intel.plannedLapses.clear();
       // v2.16: fresh match — arm result detection and clear any pending
       // auto-requeue exit from the previous game.
       runtime.session.resultRecorded = false;
@@ -15895,6 +16151,8 @@
         inboundTroopTotal: 0,
         overwhelmingNeighbor: null,
         earlyHumanOvermatch: null,
+        landFrontierOpen: true,
+        diplomaticallySealed: null,
       },
       archetype: "CONTINENTAL",
       archetypeLocked: null,
@@ -16537,6 +16795,234 @@
       pass: stallQuiet === false,
     });
 
+    // Scenarios 20–25: diplomatic seal ("allied ourselves into a box").
+    //
+    // The trap: we ally every land neighbour, terra nullius dries up, and
+    // the only land route to growth is betrayal (traitor debuff). These
+    // scenarios exercise the prevention gate (allianceWouldSealBorders),
+    // the escape valve (planned alliance lapse), and the planner rerouting
+    // (NAVAL_LAND_GRAB boost + TERRA_NULLIUS_RUSH frontier gate).
+    function makeSealNeighbor(smallID, overrides) {
+      return Object.assign(
+        {
+          smallID,
+          name: "Ally" + smallID,
+          id: "player-" + smallID,
+          type: PlayerType.Nation,
+          isMe: false,
+          isAlly: true,
+          isClanmate: false,
+          isFriendly: true,
+          isAdjacent: true,
+          isTraitor: false,
+          tiles: 800,
+          troops: 20_000,
+          outgoingAttacks: [],
+          player: { relation: () => 1, isTraitor: () => false },
+        },
+        overrides || {},
+      );
+    }
+
+    // Scenario 20: seal detection + last-outlet gate.
+    const scenario20 = buildTestWorld();
+    scenario20.me.troops = 40_000;
+    const sealAllyA = makeSealNeighbor(21);
+    const sealAllyB = makeSealNeighbor(22, { troops: 60_000 });
+    const lastOutlet = makeSealNeighbor(23, {
+      name: "LastOutlet",
+      isAlly: false,
+      isFriendly: false,
+      troops: 15_000,
+    });
+    scenario20.everyone = [scenario20.me, sealAllyA, sealAllyB, lastOutlet];
+    scenario20.threats.adjacentEnemies = [lastOutlet];
+    scenario20.threats.landFrontierOpen = false;
+    runtime.world = scenario20;
+    const sealWhileHostileLeft = computeDiplomaticSeal(scenario20.me, false);
+    const wouldSealLastOutlet = allianceWouldSealBorders(lastOutlet);
+    scenario20.threats.landFrontierOpen = true;
+    const wouldSealFrontierOpen = allianceWouldSealBorders(lastOutlet);
+    results.push({
+      name:
+        "diplomatic seal: hostile border left -> not sealed; allying it would seal (unless frontier open)",
+      expected: "null,true,false",
+      actual:
+        (sealWhileHostileLeft === null ? "null" : "set") +
+        "," +
+        wouldSealLastOutlet +
+        "," +
+        wouldSealFrontierOpen,
+      pass:
+        sealWhileHostileLeft === null &&
+        wouldSealLastOutlet === true &&
+        wouldSealFrontierOpen === false,
+    });
+
+    // Scenario 21: fully sealed world is detected.
+    const scenario21 = buildTestWorld();
+    scenario21.me.troops = 40_000;
+    const sealedAllies = [makeSealNeighbor(21), makeSealNeighbor(22)];
+    scenario21.everyone = [scenario21.me].concat(sealedAllies);
+    scenario21.threats.adjacentEnemies = [];
+    scenario21.threats.landFrontierOpen = false;
+    runtime.world = scenario21;
+    const seal21 = computeDiplomaticSeal(scenario21.me, false);
+    results.push({
+      name: "diplomatic seal: all land neighbours allied + frontier gone -> sealed",
+      expected: "2",
+      actual: seal21 === null ? "null" : String(seal21.alliedNeighborCount),
+      pass: seal21 !== null && seal21.alliedNeighborCount === 2,
+    });
+
+    // Scenario 22: incoming alliance that would seal us is refused unless
+    // the requestor is an appeasement-grade threat.
+    const scenario22 = buildTestWorld();
+    scenario22.me.troops = 40_000;
+    const weakSealer = makeSealNeighbor(31, {
+      name: "WeakSealer",
+      isAlly: false,
+      isFriendly: false,
+      type: PlayerType.Human,
+      troops: 30_000,
+      strength: 45_000,
+    });
+    scenario22.everyone = [scenario22.me, weakSealer];
+    scenario22.bySmallID = new Map([
+      [1, scenario22.me],
+      [31, weakSealer],
+    ]);
+    scenario22.threats.adjacentEnemies = [weakSealer];
+    scenario22.threats.landFrontierOpen = false;
+    runtime.world = scenario22;
+    const refuseSealer = shouldAcceptIncomingAlliance(
+      weakSealer,
+      scenario22.me,
+    );
+    weakSealer.troops = 70_000; // >= APPEASE_TROOP_RATIO x our 40k
+    weakSealer.strength = 90_000;
+    const acceptAppeasement = shouldAcceptIncomingAlliance(
+      weakSealer,
+      scenario22.me,
+    );
+    results.push({
+      name:
+        "seal guard: refuse alliance closing last border, accept when appeasement-grade",
+      expected: "false,true",
+      actual: refuseSealer + "," + acceptAppeasement,
+      pass: refuseSealer === false && acceptAppeasement === true,
+    });
+
+    // Scenario 23: release-valve pick — weakest adjacent non-clanmate
+    // ally we can realistically fight after expiry.
+    const scenario23 = buildTestWorld();
+    scenario23.me.troops = 40_000;
+    const lapseWeak = makeSealNeighbor(41, { name: "Weakest", troops: 9_000 });
+    const lapseMid = makeSealNeighbor(42, { name: "Mid", troops: 20_000 });
+    const lapseGiant = makeSealNeighbor(43, {
+      name: "Giant",
+      troops: 90_000, // above RELEASE_VALVE_MAX_TROOP_RATIO — never pick
+    });
+    scenario23.everyone = [scenario23.me, lapseWeak, lapseMid, lapseGiant];
+    scenario23.threats.adjacentEnemies = [];
+    scenario23.threats.landFrontierOpen = false;
+    scenario23.threats.diplomaticallySealed = {
+      neighbors: [lapseWeak, lapseMid, lapseGiant],
+      alliedNeighborCount: 3,
+    };
+    runtime.world = scenario23;
+    const lapsePick = chooseAllianceLapseCandidate(scenario23.me);
+    scenario23.threats.diplomaticallySealed = null;
+    const lapseNoSeal = chooseAllianceLapseCandidate(scenario23.me);
+    results.push({
+      name: "release valve: picks weakest adjacent ally, only while sealed",
+      expected: "Weakest,null",
+      actual:
+        (lapsePick ? lapsePick.name : "null") +
+        "," +
+        (lapseNoSeal ? lapseNoSeal.name : "null"),
+      pass:
+        lapsePick !== null &&
+        lapsePick.name === "Weakest" &&
+        lapseNoSeal === null,
+    });
+
+    // Scenario 24: planner reroute — sealed + soft target across water
+    // selects NAVAL_LAND_GRAB even below the normal 30k troop gate, and
+    // TERRA_NULLIUS_RUSH is invalid with the frontier closed.
+    const scenario24 = buildTestWorld();
+    scenario24.me.troops = 16_000;
+    scenario24.threats.landFrontierOpen = false;
+    scenario24.threats.diplomaticallySealed = {
+      neighbors: [],
+      alliedNeighborCount: 3,
+    };
+    scenario24.threats.softTargets = [
+      {
+        smallID: 55,
+        name: "Overseas Soft",
+        isAdjacent: false,
+        isFriendly: false,
+        troops: 4_000,
+        opportunityScore: 45,
+      },
+    ];
+    step(
+      "sealed by allies + water target -> NAVAL_LAND_GRAB",
+      scenario24,
+      "NAVAL_LAND_GRAB",
+    );
+
+    // Scenario 25: frontier gate — the default open-frontier world picks
+    // TERRA_NULLIUS_RUSH; closing the frontier must deselect it.
+    const scenario25open = buildTestWorld();
+    step(
+      "open frontier -> TERRA_NULLIUS_RUSH",
+      scenario25open,
+      "TERRA_NULLIUS_RUSH",
+    );
+    const scenario25closed = buildTestWorld();
+    scenario25closed.threats.landFrontierOpen = false;
+    step("closed frontier -> not TERRA_NULLIUS_RUSH", scenario25closed, null);
+    const frontierResult = results[results.length - 1];
+    frontierResult.expected = "!TERRA_NULLIUS_RUSH";
+    frontierResult.pass = frontierResult.actual !== "TERRA_NULLIUS_RUSH";
+
+    // Scenario 26: planned-lapse lifecycle — schedule while sealed, skip
+    // the extension for that alliance, cancel when the seal lifts.
+    const scenario26 = buildTestWorld();
+    scenario26.me.troops = 40_000;
+    const lapseAlly = makeSealNeighbor(61, {
+      name: "ReleaseValve",
+      troops: 12_000,
+    });
+    scenario26.me.alliances = [
+      { id: 601, other: "player-61", expiresAt: 2000 },
+    ];
+    scenario26.everyone = [scenario26.me, lapseAlly];
+    scenario26.threats.adjacentEnemies = [];
+    scenario26.threats.landFrontierOpen = false;
+    scenario26.threats.diplomaticallySealed = {
+      neighbors: [lapseAlly],
+      alliedNeighborCount: 1,
+    };
+    runtime.world = scenario26;
+    const stashedLapses = runtime.intel.plannedLapses;
+    runtime.intel.plannedLapses = new Map();
+    maintainPlannedAllianceLapses(scenario26.me);
+    const lapsePlanned = runtime.intel.plannedLapses.has(601);
+    scenario26.threats.diplomaticallySealed = null;
+    maintainPlannedAllianceLapses(scenario26.me);
+    const lapseCancelled = !runtime.intel.plannedLapses.has(601);
+    runtime.intel.plannedLapses = stashedLapses;
+    results.push({
+      name: "planned lapse: scheduled while sealed, cancelled when border reopens",
+      expected: "true,true",
+      actual: lapsePlanned + "," + lapseCancelled,
+      pass: lapsePlanned === true && lapseCancelled === true,
+    });
+    runtime.world = previous;
+
     // Scenario 6: parabolic SAM check should mark fewer trajectories as
     // intercepted than the linear approximation when the SAM sits on the
     // straight line between silo and target but NOT under the parabolic
@@ -16853,6 +17339,16 @@
         pickAppeasementTarget,
         maybeAppeaseThreats,
         maybeExtendAlliances,
+        // Diplomatic-seal helpers (prevent / escape the "allied with every
+        // neighbour, locked in unless we betray" trap).
+        computeLandFrontierOpen,
+        computeDiplomaticSeal,
+        allianceWouldSealBorders,
+        chooseAllianceLapseCandidate,
+        maintainPlannedAllianceLapses,
+        shouldAcceptIncomingAlliance,
+        RELEASE_VALVE_MAX_TROOP_RATIO,
+        APPEASE_TROOP_RATIO,
         // v3.1 Overlord-merge defense-floor helpers.
         enemyCommittableTroops,
         computeDefenseFloor,
