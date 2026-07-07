@@ -544,6 +544,13 @@
         inboundTroopTotal: 0,
         overwhelmingNeighbor: null,
         earlyHumanOvermatch: null,
+        // Is there any unowned land tile directly on our border? False
+        // means land expansion is physically impossible this tick.
+        landFrontierOpen: true,
+        // Set when EVERY land neighbour is friendly AND the terra
+        // nullius frontier is gone — the "allied ourselves into a box"
+        // trap. { neighbors, alliedNeighborCount } or null.
+        diplomaticallySealed: null,
       },
       archetype: "unknown",
       archetypeLocked: null, // manual override from overlay
@@ -603,6 +610,11 @@
       // after 5 minutes; without renewal our nation appeasements silently
       // lapse mid-game and the ex-ally becomes an invader again.
       extensionRequested: new Map(),
+      // allianceID -> { smallID, name, plannedAt }. Alliances we have
+      // deliberately decided to let EXPIRE (no traitor debuff, unlike a
+      // break) because every land neighbour is an ally and we're out of
+      // room to grow. See maintainPlannedAllianceLapses.
+      plannedLapses: new Map(),
     },
     /**
      * Auto-queue session (v2.16). Tracks the match result (win/loss) once
@@ -7557,6 +7569,131 @@
    * Chooses a patrol tile near our port cluster so the warship spawns at a
    * legal friendly port.
    */
+  // ------------------------------------------------------------------
+  // Warship fleet posture.
+  //
+  // Warships patrol our coast, intercept inbound enemy transports,
+  // protect trade ships, and are REQUIRED for parity before
+  // isNavalInvasionSafe lets a long-range invasion sail past enemy
+  // warships. The old rules only floated a hull on ISLAND maps or when
+  // an enemy already had warships while we had ZERO — on ordinary
+  // coastal maps the bot never built a single warship, which in turn
+  // kept the naval-safety gate permanently red and shut down the whole
+  // naval game. Three tiers now feed a fleet target:
+  //   - parity: match enemy warship counts (capped) so escorts unblock
+  //     invasions — highest priority;
+  //   - island floor: keep 2 hulls on ISLAND archetype (unchanged);
+  //   - coastal screen: one standing hull whenever we own a port and
+  //     the gold cushion is comfortable.
+  // ------------------------------------------------------------------
+  const WARSHIP_FLEET_CAP = 3;
+  // Cities-first discipline: no screen hull until the core economy stands.
+  const WARSHIP_SCREEN_MIN_CITIES = 2;
+  // Build the screen only with a 2x gold cushion so cities/SAMs still
+  // come first when gold is tight.
+  const WARSHIP_SCREEN_GOLD_CUSHION = 2;
+
+  /** Mirrors DefaultConfig's warship cost curve: min(1M, (n+1) x 250k). */
+  function estimateNextWarshipCost(currentCount) {
+    return Math.min(1_000_000, (currentCount + 1) * 250_000);
+  }
+
+  /**
+   * Compute how many warships we WANT right now plus the dominating
+   * reason. `me` is a world-model entry (plain fields, not a PlayerView).
+   * Returns { target, reason } where reason is one of "parity",
+   * "island", "screen" (or "" when target is 0).
+   */
+  function computeWarshipFleetTarget(me, weHave, enemyWarships) {
+    if (!me) return { target: 0, reason: "" };
+    let target = 0;
+    let reason = "";
+    if (
+      (me.structures[UnitType.Port] || 0) > 0 &&
+      (me.structures[UnitType.City] || 0) >= WARSHIP_SCREEN_MIN_CITIES &&
+      (me.gold || 0) >=
+        estimateNextWarshipCost(weHave) * WARSHIP_SCREEN_GOLD_CUSHION
+    ) {
+      target = 1;
+      reason = "screen";
+    }
+    if (runtime.world.archetype === "ISLAND" && target < 2) {
+      target = 2;
+      reason = "island";
+    }
+    const parity = Math.min(enemyWarships || 0, WARSHIP_FLEET_CAP);
+    if (parity > target) {
+      target = parity;
+      reason = "parity";
+    }
+    return { target, reason };
+  }
+
+  /** Sum of visible warships owned by non-friendly players. */
+  function countEnemyWarships() {
+    const enemies = (runtime.world.everyone || []).filter(
+      (p) => p && !p.isMe && !p.isFriendly,
+    );
+    return enemies.reduce(
+      (sum, e) =>
+        sum + safeCall(() => e.player.units(UnitType.Warship).length, 0),
+      0,
+    );
+  }
+
+  // Background fleet upkeep cadence. The WARSHIP_DEFENSE goal alone is
+  // not enough: on busy maps some land goal always outranks it in the
+  // planner, so the bot never floated a single hull. Fleet upkeep now
+  // ALSO runs as an always-on pass from runModulesForTick (like the
+  // appeasement / alliance-extension passes) — a cheap no-op whenever
+  // the fleet target is already met.
+  const WARSHIP_MAINTENANCE_INTERVAL_TICKS = 90;
+
+  async function maybeMaintainWarshipFleet(me) {
+    const gameView = getGameView();
+    if (!gameView || !me) return false;
+    if (
+      safeCall(
+        () => gameView.config().isUnitDisabled(UnitType.Warship),
+        false,
+      )
+    ) {
+      return false;
+    }
+    const tick = gameView.ticks();
+    if (
+      tick - runtime.state.cooldowns.warship <
+      WARSHIP_MAINTENANCE_INTERVAL_TICKS
+    ) {
+      return false;
+    }
+    const meEntry = runtime.world.me;
+    if (!meEntry) return false;
+    if ((meEntry.structures[UnitType.Port] || 0) === 0) return false;
+    const weHave = getMyUnitsOfType(UnitType.Warship).length;
+    const fleet = computeWarshipFleetTarget(
+      meEntry,
+      weHave,
+      countEnemyWarships(),
+    );
+    if (weHave >= fleet.target) return false;
+    // Require 1.5x the hull cost before dispatching. The engine
+    // re-validates affordability when WarshipExecution inits one tick
+    // later, and same-turn economy spends (city/factory builds) race us
+    // for the same purse — with no cushion the spawn fails with
+    // "Failed to spawn warship" and the gold is simply wasted time.
+    if ((meEntry.gold || 0) < estimateNextWarshipCost(weHave) * 1.5) {
+      return false;
+    }
+    const acted = await runGoal_WarshipDefense(me);
+    if (!acted) {
+      // No buildable ocean tile right now — back off for a full
+      // maintenance interval instead of re-querying buildables every tick.
+      runtime.state.cooldowns.warship = tick;
+    }
+    return acted;
+  }
+
   async function runGoal_WarshipDefense(me) {
     const gameView = getGameView();
     if (!gameView || !me) return false;
@@ -7588,12 +7725,20 @@
       if (!buildable || buildable.canBuild === false) continue;
       if (sendBuild(UnitType.Warship, tile)) {
         runtime.state.cooldowns.warship = tick;
+        const weHave = getMyUnitsOfType(UnitType.Warship).length;
+        const fleet = computeWarshipFleetTarget(
+          runtime.world.me,
+          weHave,
+          countEnemyWarships(),
+        );
         reasonLog(
           "WARSHIP_DEFENSE",
           "Building a warship to patrol our coast and intercept enemy boats.",
-          runtime.world.archetype === "ISLAND"
-            ? "island map — pirates hit hard here"
-            : "enemy warships spotted",
+          fleet.reason === "parity"
+            ? "matching enemy warships so our boats can sail"
+            : fleet.reason === "island"
+              ? "island map — pirates hit hard here"
+              : "standing coastal screen",
         );
         return true;
       }
@@ -8511,10 +8656,41 @@
     return false;
   }
 
+  // Cross-water "prey" threshold. A target under 30% of our troops is
+  // guaranteed to clear the 1.0x speed-saturation payload guard (payload
+  // caps at 35% of our troops), so shipping a wave at them is always a
+  // profitable use of surplus army. Previously naval conquest required a
+  // SOFT_TARGET classification (weak/afk/traitor), which meant a coastal
+  // bot with a huge army would sit at "no invasions" forever while
+  // perfectly edible mid-sized players lived across the water.
+  const NAVAL_PREY_TROOP_RATIO = 0.3;
+
+  /**
+   * Hostile players reachable only by water (not land-adjacent), alive,
+   * and small enough relative to our army that one transport wave can
+   * saturate their defense. Sorted weakest-first so we snowball through
+   * the easiest meals. `meEntry` is the world-model entry.
+   */
+  function findNavalPreyTargets(meEntry) {
+    if (!meEntry) return [];
+    const prey = (runtime.world.everyone || []).filter(
+      (e) =>
+        e &&
+        !e.isMe &&
+        !e.isFriendly &&
+        !e.isAdjacent &&
+        (e.tiles || 0) > 0 &&
+        (e.troops || 0) < (meEntry.troops || 0) * NAVAL_PREY_TROOP_RATIO,
+    );
+    prey.sort((a, b) => (a.troops || 0) - (b.troops || 0));
+    return prey;
+  }
+
   /**
    * Aggressive naval land-grab. In ISLAND archetype we sniff out uncontested
    * small islands via BFS; otherwise we invade the weakest soft target across
-   * water. Never exceeds `boatMaxNumber` boats in flight.
+   * water, falling back to overmatch prey (< NAVAL_PREY_TROOP_RATIO of our
+   * troops). Never exceeds `boatMaxNumber` boats in flight.
    */
   async function runGoal_NavalLandGrab(me) {
     const gameView = getGameView();
@@ -8571,10 +8747,12 @@
       }
     }
 
-    // Continental: invade the weakest structure-rich soft target.
-    const target = runtime.world.threats.softTargets.find(
+    // Continental: invade the weakest structure-rich soft target, falling
+    // back to the weakest overmatch prey across the water.
+    const soft = runtime.world.threats.softTargets.find(
       (s) => !s.isAdjacent && s.opportunityScore > 30,
     );
+    const target = soft || findNavalPreyTargets(runtime.world.me)[0] || null;
     if (!target) return false;
     const structureTiles = gatherStructureTiles(target.player);
     const candidates = uniqueBy(
@@ -8602,13 +8780,20 @@
         );
         continue;
       }
-      const boatPayload = clamp(Math.floor(available * 0.3), 8000, 30000);
-      // Plan §2.3: boat troop payload should clear the 1.0x speed-
-      // saturation point vs the target. Soft targets by definition are
-      // weaker than us, so the 30%-of-available formula usually clears
-      // — but guard anyway so a misclassified "soft" target with
-      // comparable troops doesn't receive an under-saturated shipment.
+      // Plan §2.3: boat troop payload must clear the 1.0x speed-
+      // saturation point vs the target — below the defender's troop count
+      // the landing conquers slowly with elevated losses. The payload
+      // therefore scales UP to the target's army when our budget allows
+      // (the old hard 30k cap silently disqualified every target with
+      // >30k standing troops no matter how huge our own army was).
       const targetTroops = target.troops || 0;
+      const baselinePayload = Math.floor(available * 0.3);
+      const saturationPayload = Math.ceil(targetTroops * 1.1);
+      const boatPayload = clamp(
+        Math.max(baselinePayload, saturationPayload),
+        8000,
+        Math.floor(me.troops() * 0.35),
+      );
       if (targetTroops > 0 && boatPayload < targetTroops) {
         decisionLog(
           "land-grab boat skip " +
@@ -9008,6 +9193,186 @@
     );
   }
 
+  // ------------------------------------------------------------------
+  // Diplomatic-seal detection ("allied ourselves into a box").
+  //
+  // The classic FFA trap: we ally every land neighbour, terra nullius
+  // dries up, and suddenly the only way to grow is betrayal — which costs
+  // the traitor debuff (50% defense for 30s) and sours every nearby
+  // player. Three coordinated defenses:
+  //   1. PREVENT — never form the alliance that would close our LAST
+  //      hostile land border once the frontier is gone
+  //      (allianceWouldSealBorders, checked at every alliance-forming
+  //      callsite).
+  //   2. ESCAPE — when we're already sealed, deliberately let the least
+  //      valuable alliance EXPIRE instead of breaking it. Natural expiry
+  //      (AllianceImpl.expire) carries NO traitor penalty — we just stop
+  //      requesting the extension (maintainPlannedAllianceLapses).
+  //   3. REROUTE — while waiting for the lapse, the planner biases toward
+  //      overseas / river expansion (NAVAL_LAND_GRAB seal boost) and
+  //      stops selecting land expansion it cannot execute
+  //      (TERRA_NULLIUS_RUSH frontier gate).
+  // ------------------------------------------------------------------
+
+  // Never plan a lapse against an ally who could roll us once the pact
+  // ends. 1.1× keeps a little tolerance for parity neighbours.
+  const RELEASE_VALVE_MAX_TROOP_RATIO = 1.1;
+  // A neighbour at or above this troop ratio is someone we appease for
+  // survival — those alliances are allowed even when they seal us in,
+  // because we couldn't conquer that border anyway.
+  const APPEASE_TROOP_RATIO = 1.4;
+
+  /**
+   * Is there ANY unowned land tile directly adjacent to our border?
+   * Early-exits on the first hit so the common (open frontier) case costs
+   * almost nothing.
+   */
+  function computeLandFrontierOpen(borderTiles) {
+    const gameView = getGameView();
+    if (!gameView || !borderTiles || borderTiles.length === 0) return false;
+    for (const tile of borderTiles) {
+      for (const neighbor of gameView.neighbors(tile)) {
+        if (!safeCall(() => gameView.isLand(neighbor), false)) continue;
+        if (gameView.ownerID(neighbor) === 0) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Detect the sealed state: at least one living land neighbour, ALL of
+   * them friendly, and no terra nullius left on our border. Relies on
+   * entry.isAdjacent being freshly computed by computeThreats' main loop.
+   * Returns { neighbors, alliedNeighborCount } or null.
+   */
+  function computeDiplomaticSeal(meEntry, landFrontierOpen) {
+    if (!meEntry || landFrontierOpen) return null;
+    const world = runtime.world;
+    const adjacentAlive = (world.everyone || []).filter(
+      (e) => e && !e.isMe && e.isAdjacent && (e.tiles || 0) > 0,
+    );
+    if (adjacentAlive.length === 0) return null;
+    if (adjacentAlive.some((e) => !e.isFriendly)) return null;
+    return {
+      neighbors: adjacentAlive,
+      alliedNeighborCount: adjacentAlive.length,
+    };
+  }
+
+  /**
+   * Would allying this candidate close our LAST hostile land border while
+   * the terra nullius frontier is already gone? Checked before every
+   * alliance we initiate or accept, so the seal never forms out of mere
+   * convenience. Survival-driven appeasement (>= APPEASE_TROOP_RATIO×
+   * our troops) bypasses this at the callsites — we couldn't take that
+   * border by force anyway, so allying it costs us nothing.
+   */
+  function allianceWouldSealBorders(candidateEntry) {
+    const world = runtime.world;
+    if (!world || !world.me || !candidateEntry) return false;
+    if (!candidateEntry.isAdjacent) return false;
+    // Frontier open (or not yet computed): land expansion still possible,
+    // an extra alliance can't lock us in.
+    if (world.threats.landFrontierOpen !== false) return false;
+    const otherOutlets = (world.threats.adjacentEnemies || []).filter(
+      (e) =>
+        e &&
+        e.smallID !== candidateEntry.smallID &&
+        (e.tiles || 0) > 0,
+    );
+    return otherOutlets.length === 0;
+  }
+
+  /**
+   * Pick the release-valve ally when we are sealed: the weakest adjacent
+   * non-clanmate ally we could realistically fight once the alliance
+   * expires. Returns the world entry or null.
+   */
+  function chooseAllianceLapseCandidate(myEntry) {
+    if (!myEntry) return null;
+    const seal = runtime.world.threats.diplomaticallySealed;
+    if (!seal) return null;
+    // Don't open a new front while we're already absorbing a real attack.
+    if ((myEntry.incomingTroops || 0) > (myEntry.troops || 0) * 0.25) {
+      return null;
+    }
+    const candidates = (runtime.world.everyone || []).filter(
+      (e) =>
+        e &&
+        !e.isMe &&
+        e.isAlly &&
+        !e.isClanmate &&
+        e.isAdjacent &&
+        (e.tiles || 0) > 0 &&
+        (e.troops || 0) <
+          (myEntry.troops || 0) * RELEASE_VALVE_MAX_TROOP_RATIO,
+    );
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => (a.troops || 0) - (b.troops || 0));
+    return candidates[0];
+  }
+
+  /**
+   * Maintain the planned-lapse book. Called every pass from
+   * maybeExtendAlliances (i.e. every active tick):
+   *   - prune entries whose alliance no longer exists (it expired — the
+   *     ex-ally is now a normal conquest target for the planner);
+   *   - cancel ALL planned lapses the moment the seal lifts (a hostile
+   *     border appeared or the frontier reopened) so we renew normally;
+   *   - when sealed with no lapse pending, schedule exactly one.
+   */
+  function maintainPlannedAllianceLapses(myEntry) {
+    const intel = runtime.intel;
+    if (!intel || !myEntry) return;
+    const alliances = myEntry.alliances || [];
+    const liveIDs = new Set();
+    for (const alliance of alliances) {
+      const id = safeCall(() => alliance.id, null);
+      if (id !== null) liveIDs.add(id);
+    }
+    for (const allianceID of Array.from(intel.plannedLapses.keys())) {
+      if (!liveIDs.has(allianceID)) intel.plannedLapses.delete(allianceID);
+    }
+
+    const seal = runtime.world.threats.diplomaticallySealed;
+    if (!seal) {
+      if (intel.plannedLapses.size > 0) {
+        decisionLog(
+          "alliance: border reopened — cancelling planned lapse(s)",
+        );
+        intel.plannedLapses.clear();
+      }
+      return;
+    }
+    if (intel.plannedLapses.size > 0) return; // one release valve at a time
+
+    const target = chooseAllianceLapseCandidate(myEntry);
+    if (!target) return;
+    const alliance = alliances.find(
+      (a) => safeCall(() => a.other, null) === target.id,
+    );
+    if (!alliance) return;
+    const allianceID = safeCall(() => alliance.id, null);
+    if (allianceID === null) return;
+    intel.plannedLapses.set(allianceID, {
+      smallID: target.smallID,
+      name: target.name,
+      plannedAt: runtime.world.tick || 0,
+    });
+    reasonLog(
+      "DIPLOMACY_RELEASE_VALVE",
+      `Letting the alliance with ${target.name} expire — every land neighbour is an ally and we're out of room.`,
+      `natural expiry carries no traitor debuff; ${seal.alliedNeighborCount} allied border(s)`,
+    );
+    decisionLog(
+      "alliance: planned lapse with " +
+        target.name +
+        " (sealed in by " +
+        seal.alliedNeighborCount +
+        " allied neighbours)",
+    );
+  }
+
   /**
    * Should we accept this incoming alliance request? We accept when the
    * requestor is a plausible partner:
@@ -9060,9 +9425,16 @@
       // future snowballer on nation-dense maps — lock the peace NOW while
       // their alliance AI still rates us "similarly strong". Later (or for
       // Humans) require a real overmatch before we go hat-in-hand.
+      // Seal guard: the marginal early-nation case is a convenience
+      // alliance, so it must never close our last hostile land border.
+      // Genuine overmatch (>= APPEASE_TROOP_RATIO or snowball) still
+      // qualifies — we couldn't conquer that border anyway.
       const earlyNationCase =
-        earlyWindow && entry.type === PlayerType.Nation && ratio >= 1.05;
-      if (ratio >= 1.4 || snowball || earlyNationCase) {
+        earlyWindow &&
+        entry.type === PlayerType.Nation &&
+        ratio >= 1.05 &&
+        !allianceWouldSealBorders(entry);
+      if (ratio >= APPEASE_TROOP_RATIO || snowball || earlyNationCase) {
         candidates.push({ entry, ratio });
       }
     }
@@ -9124,6 +9496,10 @@
     const myEntry = runtime.world.me;
     if (!myEntry) return false;
     const tick = runtime.world.tick || 0;
+    // Release valve for the diplomatic seal: when every land neighbour is
+    // an ally and the frontier is gone, schedule ONE alliance to lapse
+    // naturally (no traitor debuff) instead of renewing everything.
+    safeCall(() => maintainPlannedAllianceLapses(myEntry), null);
     const alliances = myEntry.alliances || [];
     for (const alliance of alliances) {
       let allianceID = null;
@@ -9137,6 +9513,9 @@
       if (allianceID === null || otherID === null || expiresAt === null) {
         continue;
       }
+      // Planned lapse: deliberately withhold the extension request so the
+      // alliance expires on schedule and reopens the border penalty-free.
+      if (runtime.intel.plannedLapses.has(allianceID)) continue;
       if (expiresAt - tick > EXTENSION_WINDOW_TICKS) continue;
       if (expiresAt <= tick) continue;
       const requestedAt = runtime.intel.extensionRequested.get(allianceID);
@@ -9187,6 +9566,17 @@
       requestor.outgoingAttacks.some(
         (a) => safeCall(() => a.targetID, null) === world.meSmallID,
       )
+    ) {
+      return false;
+    }
+    // Seal guard: never let a convenience alliance close our LAST hostile
+    // land border once the frontier is gone — that is the "allied with
+    // every neighbour, locked in unless we betray" trap. Exception: a
+    // requestor strong enough to be an appeasement target (we couldn't
+    // take that border by force, so the alliance costs us nothing).
+    if (
+      allianceWouldSealBorders(requestor) &&
+      (requestor.troops || 0) < (myEntry.troops || 0) * APPEASE_TROOP_RATIO
     ) {
       return false;
     }
@@ -9372,6 +9762,9 @@
         .filter((e) => !e.isMe && !e.isAlly && !e.isClanmate && !e.isFriendly)
         .filter((e) => e.smallID !== crown.smallID)
         .filter((e) => e.type !== PlayerType.Bot)
+        // Seal guard: an anti-crown partner is worthless if allying them
+        // closes our last hostile land border.
+        .filter((e) => !allianceWouldSealBorders(e))
         // Partners must be adjacent to the crown — they can actually pressure.
         .filter((e) =>
           isAdjacentTo(crown.player, e, Array.from(
@@ -9624,6 +10017,12 @@
       if (pType !== PlayerType.Human && pType !== PlayerType.Nation) continue;
       if (safeCall(() => me.isFriendly(p), false)) continue;
       if (safeCall(() => me.isAlliedWith(p), false)) continue;
+      // Seal guard: at spawn the frontier is normally wide open (no-op),
+      // but on cramped maps don't open-blast our only hostile border shut.
+      const worldEntry = runtime.world.bySmallID.get(
+        safeCall(() => p.smallID(), -1),
+      );
+      if (worldEntry && allianceWouldSealBorders(worldEntry)) continue;
 
       // Distance gate: spawnTile if known, else a sampled owned tile.
       let dist = Infinity;
@@ -10942,6 +11341,15 @@
     );
     brewingInvaders.sort((a, b) => (b.strength || 0) - (a.strength || 0));
 
+    // Diplomatic-seal detection. landFrontierOpen tells the planner
+    // whether land expansion is physically possible; diplomaticallySealed
+    // fires when every land border belongs to an ally on top of that.
+    const landFrontierOpen = computeLandFrontierOpen(borderTiles);
+    const diplomaticallySealed = computeDiplomaticSeal(
+      meEntry,
+      landFrontierOpen,
+    );
+
     runtime.world.threats = {
       crownSmallID: crownEntry ? crownEntry.smallID : null,
       crown: crownEntry,
@@ -10961,6 +11369,8 @@
       inboundTroopTotal,
       overwhelmingNeighbor,
       earlyHumanOvermatch,
+      landFrontierOpen,
+      diplomaticallySealed,
     };
   }
 
@@ -11836,8 +12246,8 @@
       "We are the dominant #1 — close out the game.\n" +
       "Fires at ≥30% share with a clear lead (or when the plan is in ENDGAME). Relentlessly converts our army into conquest toward the 80% win line instead of turtling on a lead.",
     NAVAL_LAND_GRAB:
-      "Water-hop to soft targets or claim an island start.\n" +
-      "Needs ≥30k troops and boat capacity available. Fires for soft targets across water, or automatically on ISLAND archetype maps where we have to hop to expand at all.",
+      "Water-hop to soft targets or overmatch prey, or claim an island start.\n" +
+      "Needs ≥30k troops (15k when sealed in by allies) and boat capacity available. Fires for soft targets across water, for any cross-water player under 30% of our troops (one wave saturates them), or automatically on ISLAND archetype maps where we have to hop to expand at all.",
     CHOKEPOINT_LOCK:
       "Seal a bottleneck on choke-heavy maps.\n" +
       "Only active on CHOKE_HEAVY archetype while we're under 35% share. Builds DefensePosts up to ~0.75 × city count so the natural terrain funnel becomes a kill-channel.",
@@ -11852,7 +12262,7 @@
       "Extremely gated: alliance-break budget must be available, the ally must be confirmed-helpless over multiple ticks, no dangerous hostile nearby, and nobody hostile owns a MIRV. Only fires when the traitor debuff is clearly worth it.",
     WARSHIP_DEFENSE:
       "Keep a warship screen up around our ports.\n" +
-      "Requires ≥1 Port. Builds up to 2 warships on ISLAND maps, and matches enemy warship counts on the rest — so enemy transports can't just drive tiles into our ports.",
+      "Requires ≥1 Port. Maintains a standing coastal patrol hull once we have 2+ cities and a 2x gold cushion, keeps 2 hulls on ISLAND maps, and matches enemy warship counts (up to 3) — parity is what lets our own invasions sail past enemy patrols.",
     RIVER_CROSSING:
       "Short-hop transport across a river or narrow strait.\n" +
       "Fires when an enemy is within a handful of water tiles of one of our border tiles. Narrow gaps are too short for enemy warships to meaningfully intercept, so we use a light transport load and the naval safety gate skips the warship check for short hops.",
@@ -12514,6 +12924,14 @@
       evaluate: () => {
         const world = runtime.world;
         if (world.totals.myShare >= 0.5) return { valid: false };
+        // Frontier gate: unclaimed land elsewhere on the map is
+        // unreachable by land attack when no unowned tile touches our
+        // border (e.g. sealed in by allied neighbours). Only an explicit
+        // false blocks — undefined means "not yet computed", keep legacy
+        // behaviour.
+        if (world.threats.landFrontierOpen === false) {
+          return { valid: false };
+        }
         const unowned = Math.max(
           0,
           world.totals.usableLand -
@@ -12599,19 +13017,37 @@
           getGameView().config().boatMaxNumber()) {
           return { valid: false };
         }
-        if (me.troops < 30000) return { valid: false };
+        // Diplomatic seal: every land border belongs to an ally, so water
+        // is the ONLY way to keep growing without betraying. Lower the
+        // troop gate and out-prioritize the (now impossible) land goals
+        // while the release-valve alliance lapse runs down.
+        const sealed = Boolean(world.threats.diplomaticallySealed);
+        if (me.troops < (sealed ? 15000 : 30000)) return { valid: false };
         const soft = world.threats.softTargets.filter((s) => !s.isAdjacent);
-        if (soft.length === 0 && world.archetype !== "ISLAND") {
-          return { valid: false };
+        // Overmatch prey: cross-water players small enough that one
+        // transport wave saturates them. Keeps naval conquest alive on
+        // coastal maps even when nobody qualifies as a SOFT_TARGET.
+        const prey = findNavalPreyTargets(me);
+        const riverHops =
+          (world.threats.narrowWaterNeighbors || []).length > 0;
+        if (
+          soft.length === 0 &&
+          prey.length === 0 &&
+          world.archetype !== "ISLAND"
+        ) {
+          if (!(sealed && riverHops)) return { valid: false };
         }
-        return {
-          valid: true,
-          priority: world.archetype === "ISLAND" ? 65 : 45,
-          note:
-            world.archetype === "ISLAND"
-              ? "island archetype"
-              : `${soft.length} soft targets across water`,
-        };
+        let priority = 45;
+        let note = `${soft.length} soft / ${prey.length} prey across water`;
+        if (world.archetype === "ISLAND") {
+          priority = 65;
+          note = "island archetype";
+        }
+        if (sealed) {
+          priority = Math.max(priority, 66);
+          note = "sealed in by allies — expanding overseas";
+        }
+        return { valid: true, priority, note };
       },
       onAct: async () => false,
     },
@@ -12746,28 +13182,23 @@
           return { valid: false };
         }
         const weHave = getMyUnitsOfType(UnitType.Warship).length;
-        if (world.archetype === "ISLAND" && weHave < 2) {
-          return {
-            valid: true,
-            priority: 48,
-            note: `island warship ${weHave}/2`,
-          };
-        }
-        // Enemy warships spotted?
-        const enemies = world.everyone.filter((p) => !p.isFriendly);
-        const enemyWarships = enemies.reduce(
-          (sum, e) =>
-            sum + safeCall(() => e.player.units(UnitType.Warship).length, 0),
-          0,
-        );
-        if (enemyWarships > 0 && weHave < 1) {
-          return {
-            valid: true,
-            priority: 52,
-            note: `enemy warships=${enemyWarships}`,
-          };
-        }
-        return { valid: false };
+        const enemyWarships = countEnemyWarships();
+        const fleet = computeWarshipFleetTarget(me, weHave, enemyWarships);
+        if (weHave >= fleet.target) return { valid: false };
+        // Parity deficits outrank the flat island/screen maintenance —
+        // enemy warships actively sink our transports and trade ships,
+        // and isNavalInvasionSafe stays red until we can match them.
+        let priority = 44;
+        if (fleet.reason === "island") priority = 48;
+        if (fleet.reason === "parity") priority = 52;
+        return {
+          valid: true,
+          priority,
+          note:
+            `warships ${weHave}/${fleet.target} (${fleet.reason}` +
+            (enemyWarships > 0 ? `, enemy=${enemyWarships}` : "") +
+            ")",
+        };
       },
       onAct: async () => false,
     },
@@ -13730,6 +14161,15 @@
     // Plan §2.10: team-mode donation. No-op outside team games.
     safeCall(() => maybeDonateToStrugglingTeammate(me), null);
 
+    // Naval fleet upkeep. Always-on (not just goal-driven) because on
+    // busy maps some land goal always outranks WARSHIP_DEFENSE in the
+    // planner and the bot never floated a single hull — leaving trade
+    // ships unescorted and isNavalInvasionSafe permanently red against
+    // enemy patrols. Cheap no-op while the fleet target is met.
+    try {
+      await maybeMaintainWarshipFleet(me);
+    } catch (_) { /* swallow */ }
+
     // Emoji communication: react to the world we just modelled. Runs
     // after world/threats/snapshot so every detector sees a consistent
     // view, and BEFORE goal planning so the per-tick emoji reflects the
@@ -14046,6 +14486,7 @@
       runtime.intel.seenAttackIDs.clear();
       runtime.intel.appeaseAttempts.clear();
       runtime.intel.extensionRequested.clear();
+      runtime.intel.plannedLapses.clear();
       // v2.16: fresh match — arm result detection and clear any pending
       // auto-requeue exit from the previous game.
       runtime.session.resultRecorded = false;
@@ -15895,6 +16336,8 @@
         inboundTroopTotal: 0,
         overwhelmingNeighbor: null,
         earlyHumanOvermatch: null,
+        landFrontierOpen: true,
+        diplomaticallySealed: null,
       },
       archetype: "CONTINENTAL",
       archetypeLocked: null,
@@ -16537,6 +16980,352 @@
       pass: stallQuiet === false,
     });
 
+    // Scenarios 20–25: diplomatic seal ("allied ourselves into a box").
+    //
+    // The trap: we ally every land neighbour, terra nullius dries up, and
+    // the only land route to growth is betrayal (traitor debuff). These
+    // scenarios exercise the prevention gate (allianceWouldSealBorders),
+    // the escape valve (planned alliance lapse), and the planner rerouting
+    // (NAVAL_LAND_GRAB boost + TERRA_NULLIUS_RUSH frontier gate).
+    function makeSealNeighbor(smallID, overrides) {
+      return Object.assign(
+        {
+          smallID,
+          name: "Ally" + smallID,
+          id: "player-" + smallID,
+          type: PlayerType.Nation,
+          isMe: false,
+          isAlly: true,
+          isClanmate: false,
+          isFriendly: true,
+          isAdjacent: true,
+          isTraitor: false,
+          tiles: 800,
+          troops: 20_000,
+          outgoingAttacks: [],
+          player: { relation: () => 1, isTraitor: () => false },
+        },
+        overrides || {},
+      );
+    }
+
+    // Scenario 20: seal detection + last-outlet gate.
+    const scenario20 = buildTestWorld();
+    scenario20.me.troops = 40_000;
+    const sealAllyA = makeSealNeighbor(21);
+    const sealAllyB = makeSealNeighbor(22, { troops: 60_000 });
+    const lastOutlet = makeSealNeighbor(23, {
+      name: "LastOutlet",
+      isAlly: false,
+      isFriendly: false,
+      troops: 15_000,
+    });
+    scenario20.everyone = [scenario20.me, sealAllyA, sealAllyB, lastOutlet];
+    scenario20.threats.adjacentEnemies = [lastOutlet];
+    scenario20.threats.landFrontierOpen = false;
+    runtime.world = scenario20;
+    const sealWhileHostileLeft = computeDiplomaticSeal(scenario20.me, false);
+    const wouldSealLastOutlet = allianceWouldSealBorders(lastOutlet);
+    scenario20.threats.landFrontierOpen = true;
+    const wouldSealFrontierOpen = allianceWouldSealBorders(lastOutlet);
+    results.push({
+      name:
+        "diplomatic seal: hostile border left -> not sealed; allying it would seal (unless frontier open)",
+      expected: "null,true,false",
+      actual:
+        (sealWhileHostileLeft === null ? "null" : "set") +
+        "," +
+        wouldSealLastOutlet +
+        "," +
+        wouldSealFrontierOpen,
+      pass:
+        sealWhileHostileLeft === null &&
+        wouldSealLastOutlet === true &&
+        wouldSealFrontierOpen === false,
+    });
+
+    // Scenario 21: fully sealed world is detected.
+    const scenario21 = buildTestWorld();
+    scenario21.me.troops = 40_000;
+    const sealedAllies = [makeSealNeighbor(21), makeSealNeighbor(22)];
+    scenario21.everyone = [scenario21.me].concat(sealedAllies);
+    scenario21.threats.adjacentEnemies = [];
+    scenario21.threats.landFrontierOpen = false;
+    runtime.world = scenario21;
+    const seal21 = computeDiplomaticSeal(scenario21.me, false);
+    results.push({
+      name: "diplomatic seal: all land neighbours allied + frontier gone -> sealed",
+      expected: "2",
+      actual: seal21 === null ? "null" : String(seal21.alliedNeighborCount),
+      pass: seal21 !== null && seal21.alliedNeighborCount === 2,
+    });
+
+    // Scenario 22: incoming alliance that would seal us is refused unless
+    // the requestor is an appeasement-grade threat.
+    const scenario22 = buildTestWorld();
+    scenario22.me.troops = 40_000;
+    const weakSealer = makeSealNeighbor(31, {
+      name: "WeakSealer",
+      isAlly: false,
+      isFriendly: false,
+      type: PlayerType.Human,
+      troops: 30_000,
+      strength: 45_000,
+    });
+    scenario22.everyone = [scenario22.me, weakSealer];
+    scenario22.bySmallID = new Map([
+      [1, scenario22.me],
+      [31, weakSealer],
+    ]);
+    scenario22.threats.adjacentEnemies = [weakSealer];
+    scenario22.threats.landFrontierOpen = false;
+    runtime.world = scenario22;
+    const refuseSealer = shouldAcceptIncomingAlliance(
+      weakSealer,
+      scenario22.me,
+    );
+    weakSealer.troops = 70_000; // >= APPEASE_TROOP_RATIO x our 40k
+    weakSealer.strength = 90_000;
+    const acceptAppeasement = shouldAcceptIncomingAlliance(
+      weakSealer,
+      scenario22.me,
+    );
+    results.push({
+      name:
+        "seal guard: refuse alliance closing last border, accept when appeasement-grade",
+      expected: "false,true",
+      actual: refuseSealer + "," + acceptAppeasement,
+      pass: refuseSealer === false && acceptAppeasement === true,
+    });
+
+    // Scenario 23: release-valve pick — weakest adjacent non-clanmate
+    // ally we can realistically fight after expiry.
+    const scenario23 = buildTestWorld();
+    scenario23.me.troops = 40_000;
+    const lapseWeak = makeSealNeighbor(41, { name: "Weakest", troops: 9_000 });
+    const lapseMid = makeSealNeighbor(42, { name: "Mid", troops: 20_000 });
+    const lapseGiant = makeSealNeighbor(43, {
+      name: "Giant",
+      troops: 90_000, // above RELEASE_VALVE_MAX_TROOP_RATIO — never pick
+    });
+    scenario23.everyone = [scenario23.me, lapseWeak, lapseMid, lapseGiant];
+    scenario23.threats.adjacentEnemies = [];
+    scenario23.threats.landFrontierOpen = false;
+    scenario23.threats.diplomaticallySealed = {
+      neighbors: [lapseWeak, lapseMid, lapseGiant],
+      alliedNeighborCount: 3,
+    };
+    runtime.world = scenario23;
+    const lapsePick = chooseAllianceLapseCandidate(scenario23.me);
+    scenario23.threats.diplomaticallySealed = null;
+    const lapseNoSeal = chooseAllianceLapseCandidate(scenario23.me);
+    results.push({
+      name: "release valve: picks weakest adjacent ally, only while sealed",
+      expected: "Weakest,null",
+      actual:
+        (lapsePick ? lapsePick.name : "null") +
+        "," +
+        (lapseNoSeal ? lapseNoSeal.name : "null"),
+      pass:
+        lapsePick !== null &&
+        lapsePick.name === "Weakest" &&
+        lapseNoSeal === null,
+    });
+
+    // Scenario 24: planner reroute — sealed + soft target across water
+    // selects NAVAL_LAND_GRAB even below the normal 30k troop gate, and
+    // TERRA_NULLIUS_RUSH is invalid with the frontier closed.
+    const scenario24 = buildTestWorld();
+    scenario24.me.troops = 16_000;
+    scenario24.threats.landFrontierOpen = false;
+    scenario24.threats.diplomaticallySealed = {
+      neighbors: [],
+      alliedNeighborCount: 3,
+    };
+    scenario24.threats.softTargets = [
+      {
+        smallID: 55,
+        name: "Overseas Soft",
+        isAdjacent: false,
+        isFriendly: false,
+        troops: 4_000,
+        opportunityScore: 45,
+      },
+    ];
+    step(
+      "sealed by allies + water target -> NAVAL_LAND_GRAB",
+      scenario24,
+      "NAVAL_LAND_GRAB",
+    );
+
+    // Scenario 25: frontier gate — the default open-frontier world picks
+    // TERRA_NULLIUS_RUSH; closing the frontier must deselect it.
+    const scenario25open = buildTestWorld();
+    step(
+      "open frontier -> TERRA_NULLIUS_RUSH",
+      scenario25open,
+      "TERRA_NULLIUS_RUSH",
+    );
+    const scenario25closed = buildTestWorld();
+    scenario25closed.threats.landFrontierOpen = false;
+    step("closed frontier -> not TERRA_NULLIUS_RUSH", scenario25closed, null);
+    const frontierResult = results[results.length - 1];
+    frontierResult.expected = "!TERRA_NULLIUS_RUSH";
+    frontierResult.pass = frontierResult.actual !== "TERRA_NULLIUS_RUSH";
+
+    // Scenario 26: planned-lapse lifecycle — schedule while sealed, skip
+    // the extension for that alliance, cancel when the seal lifts.
+    const scenario26 = buildTestWorld();
+    scenario26.me.troops = 40_000;
+    const lapseAlly = makeSealNeighbor(61, {
+      name: "ReleaseValve",
+      troops: 12_000,
+    });
+    scenario26.me.alliances = [
+      { id: 601, other: "player-61", expiresAt: 2000 },
+    ];
+    scenario26.everyone = [scenario26.me, lapseAlly];
+    scenario26.threats.adjacentEnemies = [];
+    scenario26.threats.landFrontierOpen = false;
+    scenario26.threats.diplomaticallySealed = {
+      neighbors: [lapseAlly],
+      alliedNeighborCount: 1,
+    };
+    runtime.world = scenario26;
+    const stashedLapses = runtime.intel.plannedLapses;
+    runtime.intel.plannedLapses = new Map();
+    maintainPlannedAllianceLapses(scenario26.me);
+    const lapsePlanned = runtime.intel.plannedLapses.has(601);
+    scenario26.threats.diplomaticallySealed = null;
+    maintainPlannedAllianceLapses(scenario26.me);
+    const lapseCancelled = !runtime.intel.plannedLapses.has(601);
+    runtime.intel.plannedLapses = stashedLapses;
+    results.push({
+      name: "planned lapse: scheduled while sealed, cancelled when border reopens",
+      expected: "true,true",
+      actual: lapsePlanned + "," + lapseCancelled,
+      pass: lapsePlanned === true && lapseCancelled === true,
+    });
+    runtime.world = previous;
+
+    // Scenarios 27–29: naval posture ("did we forget how to play naval?").
+    //
+    // A coastal player must keep a warship screen (parity vs enemy hulls
+    // unblocks isNavalInvasionSafe) and must keep invading across water
+    // even when nobody qualifies as a SOFT_TARGET — any hostile under
+    // NAVAL_PREY_TROOP_RATIO of our troops is one transport wave away
+    // from being farmed.
+
+    // Scenario 27: coastal screen — port + cities + gold cushion and zero
+    // hulls selects WARSHIP_DEFENSE even with no enemy navy in sight.
+    const scenario27 = buildTestWorld();
+    scenario27.me.gold = 600_000; // >= 2x first-warship cost (250k)
+    scenario27.me.structures[UnitType.Port] = 1;
+    scenario27.threats.landFrontierOpen = false; // mute TERRA_NULLIUS_RUSH
+    step(
+      "coastal port + gold cushion + no hulls -> WARSHIP_DEFENSE",
+      scenario27,
+      "WARSHIP_DEFENSE",
+    );
+
+    // Scenario 27b: parity tier — enemy warships on the map outrank the
+    // screen (52 vs 44) and lift the fleet target to match them.
+    const scenario27b = buildTestWorld();
+    scenario27b.me.gold = 600_000;
+    scenario27b.me.structures[UnitType.Port] = 1;
+    scenario27b.threats.landFrontierOpen = false;
+    const navyEnemy = {
+      smallID: 71,
+      name: "Corsair",
+      isMe: false,
+      isFriendly: false,
+      isAdjacent: false,
+      tiles: 900,
+      troops: 100_000, // too big to be naval prey — isolates the parity path
+      player: {
+        units: (t) => (t === UnitType.Warship ? [{}, {}] : []),
+      },
+    };
+    scenario27b.everyone = [scenario27b.me, navyEnemy];
+    step(
+      "enemy warships -> WARSHIP_DEFENSE parity",
+      scenario27b,
+      "WARSHIP_DEFENSE",
+    );
+    const parityEval = runtime.planner.lastEvaluation.find(
+      (e) => e.id === "WARSHIP_DEFENSE",
+    );
+    results.push({
+      name: "warship parity note reports fleet target 0/2",
+      expected: "warships 0/2 (parity, enemy=2)",
+      actual: parityEval ? parityEval.note : "missing",
+      pass:
+        !!parityEval && parityEval.note === "warships 0/2 (parity, enemy=2)",
+    });
+
+    // Scenario 28: cross-water prey — no SOFT_TARGET anywhere, but a
+    // hostile under 30% of our troops across the water keeps
+    // NAVAL_LAND_GRAB alive.
+    const scenario28 = buildTestWorld();
+    scenario28.me.troops = 60_000;
+    scenario28.threats.landFrontierOpen = false;
+    const navalPrey = {
+      smallID: 72,
+      name: "Prey",
+      isMe: false,
+      isFriendly: false,
+      isAdjacent: false,
+      tiles: 700,
+      troops: 15_000, // < 0.3 x 60k
+      player: { units: () => [] },
+    };
+    scenario28.everyone = [scenario28.me, navalPrey];
+    step(
+      "cross-water overmatch prey -> NAVAL_LAND_GRAB",
+      scenario28,
+      "NAVAL_LAND_GRAB",
+    );
+
+    // Scenario 29: fleet-target tiers directly.
+    const stashedWorld29 = runtime.world;
+    const world29 = buildTestWorld();
+    runtime.world = world29;
+    const fleetMe = {
+      structures: { [UnitType.Port]: 1, [UnitType.City]: 4 },
+      gold: 600_000,
+    };
+    const screenTier = computeWarshipFleetTarget(fleetMe, 0, 0);
+    const parityTier = computeWarshipFleetTarget(fleetMe, 1, 5);
+    const brokeMe = {
+      structures: { [UnitType.Port]: 1, [UnitType.City]: 4 },
+      gold: 100_000, // below the 2x cushion
+    };
+    const brokeTier = computeWarshipFleetTarget(brokeMe, 0, 0);
+    runtime.world = stashedWorld29;
+    results.push({
+      name:
+        "warship fleet tiers: screen=1, parity capped at " +
+        WARSHIP_FLEET_CAP +
+        ", no screen without gold cushion",
+      expected: "1/screen,3/parity,0",
+      actual:
+        screenTier.target +
+        "/" +
+        screenTier.reason +
+        "," +
+        parityTier.target +
+        "/" +
+        parityTier.reason +
+        "," +
+        brokeTier.target,
+      pass:
+        screenTier.target === 1 &&
+        screenTier.reason === "screen" &&
+        parityTier.target === WARSHIP_FLEET_CAP &&
+        parityTier.reason === "parity" &&
+        brokeTier.target === 0,
+    });
+
     // Scenario 6: parabolic SAM check should mark fewer trajectories as
     // intercepted than the linear approximation when the SAM sits on the
     // straight line between silo and target but NOT under the parabolic
@@ -16853,6 +17642,27 @@
         pickAppeasementTarget,
         maybeAppeaseThreats,
         maybeExtendAlliances,
+        // Diplomatic-seal helpers (prevent / escape the "allied with every
+        // neighbour, locked in unless we betray" trap).
+        computeLandFrontierOpen,
+        computeDiplomaticSeal,
+        allianceWouldSealBorders,
+        chooseAllianceLapseCandidate,
+        maintainPlannedAllianceLapses,
+        shouldAcceptIncomingAlliance,
+        RELEASE_VALVE_MAX_TROOP_RATIO,
+        APPEASE_TROOP_RATIO,
+        // Naval posture helpers (warship fleet + cross-water prey).
+        computeWarshipFleetTarget,
+        countEnemyWarships,
+        estimateNextWarshipCost,
+        findNavalPreyTargets,
+        maybeMaintainWarshipFleet,
+        runGoal_NavalLandGrab,
+        runGoal_WarshipDefense,
+        WARSHIP_FLEET_CAP,
+        WARSHIP_MAINTENANCE_INTERVAL_TICKS,
+        NAVAL_PREY_TROOP_RATIO,
         // v3.1 Overlord-merge defense-floor helpers.
         enemyCommittableTroops,
         computeDefenseFloor,

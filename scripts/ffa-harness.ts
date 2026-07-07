@@ -304,6 +304,7 @@ const STRUCTURE_TYPES: [string, UnitType][] = [
   ["DefensePost", UnitType.DefensePost],
   ["MissileSilo", UnitType.MissileSilo],
   ["SAMLauncher", UnitType.SAMLauncher],
+  ["Warship", UnitType.Warship],
 ];
 
 function structureCounts(player: any): Record<string, number> {
